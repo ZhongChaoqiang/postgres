@@ -1443,6 +1443,7 @@ BuildDescForRelation(const List *columns)
 		att->attinhcount = entry->inhcount;
 		att->attidentity = entry->identity;
 		att->attgenerated = entry->generated;
+		att->attpredict = entry->is_predict;
 		att->attcompression = GetAttributeCompression(att->atttypid, entry->compression);
 		if (entry->storage)
 			att->attstorage = entry->storage;

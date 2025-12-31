@@ -75,6 +75,7 @@ populate_compact_attribute_internal(Form_pg_attribute src,
 	dst->atthasmissing = src->atthasmissing;
 	dst->attisdropped = src->attisdropped;
 	dst->attgenerated = (src->attgenerated != '\0');
+	dst->attpredict = src->attpredict;
 
 	/*
 	 * Assign nullability status for this column.  Assuming that a constraint

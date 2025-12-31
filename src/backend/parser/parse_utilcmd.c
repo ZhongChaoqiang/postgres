@@ -646,7 +646,27 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 
 	/* Do necessary work on the column type declaration */
 	if (column->typeName)
+	{
+		/*
+		 * If PREDICT option is specified, we need to convert the type to an array.
+		 * The array will have two elements: the first for user data, the second reserved.
+		 */
+		if (column->is_predict)
+		{
+			if (column->typeName->arrayBounds != NIL)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("PREDICT option cannot be used with array types"),
+						 parser_errposition(cxt->pstate,
+											column->typeName->location)));
+			}
+			/* Set array bounds to [2] for two-element array */
+			column->typeName->arrayBounds = list_make2(makeInteger(2), makeInteger(-1));
+			column->typeName->location = column->typeName->location;
+		}
 		transformColumnType(cxt, column);
+	}
 
 	/* Special actions for SERIAL pseudo-types */
 	if (is_serial)

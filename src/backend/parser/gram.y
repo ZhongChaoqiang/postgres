@@ -518,7 +518,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				 SetResetClause FunctionSetResetClause
 
 %type <node>	TableElement TypedTableElement ConstraintElem DomainConstraintElem TableFuncElement
-%type <node>	columnDef columnOptions optionalPeriodName
+%type <node>	columnDef optionalPeriodName
 %type <defelt>	def_elem reloption_elem old_aggr_elem operator_def_elem
 %type <node>	def_arg columnElem where_clause where_or_current_clause
 				a_expr b_expr c_expr AexprConst indirection_el opt_slice_bound
@@ -592,6 +592,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	DomainConstraint TableConstraint TableLikeClause
 %type <ival>	TableLikeOptionList TableLikeOption
 %type <str>		column_compression opt_column_compression column_storage opt_column_storage
+%type <boolean>	opt_predict
 %type <list>	ColQualList
 %type <node>	ColConstraint ColConstraintElem ConstraintAttr
 %type <ival>	key_match
@@ -758,7 +759,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
 	PERIOD PLACING PLAN PLANS POLICY
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
-	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
+	PREDICT PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
 
 	QUOTE QUOTES
 
@@ -3807,11 +3808,11 @@ TableElement:
 		;
 
 TypedTableElement:
-			columnOptions						{ $$ = $1; }
+			columnDef						{ $$ = $1; }
 			| TableConstraint					{ $$ = $1; }
 		;
 
-columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList
+columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList opt_predict
 				{
 					ColumnDef *n = makeNode(ColumnDef);
 
@@ -3828,47 +3829,8 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 					n->cooked_default = NULL;
 					n->collOid = InvalidOid;
 					n->fdwoptions = $5;
+					n->is_predict = $7;
 					SplitColQualList($6, &n->constraints, &n->collClause,
-									 yyscanner);
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-		;
-
-columnOptions:	ColId ColQualList
-				{
-					ColumnDef *n = makeNode(ColumnDef);
-
-					n->colname = $1;
-					n->typeName = NULL;
-					n->inhcount = 0;
-					n->is_local = true;
-					n->is_not_null = false;
-					n->is_from_type = false;
-					n->storage = 0;
-					n->raw_default = NULL;
-					n->cooked_default = NULL;
-					n->collOid = InvalidOid;
-					SplitColQualList($2, &n->constraints, &n->collClause,
-									 yyscanner);
-					n->location = @1;
-					$$ = (Node *) n;
-				}
-				| ColId WITH OPTIONS ColQualList
-				{
-					ColumnDef *n = makeNode(ColumnDef);
-
-					n->colname = $1;
-					n->typeName = NULL;
-					n->inhcount = 0;
-					n->is_local = true;
-					n->is_not_null = false;
-					n->is_from_type = false;
-					n->storage = 0;
-					n->raw_default = NULL;
-					n->cooked_default = NULL;
-					n->collOid = InvalidOid;
-					SplitColQualList($4, &n->constraints, &n->collClause,
 									 yyscanner);
 					n->location = @1;
 					$$ = (Node *) n;
@@ -3883,6 +3845,11 @@ column_compression:
 opt_column_compression:
 			column_compression						{ $$ = $1; }
 			| /*EMPTY*/								{ $$ = NULL; }
+		;
+
+opt_predict:
+			PREDICT									{ $$ = true; }
+			| /*EMPTY*/								{ $$ = false; }
 		;
 
 column_storage:
@@ -17890,6 +17857,7 @@ unreserved_keyword:
 			| PLANS
 			| POLICY
 			| PRECEDING
+			| PREDICT
 			| PREPARE
 			| PREPARED
 			| PRESERVE
@@ -18519,6 +18487,7 @@ bare_label_keyword:
 			| POLICY
 			| POSITION
 			| PRECEDING
+			| PREDICT
 			| PREPARE
 			| PREPARED
 			| PRESERVE
