@@ -134,6 +134,9 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	/* One of the ATTRIBUTE_GENERATED_* constants below, or '\0' */
 	char		attgenerated BKI_DEFAULT('\0');
 
+	/* Is PREDICT option specified */
+	bool		attpredict BKI_DEFAULT(f);
+
 	/* Is dropped (ie, logically invisible) or not */
 	bool		attisdropped BKI_DEFAULT(f);
 

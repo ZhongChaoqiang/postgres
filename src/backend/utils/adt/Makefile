@@ -89,6 +89,7 @@ OBJS = \
 	pg_ndistinct.o \
 	pg_upgrade_support.o \
 	pgstatfuncs.o \
+	predict.o \
 	pseudorandomfuncs.o \
 	pseudotypes.o \
 	quote.o \

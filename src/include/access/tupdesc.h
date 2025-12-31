@@ -76,6 +76,7 @@ typedef struct CompactAttribute
 	bool		atthasmissing;	/* as FormData_pg_attribute.atthasmissing */
 	bool		attisdropped;	/* as FormData_pg_attribute.attisdropped */
 	bool		attgenerated;	/* FormData_pg_attribute.attgenerated != '\0' */
+	bool		attpredict;		/* FormData_pg_attribute.attpredict */
 	char		attnullability; /* status of not-null constraint, see below */
 	uint8		attalignby;		/* alignment requirement in bytes */
 } CompactAttribute;
