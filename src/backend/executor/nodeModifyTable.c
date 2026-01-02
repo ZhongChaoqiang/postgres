@@ -71,6 +71,9 @@
 #include "utils/injection_point.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/array.h"
+#include "catalog/pg_type.h"
+
 
 
 typedef struct MTTargetRelLookup
@@ -847,6 +850,7 @@ ExecGetUpdateNewTuple(ResultRelInfo *relinfo,
  *		save the previous value to avoid losing track of it.
  * ----------------------------------------------------------------
  */
+
 static TupleTableSlot *
 ExecInsert(ModifyTableContext *context,
 		   ResultRelInfo *resultRelInfo,
