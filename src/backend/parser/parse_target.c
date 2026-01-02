@@ -577,6 +577,85 @@ transformAssignedExpr(ParseState *pstate,
 		 */
 		Node	   *orig_expr = (Node *) expr;
 
+		/*
+		 * For PREDICT columns, wrap scalar expressions into two-element arrays
+		 * {expr, 0} automatically before type coercion.
+		 */
+		if (attrno > 0 && attrno <= RelationGetNumberOfAttributes(rd))
+		{
+			Form_pg_attribute attr = TupleDescAttr(rd->rd_att, attrno - 1);
+			if (attr->attpredict)
+			{
+				ArrayExpr  *array_expr;
+				Node	   *zero_elem;
+				A_Const    *zero_const;
+				TypeCast   *zero_cast;
+				Oid			element_type;
+				int32		element_typmod;
+				ParseExprKind save_expr_kind;
+
+				/* Get the element type of the PREDICT column */
+				element_type = get_element_type(attrtype);
+				element_typmod = attrtypmod;  /* Array typmod is used for element */
+
+				/* Create a zero constant */
+				zero_const = makeNode(A_Const);
+				zero_const->val.ival.type = T_Integer;
+				zero_const->val.ival.ival = 0;
+				zero_const->location = -1;
+
+				/* Cast zero to the base element type */
+				zero_cast = makeNode(TypeCast);
+				zero_cast->arg = (Node *) zero_const;
+				zero_cast->typeName = makeTypeNameFromOid(element_type, -1);
+				zero_cast->location = -1;
+
+				/* Transform the zero cast expression */
+				save_expr_kind = pstate->p_expr_kind;
+				zero_elem = transformExpr(pstate, (Node *) zero_cast, exprKind);
+				pstate->p_expr_kind = save_expr_kind;
+
+				/* Coerce original expr to element type if needed */
+				if (type_id != element_type)
+				{
+					orig_expr = coerce_to_target_type(pstate,
+													 (Node *) expr,
+													 type_id,
+													 element_type,
+													 element_typmod,
+													 COERCION_ASSIGNMENT,
+													 COERCE_IMPLICIT_CAST,
+													 -1);
+					if (orig_expr == NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_DATATYPE_MISMATCH),
+								 errmsg("column \"%s\" is of type %s"
+										" but expression is of type %s",
+										colname,
+										format_type_be(attrtype),
+										format_type_be(type_id)),
+								 errhint("You will need to rewrite or cast the expression."),
+								 parser_errposition(pstate, exprLocation((Node *) expr))));
+				}
+				else
+				{
+					orig_expr = (Node *) expr;
+				}
+
+				/* Create ArrayExpr with two elements: original expr and 0 */
+				array_expr = makeNode(ArrayExpr);
+				array_expr->array_typeid = attrtype;
+				array_expr->array_collid = attrcollation;
+				array_expr->element_typeid = element_type;
+				array_expr->elements = list_make2(orig_expr, zero_elem);
+				array_expr->multidims = false;
+				array_expr->location = -1;
+
+				orig_expr = (Node *) array_expr;
+				type_id = attrtype;
+			}
+		}
+
 		expr = (Expr *)
 			coerce_to_target_type(pstate,
 								  orig_expr, type_id,
