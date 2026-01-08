@@ -24,7 +24,9 @@
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/parsenodes.h"
 #include "parser/parse_enr.h"
+#include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_type.h"
 #include "parser/parsetree.h"
@@ -779,6 +781,53 @@ scanNSItemForColumn(ParseState *pstate, ParseNamespaceItem *nsitem,
 
 	/* Require read access to the column */
 	markVarForSelectPriv(pstate, var);
+
+	/*
+	 * For PREDICT columns, automatically wrap the Var into an array subscript
+	 * to access the first element. This makes SELECT queries return the scalar
+	 * value instead of the array {value, 0}.
+	 */
+	if (attnum > InvalidAttrNumber && rte->rtekind == RTE_RELATION)
+	{
+		Relation	rel;
+		TupleDesc	tupdesc;
+		Form_pg_attribute attr;
+
+		/* Open the relation to check if the column has PREDICT attribute */
+		rel = relation_open(rte->relid, AccessShareLock);
+		tupdesc = RelationGetDescr(rel);
+		attr = TupleDescAttr(tupdesc, attnum - 1);
+
+		if (attr->attpredict)
+		{
+			A_Indirection *ind;
+			A_Indices  *indices;
+			A_Const    *idx_const;
+
+			/* Create an A_Indices node for subscript [1] */
+			indices = makeNode(A_Indices);
+			indices->is_slice = false;
+			indices->lidx = NULL;
+
+			/* Create constant 1 for the subscript */
+			idx_const = makeNode(A_Const);
+			idx_const->val.ival.type = T_Integer;
+			idx_const->val.ival.ival = 1;
+			idx_const->location = -1;
+			indices->uidx = (Node *) idx_const;
+
+			/* Create A_Indirection node to wrap the Var */
+			ind = makeNode(A_Indirection);
+			ind->arg = (Node *) var;
+			ind->indirection = list_make1(indices);
+
+			/* Transform the indirection expression */
+			relation_close(rel, AccessShareLock);
+			return transformExpr(pstate, (Node *) ind, pstate->p_expr_kind);
+		}
+
+		relation_close(rel, AccessShareLock);
+	}
 
 	return (Node *) var;
 }
