@@ -12547,4 +12547,14 @@
   proargnames => '{pid,io_id,io_generation,state,operation,off,length,target,handle_data_len,raw_result,result,target_desc,f_sync,f_localmem,f_buffered}',
   prosrc => 'pg_get_aios' },
 
+# PREDICT column support functions
+{ oid => '6500', descr => 'trigger to copy first array element to second for PREDICT columns',
+  proname => 'predict_trigger', proisstrict => 'f', provolatile => 'v',
+  prorettype => 'trigger', proargtypes => '',
+  prosrc => 'predict_trigger' },
+{ oid => '6501', descr => 'check if a column has PREDICT attribute',
+  proname => 'is_predict_column', provolatile => 's', prorettype => 'bool',
+  proargtypes => 'oid text', proargnames => '{relid,colname}',
+  prosrc => 'is_predict_column' },
+
 ]
