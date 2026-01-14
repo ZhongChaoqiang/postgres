@@ -456,6 +456,8 @@ static void validateForeignKeyConstraint(char *conname,
 										 Relation rel, Relation pkrel,
 										 Oid pkindOid, Oid constraintOid, bool hasperiod);
 static void CheckAlterTableIsSafe(Relation rel);
+static void createPredictTrigger(Oid relOid, AttrNumber attnum, const char *colname);
+static void createPredictTriggersForRelation(Relation rel);
 static void ATController(AlterTableStmt *parsetree,
 						 Relation rel, List *cmds, bool recurse, LOCKMODE lockmode,
 						 AlterTableUtilityContext *context);
@@ -1347,6 +1349,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		set_attnotnull(NULL, rel, attrnum, true, false);
 
 	ObjectAddressSet(address, RelationRelationId, relationId);
+
+	/*
+	 * Create triggers for PREDICT columns. This must be done after the
+	 * relation is fully created and before closing it.
+	 */
+	createPredictTriggersForRelation(rel);
 
 	/*
 	 * Clean up.  We keep lock on new relation (although it shouldn't be
@@ -7625,6 +7633,14 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 						lockmode, cur_pass, context);
 
 		table_close(childrel, NoLock);
+	}
+
+	/*
+	 * If the newly added column is a PREDICT column, create the trigger for it.
+	 */
+	if (colDef->is_predict)
+	{
+		createPredictTrigger(myrelid, newattnum, colDef->colname);
 	}
 
 	ObjectAddressSubSet(address, RelationRelationId, myrelid, newattnum);
@@ -13971,6 +13987,84 @@ createForeignKeyActionTriggers(Oid myRelOid, Oid refRelOid, Constraint *fkconstr
 								parentUpdTrigger, NULL, true, false);
 	if (updateTrigOid)
 		*updateTrigOid = trigAddress.objectId;
+}
+
+/*
+ * createPredictTrigger
+ *		Create an internal trigger for a PREDICT column.
+ *
+ * This function creates an AFTER INSERT trigger that copies the first element
+ * of the PREDICT column's array to the second element position.
+ */
+static void
+createPredictTrigger(Oid relOid, AttrNumber attnum, const char *colname)
+{
+	CreateTrigStmt *trigger;
+	char		trigname[NAMEDATALEN];
+	char		attnum_str[16];
+
+	/* Generate a unique trigger name */
+	snprintf(trigname, NAMEDATALEN, "pg_predict_%s_%u", colname, relOid);
+
+	/* Convert attnum to string for trigger argument */
+	snprintf(attnum_str, sizeof(attnum_str), "%d", attnum);
+
+	/* Create trigger node */
+	trigger = makeNode(CreateTrigStmt);
+	trigger->replace = false;
+	trigger->isconstraint = false;
+	trigger->trigname = pstrdup(trigname);
+	trigger->relation = NULL;	/* Will be set by CreateTrigger */
+
+	/* This is a BEFORE INSERT trigger */
+	trigger->funcname = SystemFuncName("predict_trigger");
+	trigger->args = NIL;  /* No arguments needed - trigger will detect PREDICT column */
+	trigger->row = true;
+	trigger->timing = TRIGGER_TYPE_BEFORE;
+	trigger->events = TRIGGER_TYPE_INSERT;
+	trigger->columns = NIL;
+	trigger->whenClause = NULL;
+	trigger->transitionRels = NIL;
+	trigger->deferrable = false;
+	trigger->initdeferred = false;
+	trigger->constrrel = NULL;
+
+	/* Create the trigger */
+	CreateTrigger(trigger, NULL, relOid, InvalidOid,
+								InvalidOid, InvalidOid, InvalidOid,
+								InvalidOid, NULL, true, false);
+
+	/* Make changes visible */
+	CommandCounterIncrement();
+}
+
+/*
+ * createPredictTriggersForRelation
+ *		Create triggers for all PREDICT columns in a relation.
+ */
+static void
+createPredictTriggersForRelation(Relation rel)
+{
+	TupleDesc	tupdesc;
+	int			attnum;
+
+	tupdesc = RelationGetDescr(rel);
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+		/* Skip dropped columns */
+		if (attr->attisdropped)
+			continue;
+
+		/* Check if this is a PREDICT column */
+		if (attr->attpredict)
+		{
+			createPredictTrigger(RelationGetRelid(rel), attnum,
+								NameStr(attr->attname));
+		}
+	}
 }
 
 /*
