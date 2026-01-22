@@ -1188,7 +1188,7 @@ transformRelOptions(Datum oldOptions, List *defList, const char *nameSpace,
 	astate = NULL;
 
 	/* Copy any oldOptions that aren't to be replaced */
-	if (DatumGetPointer(oldOptions) != NULL)
+	if (oldOptions != (Datum) 0 && DatumGetPointer(oldOptions) != NULL)
 	{
 		ArrayType  *array = DatumGetArrayTypeP(oldOptions);
 		Datum	   *oldoptions;
