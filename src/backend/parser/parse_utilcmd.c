@@ -648,22 +648,20 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 	if (column->typeName)
 	{
 		/*
-		 * If PREDICT option is specified, we need to convert the type to an array.
-		 * The array will have two elements: the first for user data, the second reserved.
+		 * If PREDICT option is specified, we need to ensure the type is an array.
+		 * If the user specified array syntax like INTEGER[], we accept it.
+		 * Otherwise, we convert the base type to an array.
+		 * The array should have at least 2 elements: first for user data, second reserved.
 		 */
 		if (column->is_predict)
 		{
-			if (column->typeName->arrayBounds != NIL)
+			/* If user didn't specify array bounds, add them */
+			if (column->typeName->arrayBounds == NIL)
 			{
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("PREDICT option cannot be used with array types"),
-						 parser_errposition(cxt->pstate,
-											column->typeName->location)));
+				/* Set array bounds to [2] for two-element array */
+				column->typeName->arrayBounds = list_make2(makeInteger(2), makeInteger(-1));
+				column->typeName->location = column->typeName->location;
 			}
-			/* Set array bounds to [2] for two-element array */
-			column->typeName->arrayBounds = list_make2(makeInteger(2), makeInteger(-1));
-			column->typeName->location = column->typeName->location;
 		}
 		transformColumnType(cxt, column);
 	}
