@@ -195,51 +195,47 @@ Datum
 predict_trigger(PG_FUNCTION_ARGS)
 {
 	TriggerData *trigdata = (TriggerData *) fcinfo->context;
-	TupleDesc	tupdesc;
-	HeapTuple	rettuple;
-	HeapTuple	newtuple;
-	Relation	rel;
-	int			attnum;
-	Oid			typeid;
-	Oid			arraytypeid;
-	Datum		arraydatum;
-	Datum		newarraydatum;
-	Datum		firstelem;
-	bool		isnull;
-	int16		typlen;
-	bool		typbyval;
-	char		typalign;
-	int16		arrlen;
-	int			lowerIndex[1] = {1};
-	int			upperIndex[1] = {2};
-	bool		replisnull;
+	TupleDesc		tupdesc;
+	HeapTuple		rettuple;
+	HeapTuple		newtuple;
+	Relation		rel;
+	int				attnum;
+	Oid				typeid;
+	Oid				arraytypeid;
+	Datum				arraydatum;
+	Datum				newarraydatum;
+	Datum				firstelem;
+	bool				isnull;
+	int16				typlen;
+	bool				typbyval;
+	char				typalign;
+	int16				arrlen;
+	int				lowerIndex[1] = {1};
+	bool				replisnull;
 
-	/* Make sure this is being called as a trigger */
+	/* Validate trigger context */
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"predict_trigger\" was not called by trigger manager")));
 
-	/* Check that this is a BEFORE INSERT trigger */
 	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event) ||
 		!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"predict_trigger\" must be called as BEFORE INSERT trigger")));
 
-	/* Check for the NEW tuple */
 	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"predict_trigger\" must be a ROW-level trigger")));
 
+	/* Get trigger data */
 	rel = trigdata->tg_relation;
 	tupdesc = RelationGetDescr(rel);
-
-	/* Get the NEW tuple */
 	newtuple = trigdata->tg_trigtuple;
 
-	/* Find the first PREDICT column in the tuple descriptor */
+	/* Find the first PREDICT column */
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
@@ -251,109 +247,70 @@ predict_trigger(PG_FUNCTION_ARGS)
 		/* Check if this is a PREDICT column */
 		if (attr->attpredict)
 		{
-			/* Get column info */
+			/* Validate column is an array type */
 			arraytypeid = attr->atttypid;
 			typeid = get_base_element_type(arraytypeid);
-
-			/* Verify it's an array type */
 			if (!OidIsValid(typeid))
 				ereport(ERROR,
 						(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						 errmsg("column \"%s\" is not an array type for trigger \"predict_trigger\"",
 								NameStr(attr->attname))));
 
-			/* Get type info */
+			/* Get type information */
 			get_typlenbyvalalign(typeid, &typlen, &typbyval, &typalign);
 			get_typlenbyvalalign(arraytypeid, &arrlen, &typbyval, &typalign);
 
-			/* Get the array value from the new tuple */
+			/* Get array value from tuple */
 			arraydatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
-
 			if (isnull)
-			{
-				/* If the array is NULL, we don't need to do anything */
-				return PointerGetDatum(newtuple);
-			}
+				return PointerGetDatum(newtuple); /* NULL array, no action needed */
 			
-			/* Get the first element (index 1) */
-			firstelem = array_get_element(arraydatum, 1, lowerIndex, arrlen,
-							 typlen, typbyval, typalign, &isnull);
-			
-			/* Convert the element to int32 based on typbyval */
-			if (typbyval)
-			{
-				elog(LOG, "predict_trigger: firstelem as int32 (typbyval=true) = %d", DatumGetInt32(firstelem));
-			}
-			else
-			{
-				/* If typbyval is false, firstelem is a pointer to the actual value */
-				int32 *value_ptr = (int32 *) DatumGetPointer(firstelem);
-				elog(LOG, "predict_trigger: firstelem as int32 (typbyval=false) = %d", *value_ptr);
-			}
-
+			/* Get first element */
+			firstelem = array_get_element(arraydatum, 1, lowerIndex, arrlen, 
+						 typlen, typbyval, typalign, &isnull);
 			if (isnull)
-			{
-				/* If the first element is NULL, we don't need to do anything */
-				return PointerGetDatum(newtuple);
-			}
+				return PointerGetDatum(newtuple); /* NULL first element, no action needed */
 
-			/* Get the predict function name */
-			char *predict_func_name;
-			Datum predict_result;
-			bool predict_isnull;
-			Oid predict_func_oid;
-			char *search_func_name;
-			char *funcname_only;
-			FuncCandidateList clist;
-			int fgc_flags;
+			/* Process predict function if available */
+			Datum predict_result = firstelem;
+			char *predict_func_name = get_predict_function(rel->rd_id);
 			
-			predict_func_name = get_predict_function(rel->rd_id);
-			predict_result = firstelem; /* Default to first element if no predict function */
-			predict_isnull = false;
 			if (predict_func_name != NULL)
 			{
 				/* Look up the predict function OID */
-				predict_func_oid = InvalidOid;
-				search_func_name = NULL;
+				Oid predict_func_oid = InvalidOid;
+				char *search_func_name;
+				char *funcname_only;
+				FuncCandidateList clist;
+				int fgc_flags;
 				
-				/* Try a direct approach using syscache lookup */
-				/* First, construct the function name with schema if needed */
+				/* Construct function name with schema if needed */
 				if (strchr(predict_func_name, '.') == NULL)
-				{
 					search_func_name = psprintf("public.%s", predict_func_name);
-				}
 				else
-				{
 					search_func_name = pstrdup(predict_func_name);
-				}
 				
-				/* Try to find the function using a simpler approach */
-				/* Use the function name directly without complex parsing */
+				/* Extract function name without schema */
 				funcname_only = strrchr(search_func_name, '.');
 				if (funcname_only != NULL)
-				{
-					funcname_only++; /* Skip the dot */
-				}
+					funcname_only++;
 				else
-				{
 					funcname_only = search_func_name;
-				}
 				
-				/* Use FuncnameGetCandidates to find the function */
-				/* This is a safer approach than stringToQualifiedNameList */
-				clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)), 1, NIL, false, false, false, true, &fgc_flags);
+				/* Find function candidates */
+				clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)), 
+											 1, NIL, false, false, false, true, &fgc_flags);
 				
+				/* Check for matching function signature */
 				if (clist != NULL)
 				{
-					/* Check if the function signature matches */
-					while (clist != NULL)
+					for (; clist != NULL; clist = clist->next)
 					{
 						if (clist->nargs == 1 && clist->args[0] == typeid)
 						{
 							predict_func_oid = clist->oid;
 							break;
 						}
-						clist = clist->next;
 					}
 				}
 				
@@ -362,64 +319,41 @@ predict_trigger(PG_FUNCTION_ARGS)
 				if (OidIsValid(predict_func_oid))
 				{
 					/* Call the predict function */
-					FmgrInfo predict_func; 
+					FmgrInfo predict_func;
 					fmgr_info(predict_func_oid, &predict_func);
 					
-					/* Prepare the argument based on typbyval */
-					Datum predict_arg;
-					if (typbyval)
-					{
-						/* If typbyval is true, firstelem is the actual value */
-						predict_arg = firstelem;
-					}
-					else
-					{
-						/* If typbyval is false, firstelem is a pointer to the actual value */
-						int32 *value_ptr = (int32 *) DatumGetPointer(firstelem);
-						predict_arg = Int32GetDatum(*value_ptr);
-						elog(LOG, "predict_trigger: firstelem value (typbyval=false) = %d", *value_ptr);
-					}					
+					/* Prepare argument based on typbyval */
+					Datum predict_arg = typbyval ? firstelem : 
+						Int32GetDatum(*((int32 *) DatumGetPointer(firstelem)));
+					
 					predict_result = FunctionCall1(&predict_func, predict_arg);
 				}
 				
 				pfree(predict_func_name);
 			}
 			
-			/* Create a new array with updated values */
+			/* Create updated array */
 			Datum newelems[2];
-			bool newnulls[2] = {false, false};  /* Both elements are non-null */
 			
-			/* First element stays the same (original value) */
-			if (typbyval)
-			{
-				newelems[0] = firstelem;
-			}
-			else
-			{
-				int32 *value_ptr = (int32 *) DatumGetPointer(firstelem);
-				newelems[0] = Int32GetDatum(*value_ptr);
-			}
+			/* First element stays the same */
+			newelems[0] = typbyval ? firstelem : Int32GetDatum(*((int32 *) DatumGetPointer(firstelem)));
 			
 			/* Second element is the predict function result */
 			newelems[1] = predict_result;
 			
-			/* Create new array with 2 elements using construct_array */
-			if (typeid == INT4OID) {
-				newarraydatum = PointerGetDatum(construct_array_builtin(newelems, 2, typeid));
-			} else {
-				newarraydatum = PointerGetDatum(construct_array(newelems, 2, typeid, typlen, typbyval, typalign));
-			}
+			/* Construct new array */
+			newarraydatum = (typeid == INT4OID) ?
+				PointerGetDatum(construct_array_builtin(newelems, 2, typeid)) :
+				PointerGetDatum(construct_array(newelems, 2, typeid, typlen, typbyval, typalign));
 			
-			/* Modify the tuple with the updated array value */
+			/* Update tuple and return */
 			replisnull = false;
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc,
-												 1, &attnum, &newarraydatum,
-												 &replisnull);
-
+			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum,
+							&newarraydatum, &replisnull);
 			return PointerGetDatum(rettuple);
 		}
 	}
 
-	/* No PREDICT column found, return the tuple unchanged */
+	/* No PREDICT column found, return original tuple */
 	return PointerGetDatum(newtuple);
 }
