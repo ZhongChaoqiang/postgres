@@ -27,6 +27,8 @@
 #include "commands/trigger.h"
 #include "parser/parse_type.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_func.h"
+#include "nodes/pg_list.h"
 #include "executor/spi.h"
 #include "catalog/pg_proc.h"
 #include "utils/guc.h"
@@ -98,8 +100,6 @@ get_predict_function(Oid relid)
 	reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
 		   &isnull);
 
-	elog(LOG, "get_predict_function: relation %u, isnull = %d", relid, isnull);
-
 	if (!isnull)
 	{
 		/* reloptions is a text array, so we need to deconstruct it */
@@ -112,8 +112,6 @@ get_predict_function(Oid relid)
 		/* Deconstruct the array */
 		deconstruct_array(array, TEXTOID, -1, false, 'i', &elems, &nulls, &nitems);
 
-		elog(LOG, "get_predict_function: found %d reloptions", nitems);
-
 		/* Iterate through the array elements */
 		for (i = 0; i < nitems; i++)
 		{
@@ -125,9 +123,7 @@ get_predict_function(Oid relid)
 			int		text_len;
 			char		*opt_str;
 			int		len;
-			
-			elog(LOG, "get_predict_function: reloption %d, nulls[i] = %d, elems[i] = 0x%p", i, nulls[i], (void *)elems[i]);
-			
+
 			/* Check if the element is null */
 			if (!nulls[i])
 			{
@@ -142,16 +138,6 @@ get_predict_function(Oid relid)
 				opt_str[text_len] = '\0';
 				elog(LOG, "get_predict_function: reloption %d: '%s'", i, opt_str);
 				
-				/* Debug: Check the condition parts */
-				elog(LOG, "get_predict_function: text_len = %d, text_len > 17 = %d", text_len, text_len > 17);
-				elog(LOG, "get_predict_function: expected prefix = 'predict_function='");
-				elog(LOG, "get_predict_function: actual prefix = '%.*s'", 17, opt_str);
-				
-				/* Debug: Check the first few characters with their ASCII values */
-				elog(LOG, "get_predict_function: opt_str[0] = '%c' (%d), expected 'p' (%d)", opt_str[0], (int)opt_str[0], (int)'p');
-				elog(LOG, "get_predict_function: opt_str[1] = '%c' (%d), expected 'r' (%d)", opt_str[1], (int)opt_str[1], (int)'r');
-				elog(LOG, "get_predict_function: opt_str[2] = '%c' (%d), expected 'e' (%d)", opt_str[2], (int)opt_str[2], (int)'e');
-				
 				/* Check each character individually to avoid any string comparison issues */
 				match = true;
 				expected = "predict_function=";
@@ -164,7 +150,6 @@ get_predict_function(Oid relid)
 						break;
 					}
 				}
-				elog(LOG, "get_predict_function: prefix match = %d", match);
 				
 				/* Look for predict_function keyword using individual character comparison */
 				if (text_len > 17 && match)
@@ -174,7 +159,6 @@ get_predict_function(Oid relid)
 					predict_func = palloc(len + 1);
 					memcpy(predict_func, opt_str + 17, len);
 					predict_func[len] = '\0';
-					elog(LOG, "get_predict_function: found predict function: '%s'", predict_func);
 					break;
 				}
 				else
@@ -196,8 +180,6 @@ get_predict_function(Oid relid)
 	}
 
 	ReleaseSysCache(tuple);
-
-	elog(LOG, "get_predict_function: returning '%s'", predict_func ? predict_func : "NULL");
 	return predict_func;
 }
 
@@ -292,10 +274,22 @@ predict_trigger(PG_FUNCTION_ARGS)
 				/* If the array is NULL, we don't need to do anything */
 				return PointerGetDatum(newtuple);
 			}
-
+			
 			/* Get the first element (index 1) */
 			firstelem = array_get_element(arraydatum, 1, lowerIndex, arrlen,
-										 typlen, typbyval, typalign, &isnull);
+							 typlen, typbyval, typalign, &isnull);
+			
+			/* Convert the element to int32 based on typbyval */
+			if (typbyval)
+			{
+				elog(LOG, "predict_trigger: firstelem as int32 (typbyval=true) = %d", DatumGetInt32(firstelem));
+			}
+			else
+			{
+				/* If typbyval is false, firstelem is a pointer to the actual value */
+				int32 *value_ptr = (int32 *) DatumGetPointer(firstelem);
+				elog(LOG, "predict_trigger: firstelem as int32 (typbyval=false) = %d", *value_ptr);
+			}
 
 			if (isnull)
 			{
@@ -303,11 +297,119 @@ predict_trigger(PG_FUNCTION_ARGS)
 				return PointerGetDatum(newtuple);
 			}
 
-			/* Set the second element (index 2) to the same value as first element */
-			newarraydatum = array_set_element(arraydatum, 1, upperIndex,
-										 firstelem, false,
-										 arrlen, typlen, typbyval, typalign);
-
+			/* Get the predict function name */
+			char *predict_func_name;
+			Datum predict_result;
+			bool predict_isnull;
+			Oid predict_func_oid;
+			char *search_func_name;
+			char *funcname_only;
+			FuncCandidateList clist;
+			int fgc_flags;
+			
+			predict_func_name = get_predict_function(rel->rd_id);
+			predict_result = firstelem; /* Default to first element if no predict function */
+			predict_isnull = false;
+			if (predict_func_name != NULL)
+			{
+				/* Look up the predict function OID */
+				predict_func_oid = InvalidOid;
+				search_func_name = NULL;
+				
+				/* Try a direct approach using syscache lookup */
+				/* First, construct the function name with schema if needed */
+				if (strchr(predict_func_name, '.') == NULL)
+				{
+					search_func_name = psprintf("public.%s", predict_func_name);
+				}
+				else
+				{
+					search_func_name = pstrdup(predict_func_name);
+				}
+				
+				/* Try to find the function using a simpler approach */
+				/* Use the function name directly without complex parsing */
+				funcname_only = strrchr(search_func_name, '.');
+				if (funcname_only != NULL)
+				{
+					funcname_only++; /* Skip the dot */
+				}
+				else
+				{
+					funcname_only = search_func_name;
+				}
+				
+				/* Use FuncnameGetCandidates to find the function */
+				/* This is a safer approach than stringToQualifiedNameList */
+				clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)), 1, NIL, false, false, false, true, &fgc_flags);
+				
+				if (clist != NULL)
+				{
+					/* Check if the function signature matches */
+					while (clist != NULL)
+					{
+						if (clist->nargs == 1 && clist->args[0] == typeid)
+						{
+							predict_func_oid = clist->oid;
+							break;
+						}
+						clist = clist->next;
+					}
+				}
+				
+				pfree(search_func_name);
+				
+				if (OidIsValid(predict_func_oid))
+				{
+					/* Call the predict function */
+					FmgrInfo predict_func; 
+					fmgr_info(predict_func_oid, &predict_func);
+					
+					/* Prepare the argument based on typbyval */
+					Datum predict_arg;
+					if (typbyval)
+					{
+						/* If typbyval is true, firstelem is the actual value */
+						predict_arg = firstelem;
+					}
+					else
+					{
+						/* If typbyval is false, firstelem is a pointer to the actual value */
+						int32 *value_ptr = (int32 *) DatumGetPointer(firstelem);
+						predict_arg = Int32GetDatum(*value_ptr);
+						elog(LOG, "predict_trigger: firstelem value (typbyval=false) = %d", *value_ptr);
+					}					
+					predict_result = FunctionCall1(&predict_func, predict_arg);
+				}
+				
+				pfree(predict_func_name);
+			}
+			
+			/* Create a new array with updated values */
+			Datum newelems[2];
+			bool newnulls[2] = {false, false};  /* Both elements are non-null */
+			
+			/* First element stays the same (original value) */
+			if (typbyval)
+			{
+				newelems[0] = firstelem;
+			}
+			else
+			{
+				int32 *value_ptr = (int32 *) DatumGetPointer(firstelem);
+				newelems[0] = Int32GetDatum(*value_ptr);
+			}
+			
+			/* Second element is the predict function result */
+			newelems[1] = predict_result;
+			
+			/* Create new array with 2 elements using construct_array */
+			if (typeid == INT4OID) {
+				newarraydatum = PointerGetDatum(construct_array_builtin(newelems, 2, typeid));
+			} else {
+				newarraydatum = PointerGetDatum(construct_array(newelems, 2, typeid, typlen, typbyval, typalign));
+			}
+			
 			/* Modify the tuple with the updated array value */
 			replisnull = false;
 			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc,
