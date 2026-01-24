@@ -108,6 +108,8 @@ get_predict_function(Oid relid)
 		bool		*nulls;
 		int		nitems;
 		int		i;
+		const char *prefix = "predict_function=";
+		const size_t prefix_len = 17;
 
 		/* Deconstruct the array */
 		deconstruct_array(array, TEXTOID, -1, false, 'i', &elems, &nulls, &nitems);
@@ -115,62 +117,21 @@ get_predict_function(Oid relid)
 		/* Iterate through the array elements */
 		for (i = 0; i < nitems; i++)
 		{
-			bool match;
-			const char *expected;
-			int j;
-			text		*t;
-			char		*text_str;
-			int		text_len;
-			char		*opt_str;
-			int		len;
-
-			/* Check if the element is null */
 			if (!nulls[i])
 			{
-				/* Get the text string from the datum */
-				t = DatumGetTextP(elems[i]);
-				text_str = VARDATA(t);
-				text_len = VARSIZE(t) - VARHDRSZ;
+				text		*t = DatumGetTextP(elems[i]);
+				char		*text_str = VARDATA(t);
+				int		text_len = VARSIZE(t) - VARHDRSZ;
 
-				/* Log the actual reloption string */
-				opt_str = palloc(text_len + 1);
-				memcpy(opt_str, text_str, text_len);
-				opt_str[text_len] = '\0';
-				elog(LOG, "get_predict_function: reloption %d: '%s'", i, opt_str);
-				
-				/* Check each character individually to avoid any string comparison issues */
-				match = true;
-				expected = "predict_function=";
-				for (j = 0; j < 17; j++)
+				/* Check if the option matches the expected prefix */
+				if (text_len > prefix_len && strncmp(text_str, prefix, prefix_len) == 0)
 				{
-					if (opt_str[j] != expected[j])
-					{
-						match = false;
-						elog(LOG, "get_predict_function: mismatch at position %d: '%c' (%d) != '%c' (%d)", j, opt_str[j], (int)opt_str[j], expected[j], (int)expected[j]);
-						break;
-					}
-				}
-				
-				/* Look for predict_function keyword using individual character comparison */
-				if (text_len > 17 && match)
-				{
-					/* Extract the function name */
-					len = text_len - 17;
-					predict_func = palloc(len + 1);
-					memcpy(predict_func, opt_str + 17, len);
-					predict_func[len] = '\0';
+					/* Extract the function name directly from text_str */
+					predict_func = palloc(text_len - prefix_len + 1);
+					memcpy(predict_func, text_str + prefix_len, text_len - prefix_len);
+					predict_func[text_len - prefix_len] = '\0';
 					break;
 				}
-				else
-				{
-					elog(LOG, "get_predict_function: condition not met, text_len=%d, match=%d", text_len, match);
-				}
-				
-				pfree(opt_str);
-			}
-			else
-			{
-				elog(LOG, "get_predict_function: reloption %d is null", i);
 			}
 		}
 
