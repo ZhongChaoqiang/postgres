@@ -507,6 +507,14 @@ static relopt_enum_elt_def StdRdOptIndexCleanupValues[] =
 	{(const char *) NULL}		/* list terminator */
 };
 
+/* values from StdRdOptPredictTiming */
+static relopt_enum_elt_def StdRdOptPredictTimingValues[] =
+{
+	{"deferred", STDRD_OPTION_PREDICT_TIMING_DEFERRED},
+	{"immediate", STDRD_OPTION_PREDICT_TIMING_IMMEDIATE},
+	{(const char *) NULL}		/* list terminator */
+};
+
 /* values from GistOptBufferingMode */
 static relopt_enum_elt_def gistBufferingOptValues[] =
 {
@@ -537,6 +545,17 @@ static relopt_enum enumRelOpts[] =
 		StdRdOptIndexCleanupValues,
 		STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO,
 		gettext_noop("Valid values are \"on\", \"off\", and \"auto\".")
+	},
+	{
+		{
+			"predict_timing",
+			"Controls when prediction operations are performed",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+		StdRdOptPredictTimingValues,
+		STDRD_OPTION_PREDICT_TIMING_DEFERRED,
+		gettext_noop("Valid values are \"deferred\" and \"immediate\".")
 	},
 	{
 		{
@@ -1923,6 +1942,8 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, parallel_workers)},
 		{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
+		{"predict_timing", RELOPT_TYPE_ENUM,
+		offsetof(StdRdOptions, predict_timing)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, vacuum_truncate), offsetof(StdRdOptions, vacuum_truncate_set)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,

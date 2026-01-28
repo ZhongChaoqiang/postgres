@@ -338,6 +338,13 @@ typedef enum StdRdOptIndexCleanup
 	STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON,
 } StdRdOptIndexCleanup;
 
+/* StdRdOptions->predict_timing values */
+typedef enum StdRdOptPredictTiming
+{
+	STDRD_OPTION_PREDICT_TIMING_DEFERRED = 0,
+	STDRD_OPTION_PREDICT_TIMING_IMMEDIATE,
+} StdRdOptPredictTiming;
+
 typedef struct StdRdOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
@@ -347,6 +354,7 @@ typedef struct StdRdOptions
 	bool		user_catalog_table; /* use as an additional catalog relation */
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
+	StdRdOptPredictTiming predict_timing;		/* controls prediction timing */
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
 	bool		vacuum_truncate_set;	/* whether vacuum_truncate is set */
 
