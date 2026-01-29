@@ -585,6 +585,19 @@ static relopt_enum enumRelOpts[] =
 
 static relopt_string stringRelOpts[] =
 {
+	{
+		{
+			"predict_function",
+			"Sets the prediction function for the table",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+		0,
+		true,
+		NULL,
+		NULL,
+		NULL
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -1944,6 +1957,8 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
 		{"predict_timing", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, predict_timing)},
+		{"predict_function", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, predict_function)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, vacuum_truncate), offsetof(StdRdOptions, vacuum_truncate_set)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,

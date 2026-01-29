@@ -356,6 +356,7 @@ typedef struct StdRdOptions
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
 	StdRdOptPredictTiming predict_timing;		/* controls prediction timing */
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
+	int		predict_function;	/* offset to predict function name string */
 	bool		vacuum_truncate_set;	/* whether vacuum_truncate is set */
 
 	/*
