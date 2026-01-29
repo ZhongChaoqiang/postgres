@@ -16,6 +16,7 @@ PREDICT功能的主要实现包括：
 - 预测函数查找机制（从reloptions获取）
 - 预测触发器函数（predict_trigger）
 - PREDICT列验证函数（is_predict_column）
+- 预测时机控制选项（predict_timing表选项）
 
 ### 1.2 设计目标
 - 提供灵活的数据预测机制
@@ -159,6 +160,50 @@ col_qualifier:
     PREDICT { $$ = makePredictQualifier(); }
     | /* 其他限定符 */
 ;
+```
+
+#### 3.2.3 predict_timing表选项语法
+在`reloptions.c`中定义`predict_timing`表选项：
+
+```c
+/* predict_timing选项的枚举值定义 */
+typedef enum StdRdOptPredictTiming
+{
+    STDRD_OPTION_PREDICT_TIMING_DEFERRED = 0,
+    STDRD_OPTION_PREDICT_TIMING_IMMEDIATE,
+} StdRdOptPredictTiming;
+
+/* 在StdRdOptions结构体中添加字段 */
+typedef struct StdRdOptions
+{
+    // ... 现有字段
+    StdRdOptPredictTiming predict_timing;    /* 控制预测时机 */
+    int predict_function;                    /* 预测函数名称字符串偏移量 */
+} StdRdOptions;
+
+/* 在enumRelOpts数组中添加选项定义 */
+static relopt_enum_elt_def StdRdOptPredictTimingValues[] =
+{
+    {"deferred", STDRD_OPTION_PREDICT_TIMING_DEFERRED},
+    {"immediate", STDRD_OPTION_PREDICT_TIMING_IMMEDIATE},
+    {(const char *) NULL} /* 列表终止符 */
+};
+
+static relopt_enum enumRelOpts[] =
+{
+    {
+        {
+            "predict_timing",
+            "Controls when prediction operations are performed",
+            RELOPT_KIND_HEAP,
+            AccessExclusiveLock
+        },
+        StdRdOptPredictTimingValues,
+        STDRD_OPTION_PREDICT_TIMING_DEFERRED,
+        gettext_noop("Valid values are \"deferred\" and \"immediate\".")
+    },
+    // ... 其他选项
+};
 ```
 
 ### 3.3 预测触发器设计
@@ -396,6 +441,30 @@ CREATE TABLE sensor_data (
     predict_function = 'temperature_predict'
 );
 
+-- 使用predict_timing选项控制预测时机
+CREATE TABLE sensor_data (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP,
+    temperature FLOAT PREDICT
+) WITH (predict_timing = immediate);  -- 立即执行预测
+
+-- 或者使用默认的延迟预测
+CREATE TABLE sensor_data (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP,
+    temperature FLOAT PREDICT
+) WITH (predict_timing = deferred);  -- 延迟执行预测（默认值）
+
+-- 使用ALTER TABLE修改预测时机
+ALTER TABLE sensor_data SET (predict_timing = immediate);
+ALTER TABLE sensor_data SET (predict_timing = deferred);
+
+-- 重置为默认值
+ALTER TABLE sensor_data RESET (predict_timing);
+
+-- 同时设置多个选项
+ALTER TABLE sensor_data SET (predict_timing = immediate, fillfactor = 80);
+
 -- 创建预测函数（接受基础类型参数）
 CREATE OR REPLACE FUNCTION temperature_predict(FLOAT) 
 RETURNS FLOAT AS $
@@ -460,9 +529,101 @@ CREATE TABLE example (
 ) WITH (
     predict_function = 'custom_predict_func'
 );
+
+-- 预测时机控制（新增）
+CREATE TABLE example (
+    data INTEGER[] PREDICT
+) WITH (
+    predict_timing = deferred,      -- 延迟预测（默认）
+    predict_function = 'custom_predict_func'
+);
 ```
 
-当前版本主要支持预测函数配置，其他高级功能尚未实现。
+### 6.3 predict_timing表选项详细设计
+
+#### 6.3.1 功能概述
+`predict_timing`表选项用于控制PREDICT列的预测执行时机，提供两种模式：
+- **deferred**（默认）：延迟预测模式，在事务提交时执行预测
+- **immediate**：立即预测模式，在INSERT语句执行时立即执行预测
+
+#### 6.3.2 设计原理
+```mermaid
+graph TB
+    A[INSERT语句] --> B{预测时机模式}
+    B -->|immediate| C[立即执行预测]
+    B -->|deferred| D[延迟到事务提交]
+    C --> E[返回预测结果]
+    D --> F[事务提交时执行预测]
+    F --> G[异步更新预测数据]
+```
+
+#### 6.3.3 实现机制
+
+**核心数据结构**：
+```c
+/* 在src/include/utils/rel.h中定义 */
+typedef enum StdRdOptPredictTiming
+{
+    STDRD_OPTION_PREDICT_TIMING_DEFERRED = 0,    /* 延迟预测 */
+    STDRD_OPTION_PREDICT_TIMING_IMMEDIATE,       /* 立即预测 */
+} StdRdOptPredictTiming;
+
+/* 在StdRdOptions结构体中添加字段 */
+typedef struct StdRdOptions
+{
+    // ... 现有字段
+    StdRdOptPredictTiming predict_timing;        /* 预测时机控制 */
+    int predict_function;                        /* 预测函数名称偏移量 */
+} StdRdOptions;
+```
+
+**选项注册**：
+```c
+/* 在src/backend/access/common/reloptions.c中注册 */
+static relopt_enum_elt_def StdRdOptPredictTimingValues[] =
+{
+    {"deferred", STDRD_OPTION_PREDICT_TIMING_DEFERRED},
+    {"immediate", STDRD_OPTION_PREDICT_TIMING_IMMEDIATE},
+    {(const char *) NULL} /* 列表终止符 */
+};
+
+static relopt_enum enumRelOpts[] =
+{
+    {
+        {
+            "predict_timing",
+            "Controls when prediction operations are performed",
+            RELOPT_KIND_HEAP,
+            AccessExclusiveLock
+        },
+        StdRdOptPredictTimingValues,
+        STDRD_OPTION_PREDICT_TIMING_DEFERRED,
+        gettext_noop("Valid values are \"deferred\" and \"immediate\".")
+    },
+    // ... 其他选项
+};
+```
+
+#### 6.3.4 使用场景
+
+**立即预测模式（immediate）适用场景**：
+- 需要立即获取预测结果的实时应用
+- 预测计算开销较小的场景
+- 对数据一致性要求不高的应用
+
+**延迟预测模式（deferred）适用场景**：
+- 批量插入数据的场景
+- 预测计算开销较大的场景
+- 对事务性能要求较高的应用
+- 需要保证数据一致性的关键业务
+
+#### 6.3.5 兼容性考虑
+- `predict_timing`选项与现有的`predict_function`选项完全兼容
+- 支持CREATE TABLE和ALTER TABLE语法
+- 支持与PostgreSQL其他表选项同时使用
+- 默认值为`deferred`，确保向后兼容性
+
+当前版本支持预测函数配置和预测时机控制，其他高级功能可根据需求逐步实现。
 
 ## 7. 错误处理
 
