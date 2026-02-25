@@ -253,9 +253,9 @@ sequenceDiagram
         PredictTrigger->>PredictQueue: 保存到延迟队列
         PredictTrigger->>PredictTrigger: 构造部分数组[用户数据, NULL]
         
-        Note over PredictTrigger,Transaction: 事务提交时执行预测
+        Note over PredictTrigger,Transaction: 异步线程执行预测
         Client->>Transaction: COMMIT
-        Transaction->>PredictTrigger: 调用延迟预测处理
+        Transaction->>PredictTrigger: 触发异步预测处理
         PredictTrigger->>PredictQueue: 获取延迟队列项
         loop 遍历队列项
             PredictTrigger->>PredictFunction: 调用预测函数(历史数据)
@@ -267,6 +267,46 @@ sequenceDiagram
     PredictTrigger->>Executor: 返回修改后的元组（数组类型）
     Executor->>Client: 执行完成
 ```
+
+### 3.3.3 预测函数调用控制
+
+#### 3.3.3.1 实现细节
+
+根据`predict_timing`选项的值，预测触发器会决定是否在INSERT时立即调用预测函数：
+
+- **immediate模式**：在BEFORE INSERT触发器中立即调用预测函数，构造完整的数组`[用户数据, 预测数据]`
+- **deferred模式**：在BEFORE INSERT触发器中跳过预测函数调用，构造部分数组`[用户数据, NULL]`，预测计算通过异步线程执行
+
+#### 3.3.3.2 代码实现
+
+```c
+Datum predict_trigger(PG_FUNCTION_ARGS)
+{
+    // ... 现有代码 ...
+    
+    /* 检查predict_timing选项 */
+    StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
+    StdRdOptPredictTiming predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
+    
+    if (relopts != NULL)
+        predict_timing = relopts->predict_timing;
+    
+    /* 只有在immediate模式下才调用预测函数 */
+    if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
+    {
+        // 调用预测函数的逻辑
+    }
+    
+    // ... 构造数组和返回结果 ...
+}
+```
+
+#### 3.3.3.3 行为变化
+
+| 预测时机模式 | 预测函数调用时机 | 数组构造方式 | 性能影响 |
+|-------------|-----------------|-------------|----------|
+| immediate   | INSERT时立即调用 | [用户数据, 预测数据] | 插入时性能开销较大，但实时获得预测结果 |
+| deferred    | 异步线程调用     | [用户数据, NULL] | 插入时性能开销较小，适合批量操作 |
 
 ### 3.4 预测函数调用机制
 
@@ -608,7 +648,7 @@ void UpdatePredictedValue(Oid relid, ItemPointer ctid, int attnum,
 **增强后的函数调用流程**：
 - 根据`predict_timing`选项决定是否立即调用预测函数
 - `immediate`模式：立即调用预测函数
-- `deferred`模式：保存到延迟队列，事务提交时批量调用
+- `deferred`模式：保存到延迟队列，通过异步线程批量调用
 
 ## 5. 接口设计
 
@@ -726,7 +766,7 @@ CREATE TABLE example (
 
 #### 6.3.1 功能概述
 `predict_timing`表选项用于控制PREDICT列的预测执行时机，提供两种模式：
-- **deferred**（默认）：延迟预测模式，在事务提交时执行预测
+- **deferred**（默认）：延迟预测模式，通过异步线程执行预测
 - **immediate**：立即预测模式，在INSERT语句执行时立即执行预测
 
 #### 6.3.2 设计原理
@@ -736,7 +776,7 @@ graph TB
     B -->|immediate| C[立即执行预测]
     B -->|deferred| D[延迟到事务提交]
     C --> E[返回预测结果]
-    D --> F[事务提交时执行预测]
+    D --> F[异步线程执行预测]
     F --> G[异步更新预测数据]
 ```
 
@@ -797,7 +837,7 @@ static relopt_enum enumRelOpts[] =
 **延迟预测模式（deferred）实现**：
 - 在INSERT时仅保存用户数据到队列中
 - 将数组第二个元素设置为NULL值
-- 在事务提交时异步执行预测计算
+- 通过异步线程执行预测计算
 - 更新队列中记录的预测数据
 
 #### 6.3.5 延迟预测队列设计
@@ -952,7 +992,7 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
 **延迟预测模式（deferred）实现**：
 - 在BEFORE INSERT触发器中仅保存当前行数据到延迟队列
 - 存储数组第二个元素填入NULL值：[历史数据, NULL]
-- 在事务提交时异步执行预测计算
+- 通过异步线程执行预测计算
 - 更新存储数组中的预测数据部分
 
 #### 6.3.5 延迟预测队列设计
@@ -979,7 +1019,7 @@ typedef struct DeferredPredictQueue
 **队列管理机制**：
 - 使用事务级内存上下文存储延迟预测队列
 - 每个事务维护独立的延迟预测队列
-- 事务提交时统一处理队列中的所有预测项
+- 通过异步线程统一处理队列中的所有预测项
 - 事务回滚时自动清理队列
 
 #### 6.3.6 预测触发器算法增强
@@ -1077,7 +1117,7 @@ typedef struct TransactionStateData
 
 ### 7.3 延迟预测执行流程
 
-**事务提交时的预测执行详细流程**：
+**异步线程预测执行详细流程**：
 ```mermaid
 sequenceDiagram
     participant Client
@@ -1088,7 +1128,7 @@ sequenceDiagram
     participant Storage
     
     Client->>Transaction: COMMIT
-    Transaction->>PredictHook: 调用事务提交钩子
+    Transaction->>PredictHook: 触发异步预测处理
     PredictHook->>PredictQueue: 获取延迟预测队列
     PredictQueue->>PredictHook: 返回队列项列表
     

@@ -36,6 +36,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
 #include "nodes/makefuncs.h"
+#include "access/reloptions.h"
 
 /*
  * is_predict_column - check if a column has PREDICT attribute
@@ -232,65 +233,77 @@ predict_trigger(PG_FUNCTION_ARGS)
 			if (isnull)
 				return PointerGetDatum(newtuple); /* NULL first element, no action needed */
 
-			/* Process predict function if available */
+			/* Process predict function if available and predict_timing is immediate */
 			Datum predict_result = firstelem;
-			char *predict_func_name = get_predict_function(rel->rd_id);
 			
-			if (predict_func_name != NULL)
+			/* Check predict_timing option */
+			StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
+			StdRdOptPredictTiming predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
+			
+			if (relopts != NULL)
+				predict_timing = relopts->predict_timing;
+			
+			/* Only call predict function in immediate mode */
+			if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
 			{
-				/* Look up the predict function OID */
-				Oid predict_func_oid = InvalidOid;
-				char *search_func_name;
-				char *funcname_only;
-				FuncCandidateList clist;
-				int fgc_flags;
+				char *predict_func_name = get_predict_function(rel->rd_id);
 				
-				/* Construct function name with schema if needed */
-				if (strchr(predict_func_name, '.') == NULL)
-					search_func_name = psprintf("public.%s", predict_func_name);
-				else
-					search_func_name = pstrdup(predict_func_name);
-				
-				/* Extract function name without schema */
-				funcname_only = strrchr(search_func_name, '.');
-				if (funcname_only != NULL)
-					funcname_only++;
-				else
-					funcname_only = search_func_name;
-				
-				/* Find function candidates */
-				clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)), 
-											 1, NIL, false, false, false, true, &fgc_flags);
-				
-				/* Check for matching function signature */
-				if (clist != NULL)
+				if (predict_func_name != NULL)
 				{
-					for (; clist != NULL; clist = clist->next)
+					/* Look up the predict function OID */
+					Oid predict_func_oid = InvalidOid;
+					char *search_func_name;
+					char *funcname_only;
+					FuncCandidateList clist;
+					int fgc_flags;
+					
+					/* Construct function name with schema if needed */
+					if (strchr(predict_func_name, '.') == NULL)
+						search_func_name = psprintf("public.%s", predict_func_name);
+					else
+						search_func_name = pstrdup(predict_func_name);
+					
+					/* Extract function name without schema */
+					funcname_only = strrchr(search_func_name, '.');
+					if (funcname_only != NULL)
+						funcname_only++;
+					else
+						funcname_only = search_func_name;
+					
+					/* Find function candidates */
+					clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)), 
+												 1, NIL, false, false, false, true, &fgc_flags);
+					
+					/* Check for matching function signature */
+					if (clist != NULL)
 					{
-						if (clist->nargs == 1 && clist->args[0] == typeid)
+						for (; clist != NULL; clist = clist->next)
 						{
-							predict_func_oid = clist->oid;
-							break;
+							if (clist->nargs == 1 && clist->args[0] == typeid)
+							{
+								predict_func_oid = clist->oid;
+								break;
+							}
 						}
 					}
-				}
-				
-				pfree(search_func_name);
-				
-				if (OidIsValid(predict_func_oid))
-				{
-					/* Call the predict function */
-					FmgrInfo predict_func;
-					fmgr_info(predict_func_oid, &predict_func);
 					
-					/* Prepare argument based on typbyval */
-					Datum predict_arg = typbyval ? firstelem : 
-						Int32GetDatum(*((int32 *) DatumGetPointer(firstelem)));
+					pfree(search_func_name);
 					
-					predict_result = FunctionCall1(&predict_func, predict_arg);
+					if (OidIsValid(predict_func_oid))
+					{
+						/* Call the predict function */
+						FmgrInfo predict_func;
+						fmgr_info(predict_func_oid, &predict_func);
+						
+						/* Prepare argument based on typbyval */
+						Datum predict_arg = typbyval ? firstelem : 
+							Int32GetDatum(*((int32 *) DatumGetPointer(firstelem)));
+						
+						predict_result = FunctionCall1(&predict_func, predict_arg);
+					}
+					
+					pfree(predict_func_name);
 				}
-				
-				pfree(predict_func_name);
 			}
 			
 			/* Create updated array */
