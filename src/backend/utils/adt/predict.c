@@ -295,11 +295,8 @@ predict_trigger(PG_FUNCTION_ARGS)
 						FmgrInfo predict_func;
 						fmgr_info(predict_func_oid, &predict_func);
 						
-						/* Prepare argument based on typbyval */
-						Datum predict_arg = typbyval ? firstelem : 
-							Int32GetDatum(*((int32 *) DatumGetPointer(firstelem)));
-						
-						predict_result = FunctionCall1(&predict_func, predict_arg);
+						/* Call with firstelem directly - it's already a proper Datum */
+						predict_result = FunctionCall1(&predict_func, firstelem);
 					}
 					
 					pfree(predict_func_name);
@@ -308,17 +305,29 @@ predict_trigger(PG_FUNCTION_ARGS)
 			
 			/* Create updated array */
 			Datum newelems[2];
+			bool newnulls[2];
+			int dims[1] = {2};
+			int lbs[1] = {1};
 			
 			/* First element stays the same */
-			newelems[0] = typbyval ? firstelem : Int32GetDatum(*((int32 *) DatumGetPointer(firstelem)));
+			newelems[0] = firstelem;
+			newnulls[0] = false;
 			
-			/* Second element is the predict function result */
-			newelems[1] = predict_result;
+			/* Second element: NULL if deferred, predict result if immediate */
+			if (predict_timing == STDRD_OPTION_PREDICT_TIMING_DEFERRED)
+			{
+				newelems[1] = (Datum) 0;
+				newnulls[1] = true;
+			}
+			else
+			{
+				newelems[1] = predict_result;
+				newnulls[1] = false;
+			}
 			
-			/* Construct new array */
-			newarraydatum = (typeid == INT4OID) ?
-				PointerGetDatum(construct_array_builtin(newelems, 2, typeid)) :
-				PointerGetDatum(construct_array(newelems, 2, typeid, typlen, typbyval, typalign));
+			/* Construct new array (use construct_md_array to support NULLs) */
+			newarraydatum = PointerGetDatum(construct_md_array(newelems, newnulls, 1, dims, lbs,
+															  typeid, typlen, typbyval, typalign));
 			
 			/* Update tuple and return */
 			replisnull = false;
