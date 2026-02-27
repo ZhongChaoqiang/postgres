@@ -218,9 +218,17 @@ predict_trigger(PG_FUNCTION_ARGS)
 						 errmsg("column \"%s\" is not an array type for trigger \"predict_trigger\"",
 								NameStr(attr->attname))));
 
-			/* Get type information */
+			/* Get type information for element type */
 			get_typlenbyvalalign(typeid, &typlen, &typbyval, &typalign);
-			get_typlenbyvalalign(arraytypeid, &arrlen, &typbyval, &typalign);
+			
+			/* Get array type length (needed for array_get_element) */
+			{
+				int16		array_typlen;
+				bool		array_typbyval;
+				char		array_typalign;
+				get_typlenbyvalalign(arraytypeid, &array_typlen, &array_typbyval, &array_typalign);
+				arrlen = array_typlen;
+			}
 
 			/* Get array value from tuple */
 			arraydatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
