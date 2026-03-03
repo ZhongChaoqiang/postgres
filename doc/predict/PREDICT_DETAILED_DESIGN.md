@@ -5,7 +5,7 @@
 ### 1.1 功能简介
 PREDICT列和PREDICT函数是PostgreSQL的一个扩展功能，用于在插入数据时自动计算预测值。该功能通过以下组件实现：
 
-- **PREDICT列属性**：标记列为预测列，必须是数组类型
+- **PREDICT列属性**：标记列为预测列，支持任意基础数据类型
 - **PREDICT函数**：用户自定义的预测计算函数
 - **预测触发器**：自动处理预测逻辑的触发器函数
 - **关系选项**：控制预测行为的表级选项
@@ -44,7 +44,7 @@ graph TB
         H --> I[检查PREDICT列]
         I --> J[获取预测函数]
         J --> K[调用预测函数]
-        K --> L[更新数组元素]
+        K --> L[保存结果数据]
         L --> M[返回修改后的元组]
     end
     
@@ -74,8 +74,9 @@ graph TB
 #### 2.2.1 PREDICT列属性
 - 在`pg_attribute`系统表中添加`attpredict`布尔字段
 - 标记该列需要预测处理
-- **定义时**：可以是任意基础类型（如integer、float等）
-- **存储时**：自动转换为数组类型，存储格式为[历史数据, 预测数据]
+- **定义和存储时**：保持原始基础类型（如integer、float等），无需转换为数组
+- **写入时**：根据`predict_timing`选项决定是否调用预测函数
+- **读取时**：直接返回原始数据，无需特殊处理
 
 #### 2.2.2 预测触发器
 - 自动创建的BEFORE INSERT触发器
@@ -98,6 +99,21 @@ graph TB
 - 查询计划缓存和重用机制
 - PREDICT列索引优化考虑
 
+### 2.3 代码实现文件
+
+PREDICT功能涉及以下核心代码文件：
+
+| 文件路径 | 功能说明 |
+|---------|----------|
+| `src/backend/parser/gram.y` | PREDICT关键字语法解析，设置`is_predict`标志 |
+| `src/backend/parser/parse_utilcmd.c` | 建表时列定义处理，保持原始类型不转换 |
+| `src/backend/parser/parse_target.c` | INSERT时目标列处理，直接保存原始数据 |
+| `src/backend/parser/parse_relation.c` | SELECT时列引用处理，直接返回原始数据 |
+| `src/backend/commands/tablecmds.c` | 建表逻辑，创建预测触发器 |
+| `src/backend/utils/adt/predict.c` | 预测触发器函数实现 |
+| `src/include/catalog/pg_attribute.h` | `attpredict`字段定义 |
+| `src/include/nodes/parsenodes.h` | `ColumnDef.is_predict`字段定义 |
+
 ## 3. 详细设计
 
 ### 3.1 数据模型设计
@@ -117,12 +133,13 @@ typedef struct FormData_pg_attribute
     bool        attpredict;     // PREDICT列标记
 } FormData_pg_attribute;
 
-// PREDICT列的类型转换和存储格式
+// PREDICT列的类型处理
 // 定义类型：基础类型（如integer、float等）
-// 存储类型：数组类型，包含两个元素：[历史数据, 预测数据]
-// 用户插入时插入基础类型的值，存储在数组的第一个元素
-// 预测函数基于第一个元素计算第二个元素
-// 查询时只返回第一个元素（转换为原始基础类型）
+// 存储类型：保持原始基础类型，无需转换为数组
+// 写入时：
+//   - deferred模式：直接保存用户输入的数据
+//   - immediate模式：调用预测函数后保存结果
+// 查询时：直接返回原始数据，无需特殊处理
 ```
 
 ### 3.2 语法设计
@@ -131,7 +148,7 @@ typedef struct FormData_pg_attribute
 ```sql
 CREATE TABLE example_table (
     id SERIAL PRIMARY KEY,
-    data_value integer PREDICT,  -- PREDICT列，定义为基础类型，存储时转换为数组
+    data_value integer PREDICT,  -- PREDICT列，保持原始基础类型
     -- 可选：指定预测函数
     predict_function = 'my_predict_func'
 );
@@ -235,36 +252,23 @@ sequenceDiagram
     participant Executor
     participant PredictTrigger
     participant PredictFunction
-    participant PredictQueue
-    participant Transaction
     
     Client->>Parser: INSERT INTO table VALUES (用户数据)
     Parser->>Executor: 解析执行计划
     Executor->>PredictTrigger: 调用BEFORE INSERT触发器
     PredictTrigger->>PredictTrigger: 查找PREDICT列
-    PredictTrigger->>PredictTrigger: 提取用户插入的基础类型数据
+    PredictTrigger->>PredictTrigger: 获取用户插入的数据
     PredictTrigger->>PredictTrigger: 检查predict_timing选项
     
     alt immediate模式
         PredictTrigger->>PredictFunction: 立即调用预测函数(用户数据)
         PredictFunction->>PredictTrigger: 返回预测结果
-        PredictTrigger->>PredictTrigger: 构造完整数组[用户数据, 预测数据]
+        PredictTrigger->>PredictTrigger: 保存预测结果到列
     else deferred模式
-        PredictTrigger->>PredictQueue: 保存到延迟队列
-        PredictTrigger->>PredictTrigger: 构造部分数组[用户数据, NULL]
-        
-        Note over PredictTrigger,Transaction: 异步线程执行预测
-        Client->>Transaction: COMMIT
-        Transaction->>PredictTrigger: 触发异步预测处理
-        PredictTrigger->>PredictQueue: 获取延迟队列项
-        loop 遍历队列项
-            PredictTrigger->>PredictFunction: 调用预测函数(历史数据)
-            PredictFunction->>PredictTrigger: 返回预测结果
-            PredictTrigger->>Executor: 更新元组预测数据
-        end
+        PredictTrigger->>PredictTrigger: 直接保存用户数据
     end
     
-    PredictTrigger->>Executor: 返回修改后的元组（数组类型）
+    PredictTrigger->>Executor: 返回修改后的元组
     Executor->>Client: 执行完成
 ```
 
@@ -272,41 +276,84 @@ sequenceDiagram
 
 #### 3.3.3.1 实现细节
 
-根据`predict_timing`选项的值，预测触发器会决定是否在INSERT时立即调用预测函数：
+根据`predict_timing`选项的值，预测触发器会决定是否在INSERT时调用预测函数：
 
-- **immediate模式**：在BEFORE INSERT触发器中立即调用预测函数，构造完整的数组`[用户数据, 预测数据]`
-- **deferred模式**：在BEFORE INSERT触发器中跳过预测函数调用，构造部分数组`[用户数据, NULL]`，预测计算通过异步线程执行
+- **immediate模式**：在BEFORE INSERT触发器中立即调用预测函数，将预测结果保存到列中
+- **deferred模式**：在BEFORE INSERT触发器中跳过预测函数调用，直接保存用户输入的数据
 
 #### 3.3.3.2 代码实现
 
 ```c
 Datum predict_trigger(PG_FUNCTION_ARGS)
 {
-    // ... 现有代码 ...
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+    HeapTuple newtuple = trigdata->tg_trigtuple;
+    TupleDesc tupdesc = RelationGetDescr(trigdata->tg_relation);
+    Relation rel = trigdata->tg_relation;
     
-    /* 检查predict_timing选项 */
-    StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
-    StdRdOptPredictTiming predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
-    
-    if (relopts != NULL)
-        predict_timing = relopts->predict_timing;
-    
-    /* 只有在immediate模式下才调用预测函数 */
-    if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
+    // 遍历所有列查找PREDICT列
+    for (int attnum = 1; attnum <= tupdesc->natts; attnum++)
     {
-        // 调用预测函数的逻辑
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+        
+        if (attr->attpredict && !attr->attisdropped)
+        {
+            // 获取用户插入的数据
+            Datum coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+            if (isnull) continue;
+            
+            Datum resultdatum;
+            
+            // 检查predict_timing选项
+            StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
+            StdRdOptPredictTiming predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
+            
+            if (relopts != NULL)
+                predict_timing = relopts->predict_timing;
+            
+            if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
+            {
+                // 立即预测模式：调用预测函数
+                char *predict_func = get_predict_function(rel->rd_id);
+                
+                if (predict_func != NULL)
+                {
+                    Oid func_oid = find_predict_function_oid(predict_func, attr->atttypid);
+                    if (OidIsValid(func_oid))
+                    {
+                        resultdatum = call_predict_function(func_oid, coldatum);
+                    }
+                    else
+                    {
+                        resultdatum = coldatum;
+                    }
+                }
+                else
+                {
+                    resultdatum = coldatum;
+                }
+            }
+            else
+            {
+                // 延迟预测模式：直接保存用户数据
+                resultdatum = coldatum;
+            }
+            
+            // 更新元组
+            newtuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum, &resultdatum, &false);
+        }
     }
     
-    // ... 构造数组和返回结果 ...
+    PG_RETURN_POINTER(newtuple);
 }
 ```
 
 #### 3.3.3.3 行为变化
 
-| 预测时机模式 | 预测函数调用时机 | 数组构造方式 | 性能影响 |
+| 预测时机模式 | 预测函数调用时机 | 数据保存方式 | 性能影响 |
 |-------------|-----------------|-------------|----------|
-| immediate   | INSERT时立即调用 | [用户数据, 预测数据] | 插入时性能开销较大，但实时获得预测结果 |
-| deferred    | 异步线程调用     | [用户数据, NULL] | 插入时性能开销较小，适合批量操作 |
+| immediate   | INSERT时立即调用 | 预测函数结果 | 插入时性能开销较大，但实时获得预测结果 |
+| deferred    | 不调用           | 用户原始数据 | 插入时性能开销最小 |
 
 ### 3.4 预测函数调用机制
 
@@ -343,10 +390,10 @@ Oid find_predict_function_oid(char *func_name, Oid element_type)
 
 ### 3.5 查询处理流程
 
-根据当前代码分析，查询时PREDICT列的处理相对简单：
-- PREDICT列在存储时是数组类型
-- 查询时直接返回数组值，没有特殊的处理逻辑
-- 预测数据存储在数组中，查询时可见
+PREDICT列在查询时直接返回原始数据，无需特殊处理：
+- PREDICT列保持原始基础类型
+- 查询时直接返回列值，与普通列行为一致
+- 无需数组下标访问或类型转换
 
 #### 3.4.2 函数调用流程
 ```c
@@ -388,23 +435,28 @@ sequenceDiagram
     Parser->>Executor: 解析执行计划
     Executor->>PredictTrigger: 调用BEFORE INSERT触发器
     PredictTrigger->>PredictTrigger: 查找PREDICT列
-    PredictTrigger->>PredictTrigger: 验证数组类型
-    PredictTrigger->>PredictTrigger: 提取用户插入的数据
-    PredictTrigger->>PredictFunc: 调用预测函数(用户数据)
-    PredictFunc->>PredictTrigger: 返回预测结果
-    PredictTrigger->>PredictTrigger: 构造数组[用户数据, 预测数据]
+    PredictTrigger->>PredictTrigger: 获取用户插入的数据
+    PredictTrigger->>PredictTrigger: 检查predict_timing选项
+    
+    alt immediate模式
+        PredictTrigger->>PredictFunc: 调用预测函数(用户数据)
+        PredictFunc->>PredictTrigger: 返回预测结果
+        PredictTrigger->>PredictTrigger: 保存预测结果
+    else deferred模式
+        PredictTrigger->>PredictTrigger: 直接保存用户数据
+    end
+    
     PredictTrigger->>Executor: 返回修改后的元组
     Executor->>Client: 执行完成
 ```
 
-#### 4.1.2 增强的预测触发器算法说明
+#### 4.1.2 预测触发器算法说明
 - 在BEFORE INSERT触发器中处理PREDICT列
 - 根据`predict_timing`选项决定预测时机
-- **immediate模式**：立即执行预测计算
-- **deferred模式**：保存到延迟队列，数组第二个元素填NULL
+- **immediate模式**：立即执行预测计算，保存预测结果
+- **deferred模式**：直接保存用户输入的数据
 - 从表选项中获取预测函数名称
-- 调用预测函数处理数组第一个元素
-- 构造包含预测结果的新数组
+- 调用预测函数处理数据并保存结果
 
 ```c
 Datum predict_trigger(PG_FUNCTION_ARGS)
@@ -428,70 +480,30 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
         
         if (attr->attpredict && !attr->attisdropped)
         {
-            // 验证是否为数组类型
-            Oid array_type = attr->atttypid;
-            Oid element_type = get_base_element_type(array_type);
-            
-            if (!OidIsValid(element_type))
-                ereport(ERROR, (...));
-            
-            // 获取数组值
-            Datum array_datum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+            // 获取用户插入的数据
+            Datum coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
             if (isnull) continue;
             
-            // 获取第一个元素（历史数据）
-            int lower_index[1] = {1};
-            Datum historical_data = array_get_element(array_datum, 1, lower_index, ...);
-            
-            Datum predicted_value;
-            bool is_null = false;
+            Datum resultdatum = coldatum;
             
             if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
             {
-                // 立即预测模式：立即执行预测计算
+                // 立即预测模式：执行预测计算
                 char *predict_func = get_predict_function(rel->rd_id);
                 
                 if (predict_func != NULL)
                 {
-                    Oid func_oid = find_predict_function_oid(predict_func, element_type);
+                    Oid func_oid = find_predict_function_oid(predict_func, attr->atttypid);
                     if (OidIsValid(func_oid))
                     {
-                        predicted_value = call_predict_function(func_oid, historical_data, element_type);
-                    }
-                    else
-                    {
-                        predicted_value = (Datum) 0;
-                        is_null = true;
+                        resultdatum = call_predict_function(func_oid, coldatum);
                     }
                 }
-                else
-                {
-                    predicted_value = (Datum) 0;
-                    is_null = true;
-                }
             }
-            else // deferred模式
-            {
-                // 延迟预测模式：保存到延迟队列，预测值设为NULL
-                predicted_value = (Datum) 0;
-                is_null = true;
-                
-                // 保存到延迟预测队列
-                AddToDeferredPredictQueue(rel->rd_id, 
-                                         &(newtuple->t_self), 
-                                         attnum, 
-                                         historical_data, 
-                                         element_type, 
-                                         false);
-            }
-            
-            // 构造新数组
-            Datum new_elements[2] = {historical_data, predicted_value};
-            bool new_elements_null[2] = {false, is_null};
-            Datum new_array = construct_array(new_elements, 2, element_type, ...);
             
             // 更新元组
-            newtuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum, &new_array, &isnull);
+            bool isnull = false;
+            newtuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum, &resultdatum, &isnull);
         }
     }
     
@@ -514,141 +526,22 @@ sequenceDiagram
     RelOptions->>Trigger: 返回predict_function值
     Trigger->>SysCache: 查找预测函数OID
     SysCache->>Trigger: 返回函数OID
-    Trigger->>PredictFunc: 调用预测函数(历史数据)
+    Trigger->>PredictFunc: 调用预测函数(用户数据)
     PredictFunc->>Trigger: 返回预测结果
-    Trigger->>Trigger: 构造新数组[历史数据, 预测数据]
+    Trigger->>Trigger: 保存结果到列
     Trigger->>Executor: 返回修改后的元组
 ```
 
-#### 4.3.2 延迟预测队列管理函数
-
-**队列管理函数设计**：
-```c
-/* 获取当前事务的延迟预测队列 */
-DeferredPredictQueue* GetCurrentDeferredPredictQueue(void)
-{
-    TransactionState s = CurrentTransactionState;
-    
-    if (s->predict_queue == NULL)
-    {
-        /* 创建新的延迟预测队列 */
-        MemoryContext oldctx = MemoryContextSwitchTo(s->curTransactionContext);
-        
-        s->predict_queue = palloc0(sizeof(DeferredPredictQueue));
-        s->predict_queue->items = NIL;
-        s->predict_queue->mctx = s->curTransactionContext;
-        
-        MemoryContextSwitchTo(oldctx);
-    }
-    
-    return s->predict_queue;
-}
-
-/* 添加预测项到延迟队列 */
-void AddToDeferredPredictQueue(Oid relid, ItemPointer ctid, int attnum, 
-                              Datum historical_data, Oid element_type, bool isnull)
-{
-    DeferredPredictQueue *queue = GetCurrentDeferredPredictQueue();
-    
-    MemoryContext oldctx = MemoryContextSwitchTo(queue->mctx);
-    
-    DeferredPredictItem *item = palloc0(sizeof(DeferredPredictItem));
-    item->relid = relid;
-    item->ctid = *ctid;  /* 复制ctid值 */
-    item->attnum = attnum;
-    item->element_type = element_type;
-    item->isnull = isnull;
-    
-    if (!isnull)
-    {
-        /* 复制数据值到事务内存上下文 */
-        if (get_typbyval(element_type))
-        {
-            item->historical_data = historical_data;
-        }
-        else
-        {
-            Size data_size = datumGetSize(historical_data, false, -1);
-            item->historical_data = datumCopy(historical_data, false, data_size);
-        }
-    }
-    else
-    {
-        item->historical_data = (Datum) 0;
-    }
-    
-    queue->items = lappend(queue->items, item);
-    
-    MemoryContextSwitchTo(oldctx);
-}
-
-/* 清理延迟预测队列 */
-void ClearDeferredPredictQueue(void)
-{
-    TransactionState s = CurrentTransactionState;
-    
-    if (s->predict_queue != NULL)
-    {
-        /* 清理队列中的项 */
-        ListCell *lc;
-        foreach(lc, s->predict_queue->items)
-        {
-            DeferredPredictItem *item = lfirst(lc);
-            pfree(item);
-        }
-        
-        list_free(s->predict_queue->items);
-        pfree(s->predict_queue);
-        s->predict_queue = NULL;
-    }
-}
-
-/* 更新预测值到实际元组 */
-void UpdatePredictedValue(Oid relid, ItemPointer ctid, int attnum, 
-                         Datum historical_data, Datum predicted_value)
-{
-    Relation rel = relation_open(relid, RowExclusiveLock);
-    
-    /* 根据ctid查找元组 */
-    HeapTuple tuple = heap_get_tuple_by_ctid(rel, ctid);
-    
-    if (tuple != NULL)
-    {
-        TupleDesc tupdesc = RelationGetDescr(rel);
-        
-        /* 构造新数组 */
-        Datum new_elements[2] = {historical_data, predicted_value};
-        bool new_elements_null[2] = {false, false};
-        
-        Datum new_array = construct_array(new_elements, 2, 
-                                         get_base_element_type(tupdesc->attrs[attnum-1].atttypid), 
-                                         -1, false, 'i');
-        
-        /* 更新元组 */
-        HeapTuple newtuple = heap_modify_tuple_by_cols(tuple, tupdesc, 
-                                                      1, &attnum, &new_array, &false);
-        
-        /* 更新到表中 */
-        heap_inplace_update(rel, newtuple);
-        
-        heap_freetuple(newtuple);
-    }
-    
-    relation_close(rel, RowExclusiveLock);
-}
-```
-
-#### 4.3.3 函数调用流程说明
+#### 4.3.2 函数调用流程说明
 根据当前代码，预测函数调用流程包括：
 - 从表reloptions中提取预测函数名称
 - 查找匹配的预测函数OID
 - 调用预测函数处理数据
-- 构造包含预测结果的新数组
+- 将结果直接保存到列中
 
-**增强后的函数调用流程**：
-- 根据`predict_timing`选项决定是否立即调用预测函数
-- `immediate`模式：立即调用预测函数
-- `deferred`模式：保存到延迟队列，通过异步线程批量调用
+**函数调用模式**：
+- `immediate`模式：立即调用预测函数，保存预测结果
+- `deferred`模式：不调用预测函数，保存用户原始数据
 
 ## 5. 接口设计
 
@@ -660,7 +553,7 @@ void UpdatePredictedValue(Oid relid, ItemPointer ctid, int attnum,
 CREATE TABLE sensor_data (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP,
-    temperature FLOAT PREDICT,  -- PREDICT列，定义为基础类型
+    temperature FLOAT PREDICT,  -- PREDICT列，保持原始基础类型
     predict_function = 'temperature_predict'
 );
 
@@ -735,7 +628,7 @@ PREDICT功能的内部接口主要包括：
 ```sql
 -- 预测函数指定（已实现）
 CREATE TABLE example (
-    data INTEGER[] PREDICT
+    data INTEGER PREDICT
 ) WITH (
     predict_function = 'custom_predict_func'
 );
@@ -748,14 +641,14 @@ CREATE TABLE example (
 ```sql
 -- 预测函数指定
 CREATE TABLE example (
-    data INTEGER[] PREDICT
+    data INTEGER PREDICT
 ) WITH (
     predict_function = 'custom_predict_func'
 );
 
 -- 预测时机控制（新增）
 CREATE TABLE example (
-    data INTEGER[] PREDICT
+    data INTEGER PREDICT
 ) WITH (
     predict_timing = deferred,      -- 延迟预测（默认）
     predict_function = 'custom_predict_func'
@@ -766,18 +659,17 @@ CREATE TABLE example (
 
 #### 6.3.1 功能概述
 `predict_timing`表选项用于控制PREDICT列的预测执行时机，提供两种模式：
-- **deferred**（默认）：延迟预测模式，通过异步线程执行预测
-- **immediate**：立即预测模式，在INSERT语句执行时立即执行预测
+- **deferred**（默认）：延迟预测模式，直接保存用户输入的数据
+- **immediate**：立即预测模式，在INSERT语句执行时立即执行预测并保存结果
 
 #### 6.3.2 设计原理
 ```mermaid
 graph TB
     A[INSERT语句] --> B{预测时机模式}
     B -->|immediate| C[立即执行预测]
-    B -->|deferred| D[延迟到事务提交]
-    C --> E[返回预测结果]
-    D --> F[异步线程执行预测]
-    F --> G[异步更新预测数据]
+    B -->|deferred| D[直接保存用户数据]
+    C --> E[保存预测结果]
+    D --> F[保存原始数据]
 ```
 
 #### 6.3.3 实现机制
@@ -831,80 +723,17 @@ static relopt_enum enumRelOpts[] =
 
 **立即预测模式（immediate）实现**：
 - 在INSERT语句执行时立即调用预测函数
-- 构造完整的数组[用户数据, 预测数据]
-- 保持现有的预测触发器流程不变
+- 将预测结果直接保存到列中
+- 保持原始数据类型不变
 
 **延迟预测模式（deferred）实现**：
-- 在INSERT时仅保存用户数据到队列中
-- 将数组第二个元素设置为NULL值
-- 通过异步线程执行预测计算
-- 更新队列中记录的预测数据
+- 在INSERT时直接保存用户输入的数据
+- 不调用预测函数
+- 保持原始数据类型不变
 
-#### 6.3.5 延迟预测队列设计
+#### 6.3.5 预测触发器实现
 
-**按表隔离的队列数据结构（记录完整行数据）**：
-```c
-typedef struct DeferredPredictItem
-{
-    ItemPointer ctid;              /* 元组物理位置 */
-    int attnum;                    /* PREDICT列编号 */
-    Datum historical_data;         /* 历史数据值 */
-    Oid element_type;              /* 基础元素类型 */
-    bool isnull;                   /* 是否为NULL值 */
-    HeapTupleData row_data;        /* 当前行的完整数据（可选） */
-    TupleDesc row_desc;            /* 行数据描述符（可选） */
-} DeferredPredictItem;
-
-typedef struct DeferredPredictTableQueue
-{
-    Oid relid;                     /* 表OID */
-    List *items;                   /* 该表的延迟预测项列表 */
-    TupleDesc table_desc;          /* 表结构描述符 */
-} DeferredPredictTableQueue;
-
-typedef struct DeferredPredictQueue
-{
-    List *table_queues;            /* 按表分组的队列列表 */
-    MemoryContext mctx;            /* 内存上下文 */
-} DeferredPredictQueue;
-```
-
-**队列管理机制**：
-- 每个表维护独立的延迟预测队列
-- 不同表之间的预测数据完全隔离
-- 支持并发插入不同表的PREDICT列
-- 按表组织便于后续的批量处理和优化
-- **记录完整行数据**：保存当前行的完整信息，便于后续预测函数使用上下文数据
-
-**队列管理函数**：
-```c
-/* 获取指定表的延迟预测队列 */
-DeferredPredictTableQueue* GetTableDeferredPredictQueue(Oid relid);
-
-/* 添加预测项到指定表的队列（包含完整行数据） */
-void AddToTableDeferredQueue(Oid relid, ItemPointer ctid, int attnum, 
-                            Datum historical_data, Oid element_type, bool isnull,
-                            HeapTuple row_tuple, TupleDesc tuple_desc);
-
-/* 获取指定表的所有延迟预测项（包含完整上下文） */
-List* GetTableDeferredItems(Oid relid);
-
-/* 清理指定表的延迟预测队列 */
-void ClearTableDeferredQueue(Oid relid);
-
-/* 获取预测项的完整行数据 */
-HeapTuple GetDeferredItemRowData(DeferredPredictItem *item);
-```
-
-**完整行数据记录的优势**：
-- **上下文信息**：预测函数可以访问行的其他列数据，提供更丰富的上下文
-- **批量处理**：后续可以基于完整行数据进行批量预测优化
-- **数据一致性**：确保预测时使用的数据与插入时一致
-- **扩展性**：支持更复杂的预测算法需要多列数据
-
-#### 6.3.6 预测触发器修改设计
-
-**修改后的预测触发器算法**：
+**预测触发器算法**：
 ```c
 Datum predict_trigger(PG_FUNCTION_ARGS)
 {
@@ -927,52 +756,30 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
         
         if (attr->attpredict && !attr->attisdropped)
         {
-            // 验证是否为数组类型
-            Oid array_type = attr->atttypid;
-            Oid element_type = get_base_element_type(array_type);
-            
-            if (!OidIsValid(element_type))
-                ereport(ERROR, (...));
-            
-            // 获取用户插入的基础数据
-            Datum user_data = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+            // 获取用户插入的数据
+            Datum coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
             if (isnull) continue;
+            
+            Datum resultdatum = coldatum;
             
             if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
             {
-                // 立即预测模式：执行现有流程
-                Datum predicted_value = user_data;
+                // 立即预测模式：执行预测计算
                 char *predict_func = get_predict_function(rel->rd_id);
                 
                 if (predict_func != NULL)
                 {
-                    Oid func_oid = find_predict_function_oid(predict_func, element_type);
+                    Oid func_oid = find_predict_function_oid(predict_func, attr->atttypid);
                     if (OidIsValid(func_oid))
                     {
-                        predicted_value = call_predict_function(func_oid, user_data, element_type);
+                        resultdatum = call_predict_function(func_oid, coldatum);
                     }
                 }
-                
-                // 构造完整数组[用户数据, 预测数据]
-                Datum new_elements[2] = {user_data, predicted_value};
-                Datum new_array = construct_array(new_elements, 2, element_type, ...);
-                
-                // 更新元组
-                newtuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum, &new_array, &isnull);
             }
-            else
-            {
-                // 延迟预测模式：保存到队列，数组第二个元素设为NULL
-                Datum new_elements[2] = {user_data, (Datum) 0};  // 第二个元素为NULL
-                Datum new_array = construct_array(new_elements, 2, element_type, ...);
-                
-                // 更新元组
-                newtuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum, &new_array, &isnull);
-                
-                // 保存到延迟预测队列
-                add_to_deferred_queue(rel->rd_id, &newtuple->t_self, attnum, 
-                                     user_data, element_type);
-            }
+            
+            // 更新元组
+            bool isnull = false;
+            newtuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum, &resultdatum, &isnull);
         }
     }
     
@@ -980,187 +787,110 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
 }
 ```
 
-
-
-#### 6.3.4 预测时机控制实现机制
-
-**立即预测模式（immediate）实现**：
-- 在BEFORE INSERT触发器中立即执行预测计算
-- 构造包含[历史数据, 预测数据]的完整数组
-- 保持现有流程不变，确保实时性
-
-**延迟预测模式（deferred）实现**：
-- 在BEFORE INSERT触发器中仅保存当前行数据到延迟队列
-- 存储数组第二个元素填入NULL值：[历史数据, NULL]
-- 通过异步线程执行预测计算
-- 更新存储数组中的预测数据部分
-
-#### 6.3.5 延迟预测队列设计
-
-**队列数据结构**：
-```c
-typedef struct DeferredPredictItem
-{
-    Oid relid;              /* 表OID */
-    ItemPointer ctid;       /* 元组物理位置 */
-    int attnum;             /* PREDICT列编号 */
-    Datum historical_data;  /* 历史数据值 */
-    Oid element_type;       /* 基础元素类型 */
-    bool isnull;            /* 是否为NULL值 */
-} DeferredPredictItem;
-
-typedef struct DeferredPredictQueue
-{
-    List *items;            /* 延迟预测项列表 */
-    MemoryContext mctx;     /* 内存上下文 */
-} DeferredPredictQueue;
-```
-
-**队列管理机制**：
-- 使用事务级内存上下文存储延迟预测队列
-- 每个事务维护独立的延迟预测队列
-- 通过异步线程统一处理队列中的所有预测项
-- 事务回滚时自动清理队列
-
-#### 6.3.6 预测触发器算法增强
-
-**增强后的预测触发器流程**：
-```mermaid
-flowchart TD
-    A[INSERT语句] --> B[预测触发器执行]
-    B --> C{检查predict_timing}
-    C -->|immediate| D[立即预测模式]
-    C -->|deferred| E[延迟预测模式]
-    
-    D --> F[调用预测函数]
-    F --> G[构造完整数组]
-    G --> H[返回修改后的元组]
-    
-    E --> I[保存到延迟队列]
-    I --> J[构造部分数组]
-    J --> H
-    
-    H --> K[INSERT完成]
-    
-    %% 延迟预测执行（后续迭代实现）
-    L[事务提交] --> M[延迟预测执行]
-    
-    %% 节点说明
-    G[构造完整数组]:::immediate
-    J[构造部分数组]:::deferred
-    M[延迟预测执行]:::future
-    
-    classDef immediate fill:#e1f5fe
-    classDef deferred fill:#f3e5f5
-    classDef future fill:#f5f5f5,stroke-dasharray: 5 5
-```
-
-
-
-#### 6.3.7 使用场景
+#### 6.3.6 使用场景
 
 **立即预测模式（immediate）适用场景**：
 - 需要立即获取预测结果的实时应用
 - 预测计算开销较小的场景
-- 对数据一致性要求不高的应用
 
 **延迟预测模式（deferred）适用场景**：
 - 批量插入数据的场景
-- 预测计算开销较大的场景
 - 对事务性能要求较高的应用
-- 需要保证数据一致性的关键业务
 
-#### 6.3.8 兼容性考虑
+#### 6.3.7 兼容性考虑
 - `predict_timing`选项与现有的`predict_function`选项完全兼容
 - 支持CREATE TABLE和ALTER TABLE语法
 - 支持与PostgreSQL其他表选项同时使用
 - 默认值为`deferred`，确保向后兼容性
 
-当前版本支持预测函数配置和预测时机控制，其他高级功能可根据需求逐步实现。
+### 6.4 关键代码修改点
 
-## 7. 事务集成与钩子函数
+PREDICT列保持原始数据类型的设计涉及以下关键代码修改：
 
-### 7.1 延迟预测队列管理
+#### 6.4.1 建表时类型处理（parse_utilcmd.c）
 
-**当前迭代功能**：
-- 在deferred模式下，将当前行数据保存到延迟队列
-- 构造部分数组`[历史数据, NULL]`
-- 延迟执行的具体机制留待后续迭代设计
+**移除的代码**：不再自动将基础类型转换为数组类型
 
-**队列管理函数**（仅用于当前迭代的数据记录）：
 ```c
-/* 添加预测项到延迟队列 */
-void AddToDeferredPredictQueue(Oid relid, ItemPointer ctid, int attnum, 
-                              Datum historical_data, Oid element_type, bool isnull)
+/* 已移除：不再自动添加数组边界
+if (column->is_predict)
 {
-    // 实现数据记录到队列的逻辑
-    // 具体延迟执行机制后续设计
+    if (column->typeName->arrayBounds == NIL)
+    {
+        column->typeName->arrayBounds = list_make2(makeInteger(2), makeInteger(-1));
+    }
+}
+*/
+```
+
+#### 6.4.2 INSERT时数据处理（parse_target.c）
+
+**移除的代码**：不再自动将标量值包装为数组
+
+```c
+/* 已移除：不再自动包装为数组 {expr, 0}
+if (attr->attpredict)
+{
+    ArrayExpr *array_expr;
+    // ... 创建两元素数组的逻辑
+    array_expr->elements = list_make2(orig_expr, zero_elem);
+}
+*/
+```
+
+#### 6.4.3 SELECT时数据处理（parse_relation.c）
+
+**移除的代码**：不再自动添加数组下标访问
+
+```c
+/* 已移除：不再自动添加[1]下标访问
+if (attr->attpredict)
+{
+    A_Indirection *ind;
+    A_Indices *indices;
+    // ... 创建数组下标访问的逻辑
+    ind->indirection = list_make1(indices);
+    return transformExpr(pstate, (Node *) ind, ...);
+}
+*/
+```
+
+#### 6.4.4 预测触发器（predict.c）
+
+**简化后的代码**：直接保存原始数据或预测结果
+
+```c
+/* 简化后的触发器逻辑 */
+if (attr->attpredict)
+{
+    Datum coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+    Datum resultdatum;
+    
+    if (predict_timing == STDRD_OPTION_PREDICT_TIMING_DEFERRED)
+    {
+        resultdatum = coldatum;  // 直接保存用户数据
+    }
+    else
+    {
+        // 调用预测函数，保存预测结果
+        resultdatum = call_predict_function(func_oid, coldatum);
+    }
+    
+    // 直接更新元组，无需构造数组
+    newtuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum, &resultdatum, &isnull);
 }
 ```
 
-### 7.2 事务状态扩展
-
-需要在事务状态结构中添加延迟预测队列字段：
-
-```c
-/* 在src/include/access/xact.h中扩展TransactionState结构 */
-typedef struct TransactionStateData
-{
-    // ... 现有字段
-    
-    /* 延迟预测队列 */
-    DeferredPredictQueue *predict_queue;
-    
-    // ... 其他字段
-} TransactionStateData;
-```
-
-### 7.3 延迟预测执行流程
-
-**异步线程预测执行详细流程**：
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Transaction
-    participant PredictHook
-    participant PredictQueue
-    participant PredictFunction
-    participant Storage
-    
-    Client->>Transaction: COMMIT
-    Transaction->>PredictHook: 触发异步预测处理
-    PredictHook->>PredictQueue: 获取延迟预测队列
-    PredictQueue->>PredictHook: 返回队列项列表
-    
-    loop 遍历每个队列项
-        PredictHook->>PredictFunction: 调用预测函数
-        PredictFunction->>PredictHook: 返回预测结果
-        PredictHook->>Storage: 更新元组预测数据
-        Storage->>PredictHook: 更新完成
-    end
-    
-    PredictHook->>PredictQueue: 清理队列
-    PredictHook->>Transaction: 钩子执行完成
-    Transaction->>Client: 事务提交成功
-```
-
-## 8. 错误处理
+## 7. 错误处理
 
 根据当前代码实现，PREDICT功能的错误处理主要依赖于PostgreSQL的标准错误处理机制：
 
 - 使用标准的`ereport`函数报告错误
-- 使用PostgreSQL预定义的错误码（如`ERRCODE_DATATYPE_MISMATCH`）
-- 在预测触发器中验证PREDICT列是否为数组类型
+- 使用PostgreSQL预定义的错误码
 - 在函数查找过程中处理函数不存在或签名不匹配的情况
-
-**延迟预测的错误处理增强**：
-- 延迟预测执行过程中的错误不会导致事务回滚
-- 单个预测项的错误不会影响其他项的预测执行
-- 预测函数执行错误时，预测值保持为NULL
-- 记录预测执行失败的日志信息，便于问题排查
 
 ---
 
-**文档版本**: 1.0  
-**最后更新**: 2025-01-24  
+**文档版本**: 1.1  
+**最后更新**: 2025-03-03  
 **作者**: PostgreSQL开发团队
