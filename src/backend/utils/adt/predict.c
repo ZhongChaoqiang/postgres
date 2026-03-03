@@ -146,10 +146,11 @@ get_predict_function(Oid relid)
 }
 
 /*
- * predict_trigger - trigger function to copy first array element to second
+ * predict_trigger - trigger function for PREDICT columns
  *
- * This is a BEFORE INSERT trigger that copies the first element of a PREDICT
- * column's array to the second element position.
+ * This is a BEFORE INSERT trigger that handles PREDICT columns:
+ * - When predict_timing is deferred: saves user input data directly
+ * - When predict_timing is immediate: calls predict_function and saves result
  */
 PG_FUNCTION_INFO_V1(predict_trigger);
 
@@ -163,19 +164,11 @@ predict_trigger(PG_FUNCTION_ARGS)
 	Relation		rel;
 	int				attnum;
 	Oid				typeid;
-	Oid				arraytypeid;
-	Datum				arraydatum;
-	Datum				newarraydatum;
-	Datum				firstelem;
+	Datum				coldatum;
+	Datum				resultdatum;
 	bool				isnull;
-	int16				typlen;
-	bool				typbyval;
-	char				typalign;
-	int16				arrlen;
-	int				lowerIndex[1] = {1};
 	bool				replisnull;
 
-	/* Validate trigger context */
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
@@ -192,97 +185,65 @@ predict_trigger(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"predict_trigger\" must be a ROW-level trigger")));
 
-	/* Get trigger data */
 	rel = trigdata->tg_relation;
 	tupdesc = RelationGetDescr(rel);
 	newtuple = trigdata->tg_trigtuple;
 
-	/* Find the first PREDICT column */
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
-		/* Skip dropped columns */
 		if (attr->attisdropped)
 			continue;
 
-		/* Check if this is a PREDICT column */
 		if (attr->attpredict)
 		{
-			/* Validate column is an array type */
-			arraytypeid = attr->atttypid;
-			typeid = get_base_element_type(arraytypeid);
-			if (!OidIsValid(typeid))
-				ereport(ERROR,
-						(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-						 errmsg("column \"%s\" is not an array type for trigger \"predict_trigger\"",
-								NameStr(attr->attname))));
+			typeid = attr->atttypid;
 
-			/* Get type information for element type */
-			get_typlenbyvalalign(typeid, &typlen, &typbyval, &typalign);
-			
-			/* Get array type length (needed for array_get_element) */
-			{
-				int16		array_typlen;
-				bool		array_typbyval;
-				char		array_typalign;
-				get_typlenbyvalalign(arraytypeid, &array_typlen, &array_typbyval, &array_typalign);
-				arrlen = array_typlen;
-			}
-
-			/* Get array value from tuple */
-			arraydatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+			coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
 			if (isnull)
-				return PointerGetDatum(newtuple); /* NULL array, no action needed */
-			
-			/* Get first element */
-			firstelem = array_get_element(arraydatum, 1, lowerIndex, arrlen, 
-						 typlen, typbyval, typalign, &isnull);
-			if (isnull)
-				return PointerGetDatum(newtuple); /* NULL first element, no action needed */
+				return PointerGetDatum(newtuple);
 
-			/* Process predict function if available and predict_timing is immediate */
-			Datum predict_result = firstelem;
-			
-			/* Check predict_timing option */
 			StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
 			StdRdOptPredictTiming predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
 			
 			if (relopts != NULL)
 				predict_timing = relopts->predict_timing;
-			
-			/* Only call predict function in immediate mode */
-			if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
+
+			if (predict_timing == STDRD_OPTION_PREDICT_TIMING_DEFERRED)
+			{
+				resultdatum = coldatum;
+			}
+			else
 			{
 				char *predict_func_name = get_predict_function(rel->rd_id);
 				
-				if (predict_func_name != NULL)
+				if (predict_func_name == NULL)
 				{
-					/* Look up the predict function OID */
+					resultdatum = coldatum;
+				}
+				else
+				{
 					Oid predict_func_oid = InvalidOid;
 					char *search_func_name;
 					char *funcname_only;
 					FuncCandidateList clist;
 					int fgc_flags;
 					
-					/* Construct function name with schema if needed */
 					if (strchr(predict_func_name, '.') == NULL)
 						search_func_name = psprintf("public.%s", predict_func_name);
 					else
 						search_func_name = pstrdup(predict_func_name);
 					
-					/* Extract function name without schema */
 					funcname_only = strrchr(search_func_name, '.');
 					if (funcname_only != NULL)
 						funcname_only++;
 					else
 						funcname_only = search_func_name;
 					
-					/* Find function candidates */
 					clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)), 
 												 1, NIL, false, false, false, true, &fgc_flags);
 					
-					/* Check for matching function signature */
 					if (clist != NULL)
 					{
 						for (; clist != NULL; clist = clist->next)
@@ -299,52 +260,25 @@ predict_trigger(PG_FUNCTION_ARGS)
 					
 					if (OidIsValid(predict_func_oid))
 					{
-						/* Call the predict function */
 						FmgrInfo predict_func;
 						fmgr_info(predict_func_oid, &predict_func);
-						
-						/* Call with firstelem directly - it's already a proper Datum */
-						predict_result = FunctionCall1(&predict_func, firstelem);
+						resultdatum = FunctionCall1(&predict_func, coldatum);
+					}
+					else
+					{
+						resultdatum = coldatum;
 					}
 					
 					pfree(predict_func_name);
 				}
 			}
 			
-			/* Create updated array */
-			Datum newelems[2];
-			bool newnulls[2];
-			int dims[1] = {2};
-			int lbs[1] = {1};
-			
-			/* First element stays the same */
-			newelems[0] = firstelem;
-			newnulls[0] = false;
-			
-			/* Second element: NULL if deferred, predict result if immediate */
-			if (predict_timing == STDRD_OPTION_PREDICT_TIMING_DEFERRED)
-			{
-				newelems[1] = (Datum) 0;
-				newnulls[1] = true;
-			}
-			else
-			{
-				newelems[1] = predict_result;
-				newnulls[1] = false;
-			}
-			
-			/* Construct new array (use construct_md_array to support NULLs) */
-			newarraydatum = PointerGetDatum(construct_md_array(newelems, newnulls, 1, dims, lbs,
-															  typeid, typlen, typbyval, typalign));
-			
-			/* Update tuple and return */
 			replisnull = false;
 			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum,
-							&newarraydatum, &replisnull);
+							&resultdatum, &replisnull);
 			return PointerGetDatum(rettuple);
 		}
 	}
 
-	/* No PREDICT column found, return original tuple */
 	return PointerGetDatum(newtuple);
 }
