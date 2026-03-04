@@ -171,8 +171,8 @@ find_column_by_name(TupleDesc tupdesc, const char *colname)
  *
  * This is a BEFORE INSERT/UPDATE trigger that handles PREDICT columns:
  * - Copies user input value to the _actual column
- * - When predict_timing is immediate: calls predict_function and saves result to _predict column
- * - When predict_timing is deferred: copies user input value to _predict column
+ * - When PREDICT column is NULL and predict_timing is immediate:
+ *   calls predict_function and saves result to _predict column
  */
 PG_FUNCTION_INFO_V1(predict_trigger);
 
@@ -187,8 +187,12 @@ predict_trigger(PG_FUNCTION_ARGS)
 	int				attnum;
 	Datum			coldatum;
 	Datum			actual_datum;
+	Datum			predict_datum;
 	bool			isnull;
 	bool			actual_isnull;
+	bool			predict_isnull;
+	StdRdOptions   *relopts;
+	StdRdOptPredictTiming predict_timing;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
@@ -214,11 +218,19 @@ predict_trigger(PG_FUNCTION_ARGS)
 	tupdesc = RelationGetDescr(rel);
 	newtuple = trigdata->tg_trigtuple;
 
+	/* Get predict_timing option */
+	relopts = (StdRdOptions *) rel->rd_options;
+	predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
+	if (relopts != NULL)
+		predict_timing = relopts->predict_timing;
+
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 		char	   *actual_colname;
+		char	   *predict_colname;
 		AttrNumber	actual_attnum;
+		AttrNumber	predict_attnum;
 
 		if (attr->attisdropped)
 			continue;
@@ -233,13 +245,93 @@ predict_trigger(PG_FUNCTION_ARGS)
 		actual_datum = coldatum;
 		actual_isnull = isnull;
 
-		/* Find _actual column */
+		/* Find _actual and _predict columns */
 		actual_colname = psprintf("%s_actual", NameStr(attr->attname));
-		actual_attnum = find_column_by_name(tupdesc, actual_colname);
-		pfree(actual_colname);
+		predict_colname = psprintf("%s_predict", NameStr(attr->attname));
 
-		/* Modify tuple to set _actual column only */
-		if (actual_attnum != InvalidAttrNumber)
+		actual_attnum = find_column_by_name(tupdesc, actual_colname);
+		predict_attnum = find_column_by_name(tupdesc, predict_colname);
+
+		pfree(actual_colname);
+		pfree(predict_colname);
+
+		/* Determine if we need to call predict function */
+		predict_datum = (Datum) 0;
+		predict_isnull = true;
+
+		if (isnull && predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
+		{
+			/* PREDICT column is NULL and timing is immediate: call predict function */
+			char *predict_func_name = get_predict_function(rel->rd_id);
+
+			if (predict_func_name != NULL)
+			{
+				Oid predict_func_oid = InvalidOid;
+				char *search_func_name;
+				char *funcname_only;
+				FuncCandidateList clist;
+				int fgc_flags;
+
+				if (strchr(predict_func_name, '.') == NULL)
+					search_func_name = psprintf("public.%s", predict_func_name);
+				else
+					search_func_name = pstrdup(predict_func_name);
+
+				funcname_only = strrchr(search_func_name, '.');
+				if (funcname_only != NULL)
+					funcname_only++;
+				else
+					funcname_only = search_func_name;
+
+				clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)),
+											  1, NIL, false, false, false, true, &fgc_flags);
+
+				if (clist != NULL)
+				{
+					for (; clist != NULL; clist = clist->next)
+					{
+						if (clist->nargs == 1 && clist->args[0] == attr->atttypid)
+						{
+							predict_func_oid = clist->oid;
+							break;
+						}
+					}
+				}
+
+				pfree(search_func_name);
+
+				if (OidIsValid(predict_func_oid))
+				{
+					FmgrInfo predict_func;
+					fmgr_info(predict_func_oid, &predict_func);
+					predict_datum = FunctionCall1(&predict_func, coldatum);
+					predict_isnull = false;
+				}
+
+				pfree(predict_func_name);
+			}
+		}
+
+		/* Modify tuple to set _actual and _predict columns */
+		if (actual_attnum != InvalidAttrNumber && predict_attnum != InvalidAttrNumber)
+		{
+			int			modify_attnums[2];
+			Datum		modify_values[2];
+			bool		modify_nulls[2];
+
+			modify_attnums[0] = actual_attnum;
+			modify_values[0] = actual_datum;
+			modify_nulls[0] = actual_isnull;
+
+			modify_attnums[1] = predict_attnum;
+			modify_values[1] = predict_datum;
+			modify_nulls[1] = predict_isnull;
+
+			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 2,
+												 modify_attnums, modify_values, modify_nulls);
+			newtuple = rettuple;
+		}
+		else if (actual_attnum != InvalidAttrNumber)
 		{
 			int			modify_attnums[1];
 			Datum		modify_values[1];
@@ -248,6 +340,20 @@ predict_trigger(PG_FUNCTION_ARGS)
 			modify_attnums[0] = actual_attnum;
 			modify_values[0] = actual_datum;
 			modify_nulls[0] = actual_isnull;
+
+			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+												 modify_attnums, modify_values, modify_nulls);
+			newtuple = rettuple;
+		}
+		else if (predict_attnum != InvalidAttrNumber && !predict_isnull)
+		{
+			int			modify_attnums[1];
+			Datum		modify_values[1];
+			bool		modify_nulls[1];
+
+			modify_attnums[0] = predict_attnum;
+			modify_values[0] = predict_datum;
+			modify_nulls[0] = predict_isnull;
 
 			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
 												 modify_attnums, modify_values, modify_nulls);
