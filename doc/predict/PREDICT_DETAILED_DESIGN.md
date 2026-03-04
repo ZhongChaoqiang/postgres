@@ -50,7 +50,12 @@ graph TB
         G[INSERT/UPDATE语句] --> H[预测触发器]
         H --> I[检查PREDICT列]
         I --> I1[同步值到_actual列]
-        I1 --> M[返回修改后的元组]
+        I1 --> I2{PREDICT列为NULL且timing=immediate?}
+        I2 -->|是| J[获取预测函数]
+        J --> K[调用预测函数]
+        K --> L[保存结果到_predict列]
+        L --> M[返回修改后的元组]
+        I2 -->|否| M
     end
     
     subgraph "SELECT流程"
@@ -108,7 +113,7 @@ graph TB
 - 自动创建的BEFORE INSERT OR UPDATE触发器
 - 处理所有PREDICT列的预测逻辑
 - 将用户输入值同步到`_actual`列
-- `_predict`列由预测函数单独更新，不在此触发器中处理
+- 当PREDICT列值为NULL且`predict_timing`为`immediate`时，调用预测函数并将结果存储到`_predict`列
 
 #### 2.2.5 预测函数机制
 - 通过表选项`predict_function`指定
@@ -1161,6 +1166,15 @@ INSERT INTO predictions (value) VALUES (100);
 -- 触发器自动执行：
 -- value = 100 (用户输入)
 -- value_actual = 100 (自动同步)
+
+-- INSERT 操作：当 PREDICT 列为 NULL 且 predict_timing = immediate 时
+INSERT INTO predictions (id) VALUES (DEFAULT);
+-- 或
+INSERT INTO predictions (id, value) VALUES (DEFAULT, NULL);
+-- 触发器自动执行：
+-- value = NULL (用户输入)
+-- value_actual = NULL (自动同步)
+-- value_predict = 预测函数返回值 (如果设置了 predict_function)
 
 -- UPDATE 操作：同样会同步到 _actual 列
 UPDATE predictions SET value = 200 WHERE id = 1;
