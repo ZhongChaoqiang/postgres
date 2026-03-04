@@ -14048,12 +14048,12 @@ createPredictTrigger(Oid relOid, AttrNumber attnum, const char *colname)
 	trigger->trigname = pstrdup(trigname);
 	trigger->relation = NULL;	/* Will be set by CreateTrigger */
 
-	/* This is a BEFORE INSERT trigger */
+	/* This is a BEFORE INSERT OR UPDATE trigger */
 	trigger->funcname = SystemFuncName("predict_trigger");
 	trigger->args = NIL;  /* No arguments needed - trigger will detect PREDICT column */
 	trigger->row = true;
 	trigger->timing = TRIGGER_TYPE_BEFORE;
-	trigger->events = TRIGGER_TYPE_INSERT;
+	trigger->events = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE;
 	trigger->columns = NIL;
 	trigger->whenClause = NULL;
 	trigger->transitionRels = NIL;
