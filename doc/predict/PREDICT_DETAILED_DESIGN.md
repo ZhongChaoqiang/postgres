@@ -14,6 +14,7 @@ PREDICT列和PREDICT函数是PostgreSQL的一个扩展功能，用于在插入�
 PREDICT功能的主要实现包括：
 - PREDICT列属性标记（attpredict字段）
 - 自动创建预测结果列（`_predict`后缀列）
+- 自动创建实际值列（`_actual`后缀列）
 - 隐藏列机制（atthidden字段，SELECT *时不显示）
 - 预测函数查找机制（从reloptions获取）
 - 预测触发器函数（predict_trigger）
@@ -81,11 +82,16 @@ graph TB
 - **读取时**：直接返回原始数据，无需特殊处理
 
 #### 2.2.2 自动创建预测结果列
-当定义一个PREDICT列时，系统会自动创建一个同类型的预测结果列：
-- 列名规则：原列名 + `_predict` 后缀（如 `value` → `value_predict`）
-- 数据类型：与原PREDICT列相同
-- 隐藏属性：自动设置为隐藏列，在 `SELECT *` 中不显示
-- 用途：存储预测函数的计算结果
+当定义一个PREDICT列时，系统会自动创建两个同类型的隐藏列：
+- **预测结果列**：原列名 + `_predict` 后缀（如 `value` → `value_predict`）
+  - 数据类型：与原PREDICT列相同
+  - 隐藏属性：自动设置为隐藏列
+  - 用途：存储预测函数的计算结果
+
+- **实际值列**：原列名 + `_actual` 后缀（如 `value` → `value_actual`）
+  - 数据类型：与原PREDICT列相同
+  - 隐藏属性：自动设置为隐藏列
+  - 用途：存储实际值，用于与预测值进行对比分析
 
 #### 2.2.3 隐藏列机制
 - 在`pg_attribute`系统表中添加`atthidden`布尔字段
@@ -194,11 +200,13 @@ struct ParseNamespaceColumn
 
 #### 3.2.1 CREATE TABLE语法扩展
 ```sql
--- 创建带PREDICT列的表，自动创建隐藏的预测结果列
+-- 创建带PREDICT列的表，-- 系统自动创建两个隐藏列：_predict 和 _actual
 CREATE TABLE example_table (
     id SERIAL PRIMARY KEY,
     data_value integer PREDICT,  -- PREDICT列
-    -- 系统自动创建：data_value_predict (hidden)
+    -- 系统自动创建：
+    -- data_value_predict (hidden) - 存储预测结果
+    -- data_value_actual (hidden) - 存储实际值
 );
 
 -- 查询时，SELECT * 不会返回隐藏列
@@ -206,8 +214,8 @@ SELECT * FROM example_table;
 -- 结果：id, data_value
 
 -- 显式指定列名时，仍然可以查询隐藏列
-SELECT id, data_value, data_value_predict FROM example_table;
--- 结果：id, data_value, data_value_predict
+SELECT id, data_value, data_value_predict, data_value_actual FROM example_table;
+-- 结果：id, data_value, data_value_predict, data_value_actual
 ```
 
 #### 3.2.2 语法解析规则
@@ -945,19 +953,21 @@ if (attr->attpredict)
 - 使用PostgreSQL预定义的错误码
 - 在函数查找过程中处理函数不存在或签名不匹配的情况
 
-## 8. 自动创建预测结果列
+## 8. 自动创建预测结果列和实际值列
 
 ### 8.1 功能概述
 
-当用户定义一个PREDICT列时，系统会自动创建一个同类型的预测结果列，用于存储预测函数的计算结果。
+当用户定义一个PREDICT列时，系统会自动创建两个同类型的隐藏列：
+- **预测结果列**：存储预测函数的计算结果
+- **实际值列**：存储实际值，用于与预测值进行对比分析
 
 ### 8.2 列命名规则
 
-| 原PREDICT列名 | 自动创建的预测结果列名 |
-|--------------|---------------------|
-| `value` | `value_predict` |
-| `temperature` | `temperature_predict` |
-| `score` | `score_predict` |
+| 原PREDICT列名 | 预测结果列名 | 实际值列名 |
+|--------------|-------------|-----------|
+| `value` | `value_predict` | `value_actual` |
+| `temperature` | `temperature_predict` | `temperature_actual` |
+| `score` | `score_predict` | `score_actual` |
 
 ### 8.3 实现位置
 
@@ -967,35 +977,55 @@ if (attr->attpredict)
 
 ```c
 /*
- * If this is a PREDICT column, automatically add a companion column
- * with "_predict" suffix to store the prediction result.
+ * If this is a PREDICT column, automatically add companion columns:
+ * - "_predict" suffix column: stores the prediction result
+ * - "_actual" suffix column: stores the actual value for comparison
+ * Both columns are hidden from SELECT * expansion.
  */
 if (column->is_predict)
 {
     ColumnDef  *predict_col;
+    ColumnDef  *actual_col;
     char       *predict_colname;
+    char       *actual_colname;
 
+    /* Create _predict column */
     predict_colname = psprintf("%s_predict", column->colname);
-
     predict_col = makeNode(ColumnDef);
     predict_col->colname = predict_colname;
     predict_col->typeName = copyObject(column->typeName);
-    predict_col->is_hidden = true;  // 设置为隐藏列
+    predict_col->is_hidden = true;
     // ... 其他字段初始化
-
     cxt->columns = lappend(cxt->columns, predict_col);
+
+    /* Create _actual column */
+    actual_colname = psprintf("%s_actual", column->colname);
+    actual_col = makeNode(ColumnDef);
+    actual_col->colname = actual_colname;
+    actual_col->typeName = copyObject(column->typeName);
+    actual_col->is_hidden = true;
+    // ... 其他字段初始化
+    cxt->columns = lappend(cxt->columns, actual_col);
 }
 ```
 
 ### 8.4 列属性继承
 
-预测结果列从原PREDICT列继承以下属性：
+预测结果列和实际值列从原PREDICT列继承以下属性：
 - 数据类型（`typeName`）
 - 排序规则（`collOid`）
 
-预测结果列的独特属性：
+两个自动创建的列的独特属性：
 - `is_predict = false`：不是PREDICT列
 - `is_hidden = true`：隐藏列，SELECT *时不显示
+
+### 8.5 列的用途
+
+| 列名 | 用途 |
+|-----|------|
+| `value` | 用户输入的原始数据（PREDICT列） |
+| `value_predict` | 存储预测函数的计算结果 |
+| `value_actual` | 存储实际值，用于与预测值进行对比分析 |
 
 ## 9. 隐藏列机制
 
@@ -1116,19 +1146,29 @@ CREATE TABLE predictions (
 
 -- 实际表结构：
 -- id (integer, NOT NULL)
--- value (integer)                    -- PREDICT列
--- value_predict (integer, HIDDEN)    -- 自动创建的隐藏列
+-- value (integer)                       -- PREDICT列
+-- value_predict (integer, HIDDEN)       -- 自动创建的隐藏列，存储预测结果
+-- value_actual (integer, HIDDEN)        -- 自动创建的隐藏列，存储实际值
 
 -- SELECT * 不返回隐藏列
 SELECT * FROM predictions;
 -- 结果列：id, value
 
 -- 显式指定可以查询隐藏列
-SELECT id, value, value_predict FROM predictions;
--- 结果列：id, value, value_predict
+SELECT id, value, value_predict, value_actual FROM predictions;
+-- 结果列：id, value, value_predict, value_actual
 
 -- 隐藏列仍然可以用于WHERE条件
 SELECT * FROM predictions WHERE value_predict > 100;
+
+-- 计算预测准确度
+SELECT 
+    id, 
+    value,
+    value_predict,
+    value_actual,
+    ABS(value_predict - value_actual) AS prediction_error
+FROM predictions;
 ```
 
 ### 9.6 与系统列的对比

@@ -1029,14 +1029,19 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 	}
 
 	/*
-	 * If this is a PREDICT column, automatically add a companion column
-	 * with "_predict" suffix to store the prediction result.
+	 * If this is a PREDICT column, automatically add companion columns:
+	 * - "_predict" suffix column: stores the prediction result
+	 * - "_actual" suffix column: stores the actual value for comparison
+	 * Both columns are hidden from SELECT * expansion.
 	 */
 	if (column->is_predict)
 	{
 		ColumnDef  *predict_col;
+		ColumnDef  *actual_col;
 		char	   *predict_colname;
+		char	   *actual_colname;
 
+		/* Create _predict column */
 		predict_colname = psprintf("%s_predict", column->colname);
 
 		predict_col = makeNode(ColumnDef);
@@ -1063,6 +1068,34 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		predict_col->location = -1;
 
 		cxt->columns = lappend(cxt->columns, predict_col);
+
+		/* Create _actual column */
+		actual_colname = psprintf("%s_actual", column->colname);
+
+		actual_col = makeNode(ColumnDef);
+		actual_col->colname = actual_colname;
+		actual_col->typeName = copyObject(column->typeName);
+		actual_col->compression = NULL;
+		actual_col->inhcount = 0;
+		actual_col->is_local = true;
+		actual_col->is_not_null = false;
+		actual_col->is_from_type = false;
+		actual_col->is_predict = false;
+		actual_col->is_hidden = true;
+		actual_col->storage = 0;
+		actual_col->storage_name = NULL;
+		actual_col->raw_default = NULL;
+		actual_col->cooked_default = NULL;
+		actual_col->identity = '\0';
+		actual_col->identitySequence = NULL;
+		actual_col->generated = '\0';
+		actual_col->collClause = NULL;
+		actual_col->collOid = column->collOid;
+		actual_col->constraints = NIL;
+		actual_col->fdwoptions = NIL;
+		actual_col->location = -1;
+
+		cxt->columns = lappend(cxt->columns, actual_col);
 	}
 }
 
