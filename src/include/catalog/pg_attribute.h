@@ -140,6 +140,9 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	/* Is dropped (ie, logically invisible) or not */
 	bool		attisdropped BKI_DEFAULT(f);
 
+	/* Is hidden from SELECT * expansion or not */
+	bool		atthidden BKI_DEFAULT(f);
+
 	/*
 	 * This flag specifies whether this column has ever had a local
 	 * definition.  It is set for normal non-inherited columns, but also for
