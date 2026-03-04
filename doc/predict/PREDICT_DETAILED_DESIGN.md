@@ -38,17 +38,19 @@ graph TB
     subgraph "DDL流程"
         B --> C[CREATE TABLE语句]
         C --> D[列定义处理]
-        D --> E[设置attpredict标志]
-        E --> F[创建预测触发器]
+        D --> E{是否PREDICT列?}
+        E -->|是| E1[设置attpredict标志]
+        E1 --> E2[创建_predict隐藏列]
+        E2 --> E3[创建_actual隐藏列]
+        E3 --> F[创建预测触发器]
+        E -->|否| F
     end
     
-    subgraph "INSERT流程"
-        G[INSERT语句] --> H[预测触发器]
+    subgraph "INSERT/UPDATE流程"
+        G[INSERT/UPDATE语句] --> H[预测触发器]
         H --> I[检查PREDICT列]
-        I --> J[获取预测函数]
-        J --> K[调用预测函数]
-        K --> L[保存结果数据]
-        L --> M[返回修改后的元组]
+        I --> I1[同步值到_actual列]
+        I1 --> M[返回修改后的元组]
     end
     
     subgraph "SELECT流程"
@@ -56,8 +58,11 @@ graph TB
         R --> S[查询优化器]
         S --> T[执行计划生成]
         T --> U[数据读取]
-        U --> V[PREDICT列验证]
-        V --> W[结果格式化]
+        U --> V{SELECT * ?}
+        V -->|是| V1[过滤隐藏列]
+        V -->|否| V2[包含所有指定列]
+        V1 --> W[结果格式化]
+        V2 --> W
         W --> X[返回查询结果]
     end
     
@@ -67,7 +72,7 @@ graph TB
     end
     
     %% 跨流程连接
-    E -.-> V
+    E1 -.-> V
     P -.-> K
     F -.-> H
 ```
@@ -100,22 +105,23 @@ graph TB
 - 利用现有的`p_dontexpand`机制实现（与CTE的SEARCH/CYCLE列相同）
 
 #### 2.2.4 预测触发器
-- 自动创建的BEFORE INSERT触发器
+- 自动创建的BEFORE INSERT OR UPDATE触发器
 - 处理所有PREDICT列的预测逻辑
-- 调用用户定义的预测函数
+- 将用户输入值同步到`_actual`列
+- `_predict`列由预测函数单独更新，不在此触发器中处理
 
-#### 2.2.3 预测函数机制
+#### 2.2.5 预测函数机制
 - 通过表选项`predict_function`指定
 - 支持自定义预测算法
 - 函数签名：`function_name(element_type) returns element_type`
 
-#### 2.2.4 查询处理器
+#### 2.2.6 查询处理器
 - 解析SELECT语句中的PREDICT列引用
 - 验证PREDICT列在查询上下文中的合法性
 - 优化包含PREDICT列的查询执行计划
 - 格式化查询结果中的PREDICT列数据
 
-#### 2.2.5 查询优化器
+#### 2.2.7 查询优化器
 - 针对PREDICT列的特殊优化策略
 - 查询计划缓存和重用机制
 - PREDICT列索引优化考虑
@@ -1150,6 +1156,18 @@ CREATE TABLE predictions (
 -- value_predict (integer, HIDDEN)       -- 自动创建的隐藏列，存储预测结果
 -- value_actual (integer, HIDDEN)        -- 自动创建的隐藏列，存储实际值
 
+-- INSERT 操作：用户输入值会自动同步到 _actual 列
+INSERT INTO predictions (value) VALUES (100);
+-- 触发器自动执行：
+-- value = 100 (用户输入)
+-- value_actual = 100 (自动同步)
+
+-- UPDATE 操作：同样会同步到 _actual 列
+UPDATE predictions SET value = 200 WHERE id = 1;
+-- 触发器自动执行：
+-- value = 200 (用户输入)
+-- value_actual = 200 (自动同步)
+
 -- SELECT * 不返回隐藏列
 SELECT * FROM predictions;
 -- 结果列：id, value
@@ -1212,6 +1230,6 @@ pg_ctl start -D /path/to/data
 
 ---
 
-**文档版本**: 1.2  
+**文档版本**: 1.3  
 **最后更新**: 2025-03-04  
 **作者**: PostgreSQL开发团队

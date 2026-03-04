@@ -146,11 +146,33 @@ get_predict_function(Oid relid)
 }
 
 /*
+ * find_column_by_name - find column number by name (1-based)
+ * Returns InvalidAttrNumber if not found
+ */
+static AttrNumber
+find_column_by_name(TupleDesc tupdesc, const char *colname)
+{
+	int		attnum;
+	int		namelen = strlen(colname);
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+		if (attr->attisdropped)
+			continue;
+		if (namestrcmp(&attr->attname, colname) == 0)
+			return attnum;
+	}
+	return InvalidAttrNumber;
+}
+
+/*
  * predict_trigger - trigger function for PREDICT columns
  *
- * This is a BEFORE INSERT trigger that handles PREDICT columns:
- * - When predict_timing is deferred: saves user input data directly
- * - When predict_timing is immediate: calls predict_function and saves result
+ * This is a BEFORE INSERT/UPDATE trigger that handles PREDICT columns:
+ * - Copies user input value to the _actual column
+ * - When predict_timing is immediate: calls predict_function and saves result to _predict column
+ * - When predict_timing is deferred: copies user input value to _predict column
  */
 PG_FUNCTION_INFO_V1(predict_trigger);
 
@@ -163,27 +185,30 @@ predict_trigger(PG_FUNCTION_ARGS)
 	HeapTuple		newtuple;
 	Relation		rel;
 	int				attnum;
-	Oid				typeid;
-	Datum				coldatum;
-	Datum				resultdatum;
-	bool				isnull;
-	bool				replisnull;
+	Datum			coldatum;
+	Datum			actual_datum;
+	bool			isnull;
+	bool			actual_isnull;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"predict_trigger\" was not called by trigger manager")));
 
-	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event) ||
-		!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-				 errmsg("function \"predict_trigger\" must be called as BEFORE INSERT trigger")));
+				 errmsg("function \"predict_trigger\" must be called as BEFORE trigger")));
 
 	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"predict_trigger\" must be a ROW-level trigger")));
+
+	if (!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event) && !TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"predict_trigger\" must be called for INSERT or UPDATE")));
 
 	rel = trigdata->tg_relation;
 	tupdesc = RelationGetDescr(rel);
@@ -192,91 +217,41 @@ predict_trigger(PG_FUNCTION_ARGS)
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+		char	   *actual_colname;
+		AttrNumber	actual_attnum;
 
 		if (attr->attisdropped)
 			continue;
 
-		if (attr->attpredict)
+		if (!attr->attpredict)
+			continue;
+
+		/* This is a PREDICT column */
+
+		/* Get user input value */
+		coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+		actual_datum = coldatum;
+		actual_isnull = isnull;
+
+		/* Find _actual column */
+		actual_colname = psprintf("%s_actual", NameStr(attr->attname));
+		actual_attnum = find_column_by_name(tupdesc, actual_colname);
+		pfree(actual_colname);
+
+		/* Modify tuple to set _actual column only */
+		if (actual_attnum != InvalidAttrNumber)
 		{
-			typeid = attr->atttypid;
+			int			modify_attnums[1];
+			Datum		modify_values[1];
+			bool		modify_nulls[1];
 
-			coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
-			if (isnull)
-				return PointerGetDatum(newtuple);
+			modify_attnums[0] = actual_attnum;
+			modify_values[0] = actual_datum;
+			modify_nulls[0] = actual_isnull;
 
-			StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
-			StdRdOptPredictTiming predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
-			
-			if (relopts != NULL)
-				predict_timing = relopts->predict_timing;
-
-			if (predict_timing == STDRD_OPTION_PREDICT_TIMING_DEFERRED)
-			{
-				resultdatum = coldatum;
-			}
-			else
-			{
-				char *predict_func_name = get_predict_function(rel->rd_id);
-				
-				if (predict_func_name == NULL)
-				{
-					resultdatum = coldatum;
-				}
-				else
-				{
-					Oid predict_func_oid = InvalidOid;
-					char *search_func_name;
-					char *funcname_only;
-					FuncCandidateList clist;
-					int fgc_flags;
-					
-					if (strchr(predict_func_name, '.') == NULL)
-						search_func_name = psprintf("public.%s", predict_func_name);
-					else
-						search_func_name = pstrdup(predict_func_name);
-					
-					funcname_only = strrchr(search_func_name, '.');
-					if (funcname_only != NULL)
-						funcname_only++;
-					else
-						funcname_only = search_func_name;
-					
-					clist = FuncnameGetCandidates(list_make1(makeString(funcname_only)), 
-												 1, NIL, false, false, false, true, &fgc_flags);
-					
-					if (clist != NULL)
-					{
-						for (; clist != NULL; clist = clist->next)
-						{
-							if (clist->nargs == 1 && clist->args[0] == typeid)
-							{
-								predict_func_oid = clist->oid;
-								break;
-							}
-						}
-					}
-					
-					pfree(search_func_name);
-					
-					if (OidIsValid(predict_func_oid))
-					{
-						FmgrInfo predict_func;
-						fmgr_info(predict_func_oid, &predict_func);
-						resultdatum = FunctionCall1(&predict_func, coldatum);
-					}
-					else
-					{
-						resultdatum = coldatum;
-					}
-					
-					pfree(predict_func_name);
-				}
-			}
-			
-			replisnull = false;
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1, &attnum,
-							&resultdatum, &replisnull);
-			return PointerGetDatum(rettuple);
+			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+												 modify_attnums, modify_values, modify_nulls);
+			newtuple = rettuple;
 		}
 	}
 
