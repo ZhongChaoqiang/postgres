@@ -290,7 +290,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 				{
 					for (; clist != NULL; clist = clist->next)
 					{
-						if (clist->nargs == 1 && clist->args[0] == attr->atttypid)
+						if (clist->nargs == 1)
 						{
 							predict_func_oid = clist->oid;
 							break;
@@ -303,8 +303,14 @@ predict_trigger(PG_FUNCTION_ARGS)
 				if (OidIsValid(predict_func_oid))
 				{
 					FmgrInfo predict_func;
+					Datum row_datum;
+					
 					fmgr_info(predict_func_oid, &predict_func);
-					predict_datum = FunctionCall1(&predict_func, coldatum);
+					
+					/* Convert the entire row to a datum */
+					row_datum = heap_copy_tuple_as_datum(newtuple, tupdesc);
+					
+					predict_datum = FunctionCall1(&predict_func, row_datum);
 					predict_isnull = false;
 				}
 

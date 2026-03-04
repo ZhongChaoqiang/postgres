@@ -118,7 +118,82 @@ graph TB
 #### 2.2.5 预测函数机制
 - 通过表选项`predict_function`指定
 - 支持自定义预测算法
-- 函数签名：`function_name(element_type) returns element_type`
+- 函数签名：`function_name(record) returns element_type`
+- 函数接收整行数据作为参数，返回预测结果
+
+**预测函数样例代码：**
+
+```sql
+-- 示例1：简单的预测函数，基于其他列计算预测值
+CREATE OR REPLACE FUNCTION simple_predict(rec record) 
+RETURNS integer AS $$
+DECLARE
+    result integer;
+BEGIN
+    -- 从记录中提取列值进行计算
+    -- 假设表有 id, value 等列
+    result := (rec.id * 10) + 5;
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 示例2：使用机器学习模型的预测函数
+CREATE OR REPLACE FUNCTION ml_predict(rec record) 
+RETURNS float AS $$
+DECLARE
+    feature1 float;
+    feature2 float;
+    prediction float;
+BEGIN
+    -- 从记录中提取特征值
+    feature1 := rec.feature_col1;
+    feature2 := rec.feature_col2;
+    
+    -- 调用外部预测服务或模型
+    -- 这里使用简单的线性模型作为示例
+    prediction := 0.5 * feature1 + 0.3 * feature2 + 1.0;
+    
+    RETURN prediction;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 示例3：使用 Python 通过 PL/Python 调用机器学习模型
+CREATE OR REPLACE FUNCTION python_predict(rec record) 
+RETURNS float AS $$
+    import json
+    
+    # 将记录转换为字典
+    row_dict = dict(rec)
+    
+    # 提取特征
+    features = [
+        row_dict.get('feature1', 0),
+        row_dict.get('feature2', 0),
+        row_dict.get('feature3', 0)
+    ]
+    
+    # 调用模型进行预测（示例）
+    prediction = sum(features) / len(features)
+    
+    return prediction
+$$ LANGUAGE plpython3u;
+
+-- 使用预测函数创建表
+CREATE TABLE predictions (
+    id SERIAL PRIMARY KEY,
+    feature1 float,
+    feature2 float,
+    result float PREDICT
+) WITH (
+    predict_timing = immediate,
+    predict_function = 'ml_predict'
+);
+
+-- 插入数据时自动预测
+INSERT INTO predictions (feature1, feature2) VALUES (10.0, 20.0);
+-- 触发器会调用 ml_predict 函数，传入整行数据
+-- result_predict = 0.5 * 10 + 0.3 * 20 + 1.0 = 12.0
+```
 
 #### 2.2.6 查询处理器
 - 解析SELECT语句中的PREDICT列引用
