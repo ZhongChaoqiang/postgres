@@ -13,6 +13,8 @@ PREDICT列和PREDICT函数是PostgreSQL的一个扩展功能，用于在插入�
 ### 1.3 当前实现状态
 PREDICT功能的主要实现包括：
 - PREDICT列属性标记（attpredict字段）
+- 自动创建预测结果列（`_predict`后缀列）
+- 隐藏列机制（atthidden字段，SELECT *时不显示）
 - 预测函数查找机制（从reloptions获取）
 - 预测触发器函数（predict_trigger）
 - PREDICT列验证函数（is_predict_column）
@@ -78,7 +80,20 @@ graph TB
 - **写入时**：根据`predict_timing`选项决定是否调用预测函数
 - **读取时**：直接返回原始数据，无需特殊处理
 
-#### 2.2.2 预测触发器
+#### 2.2.2 自动创建预测结果列
+当定义一个PREDICT列时，系统会自动创建一个同类型的预测结果列：
+- 列名规则：原列名 + `_predict` 后缀（如 `value` → `value_predict`）
+- 数据类型：与原PREDICT列相同
+- 隐藏属性：自动设置为隐藏列，在 `SELECT *` 中不显示
+- 用途：存储预测函数的计算结果
+
+#### 2.2.3 隐藏列机制
+- 在`pg_attribute`系统表中添加`atthidden`布尔字段
+- 隐藏列在`SELECT *`展开时被跳过
+- 显式指定列名时仍可正常查询隐藏列
+- 利用现有的`p_dontexpand`机制实现（与CTE的SEARCH/CYCLE列相同）
+
+#### 2.2.4 预测触发器
 - 自动创建的BEFORE INSERT触发器
 - 处理所有PREDICT列的预测逻辑
 - 调用用户定义的预测函数
@@ -105,14 +120,22 @@ PREDICT功能涉及以下核心代码文件：
 
 | 文件路径 | 功能说明 |
 |---------|----------|
-| `src/backend/parser/gram.y` | PREDICT关键字语法解析，设置`is_predict`标志 |
-| `src/backend/parser/parse_utilcmd.c` | 建表时列定义处理，保持原始类型不转换 |
+| `src/backend/parser/gram.y` | PREDICT关键字语法解析，设置`is_predict`和`is_hidden`标志 |
+| `src/backend/parser/parse_utilcmd.c` | 建表时列定义处理，自动创建`_predict`后缀列 |
 | `src/backend/parser/parse_target.c` | INSERT时目标列处理，直接保存原始数据 |
-| `src/backend/parser/parse_relation.c` | SELECT时列引用处理，直接返回原始数据 |
-| `src/backend/commands/tablecmds.c` | 建表逻辑，创建预测触发器 |
+| `src/backend/parser/parse_relation.c` | SELECT时列引用处理，隐藏列的`p_dontexpand`设置 |
+| `src/backend/commands/tablecmds.c` | 建表逻辑，创建预测触发器，传递`is_hidden`到`atthidden` |
+| `src/backend/catalog/heap.c` | 系统表插入，处理`atthidden`字段 |
+| `src/backend/access/common/tupdesc.c` | 元组描述符初始化，初始化`atthidden`字段 |
+| `src/backend/nodes/makefuncs.c` | `makeColumnDef()`函数，初始化`is_hidden`字段 |
+| `src/backend/nodes/copyfuncs.funcs.c` | 节点复制，处理`is_hidden`字段 |
+| `src/backend/nodes/equalfuncs.funcs.c` | 节点比较，处理`is_hidden`字段 |
+| `src/backend/nodes/outfuncs.funcs.c` | 节点输出，处理`is_hidden`字段 |
+| `src/backend/nodes/readfuncs.funcs.c` | 节点读取，处理`is_hidden`字段 |
 | `src/backend/utils/adt/predict.c` | 预测触发器函数实现 |
-| `src/include/catalog/pg_attribute.h` | `attpredict`字段定义 |
-| `src/include/nodes/parsenodes.h` | `ColumnDef.is_predict`字段定义 |
+| `src/include/catalog/pg_attribute.h` | `attpredict`和`atthidden`字段定义 |
+| `src/include/nodes/parsenodes.h` | `ColumnDef.is_predict`和`ColumnDef.is_hidden`字段定义 |
+| `src/include/parser/parse_node.h` | `ParseNamespaceColumn.p_dontexpand`字段定义 |
 
 ## 3. 详细设计
 
@@ -122,6 +145,7 @@ PREDICT功能涉及以下核心代码文件：
 ```sql
 -- pg_attribute表扩展
 ALTER TABLE pg_attribute ADD COLUMN attpredict boolean NOT NULL DEFAULT false;
+ALTER TABLE pg_attribute ADD COLUMN atthidden boolean NOT NULL DEFAULT false;
 ```
 
 #### 3.1.2 PREDICT列数据结构
@@ -131,7 +155,16 @@ typedef struct FormData_pg_attribute
 {
     // ... 现有字段
     bool        attpredict;     // PREDICT列标记
+    bool        atthidden;      // 隐藏列标记（SELECT *时不显示）
 } FormData_pg_attribute;
+
+// 在ColumnDef中定义
+typedef struct ColumnDef
+{
+    // ... 现有字段
+    bool        is_predict;     // PREDICT选项指定
+    bool        is_hidden;      // 隐藏列标记
+} ColumnDef;
 
 // PREDICT列的类型处理
 // 定义类型：基础类型（如integer、float等）
@@ -142,16 +175,39 @@ typedef struct FormData_pg_attribute
 // 查询时：直接返回原始数据，无需特殊处理
 ```
 
+#### 3.1.3 隐藏列机制数据结构
+```c
+// 在ParseNamespaceColumn中定义
+struct ParseNamespaceColumn
+{
+    // ... 现有字段
+    bool        p_dontexpand;   // 不包含在星号展开中
+};
+
+// 隐藏列的处理流程：
+// 1. pg_attribute.atthidden 存储列的隐藏属性
+// 2. buildNSItemFromTupleDesc() 读取 atthidden 并设置 p_dontexpand
+// 3. expandNSItemVars() 检查 p_dontexpand，跳过隐藏列
+```
+
 ### 3.2 语法设计
 
 #### 3.2.1 CREATE TABLE语法扩展
 ```sql
+-- 创建带PREDICT列的表，自动创建隐藏的预测结果列
 CREATE TABLE example_table (
     id SERIAL PRIMARY KEY,
-    data_value integer PREDICT,  -- PREDICT列，保持原始基础类型
-    -- 可选：指定预测函数
-    predict_function = 'my_predict_func'
+    data_value integer PREDICT,  -- PREDICT列
+    -- 系统自动创建：data_value_predict (hidden)
 );
+
+-- 查询时，SELECT * 不会返回隐藏列
+SELECT * FROM example_table;
+-- 结果：id, data_value
+
+-- 显式指定列名时，仍然可以查询隐藏列
+SELECT id, data_value, data_value_predict FROM example_table;
+-- 结果：id, data_value, data_value_predict
 ```
 
 #### 3.2.2 语法解析规则
@@ -889,8 +945,233 @@ if (attr->attpredict)
 - 使用PostgreSQL预定义的错误码
 - 在函数查找过程中处理函数不存在或签名不匹配的情况
 
+## 8. 自动创建预测结果列
+
+### 8.1 功能概述
+
+当用户定义一个PREDICT列时，系统会自动创建一个同类型的预测结果列，用于存储预测函数的计算结果。
+
+### 8.2 列命名规则
+
+| 原PREDICT列名 | 自动创建的预测结果列名 |
+|--------------|---------------------|
+| `value` | `value_predict` |
+| `temperature` | `temperature_predict` |
+| `score` | `score_predict` |
+
+### 8.3 实现位置
+
+**文件**: `src/backend/parser/parse_utilcmd.c`
+
+**函数**: `transformColumnDefinition()`
+
+```c
+/*
+ * If this is a PREDICT column, automatically add a companion column
+ * with "_predict" suffix to store the prediction result.
+ */
+if (column->is_predict)
+{
+    ColumnDef  *predict_col;
+    char       *predict_colname;
+
+    predict_colname = psprintf("%s_predict", column->colname);
+
+    predict_col = makeNode(ColumnDef);
+    predict_col->colname = predict_colname;
+    predict_col->typeName = copyObject(column->typeName);
+    predict_col->is_hidden = true;  // 设置为隐藏列
+    // ... 其他字段初始化
+
+    cxt->columns = lappend(cxt->columns, predict_col);
+}
+```
+
+### 8.4 列属性继承
+
+预测结果列从原PREDICT列继承以下属性：
+- 数据类型（`typeName`）
+- 排序规则（`collOid`）
+
+预测结果列的独特属性：
+- `is_predict = false`：不是PREDICT列
+- `is_hidden = true`：隐藏列，SELECT *时不显示
+
+## 9. 隐藏列机制
+
+### 9.1 功能概述
+
+隐藏列机制允许某些列在`SELECT *`查询时自动被跳过，但仍可通过显式指定列名来查询。
+
+### 9.2 设计原理
+
+隐藏列利用PostgreSQL现有的`p_dontexpand`机制，该机制原本用于CTE的SEARCH和CYCLE子句添加的列。
+
+```mermaid
+graph TB
+    A[SELECT * 查询] --> B[expandNSItemVars]
+    B --> C{检查 p_dontexpand}
+    C -->|true| D[跳过该列]
+    C -->|false| E[包含该列]
+    D --> F[返回结果]
+    E --> F
+```
+
+### 9.3 数据流程
+
+```
+pg_attribute.atthidden
+        ↓
+buildNSItemFromTupleDesc()
+        ↓
+ParseNamespaceColumn.p_dontexpand
+        ↓
+expandNSItemVars() 检查并跳过
+```
+
+### 9.4 核心代码
+
+#### 9.4.1 pg_attribute扩展
+
+**文件**: `src/include/catalog/pg_attribute.h`
+
+```c
+/* Is hidden from SELECT * expansion or not */
+bool        atthidden BKI_DEFAULT(f);
+```
+
+#### 9.4.2 解析器列定义扩展
+
+**文件**: `src/include/nodes/parsenodes.h`
+
+```c
+typedef struct ColumnDef
+{
+    // ... 现有字段
+    bool        is_hidden;      /* hidden from SELECT * expansion? */
+} ColumnDef;
+```
+
+#### 9.4.3 命名空间列处理
+
+**文件**: `src/backend/parser/parse_relation.c`
+
+```c
+static ParseNamespaceItem *
+buildNSItemFromTupleDesc(RangeTblEntry *rte, Index rtindex,
+                         RTEPermissionInfo *perminfo,
+                         TupleDesc tupdesc)
+{
+    // ...
+    for (varattno = 0; varattno < maxattrs; varattno++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, varattno);
+        
+        // ...
+        
+        /* Hidden columns are not included in SELECT * expansion */
+        nscolumns[varattno].p_dontexpand = attr->atthidden;
+    }
+    // ...
+}
+```
+
+#### 9.4.4 SELECT *展开处理
+
+**文件**: `src/backend/parser/parse_relation.c`
+
+```c
+List *
+expandNSItemVars(ParseState *pstate, ParseNamespaceItem *nsitem,
+                 int sublevels_up, int location,
+                 List **colnames)
+{
+    // ...
+    foreach(lc, nsitem->p_names->colnames)
+    {
+        ParseNamespaceColumn *nscol = nsitem->p_nscolumns + colindex;
+
+        if (nscol->p_dontexpand)
+        {
+            /* skip */  // 跳过隐藏列
+        }
+        else if (colname[0])
+        {
+            // 正常处理列
+        }
+        // ...
+    }
+    return result;
+}
+```
+
+### 9.5 使用示例
+
+```sql
+-- 创建带PREDICT列的表
+CREATE TABLE predictions (
+    id SERIAL PRIMARY KEY,
+    value INTEGER PREDICT
+);
+
+-- 实际表结构：
+-- id (integer, NOT NULL)
+-- value (integer)                    -- PREDICT列
+-- value_predict (integer, HIDDEN)    -- 自动创建的隐藏列
+
+-- SELECT * 不返回隐藏列
+SELECT * FROM predictions;
+-- 结果列：id, value
+
+-- 显式指定可以查询隐藏列
+SELECT id, value, value_predict FROM predictions;
+-- 结果列：id, value, value_predict
+
+-- 隐藏列仍然可以用于WHERE条件
+SELECT * FROM predictions WHERE value_predict > 100;
+```
+
+### 9.6 与系统列的对比
+
+| 特性 | 隐藏列（atthidden） | 系统列（如ctid） |
+|-----|-------------------|-----------------|
+| 存储位置 | 正常用户列区域 | 系统列区域（负数attnum） |
+| SELECT * | 不显示 | 不显示 |
+| 显式查询 | 支持 | 支持 |
+| attnum | 正数 | 负数 |
+| 用途 | 存储内部数据 | 系统元数据 |
+
+## 10. 重新构建和初始化
+
+由于修改了`pg_attribute`系统表结构，需要重新构建项目并初始化数据库：
+
+### 10.1 重新构建
+
+```bash
+cd /path/to/postgres/build
+make clean
+make -j4
+make install
+```
+
+### 10.2 重新初始化数据库
+
+```bash
+# 停止数据库服务
+pg_ctl stop -D /path/to/data
+
+# 删除旧数据目录
+rm -rf /path/to/data/*
+
+# 重新初始化
+initdb -D /path/to/data
+
+# 启动数据库
+pg_ctl start -D /path/to/data
+```
+
 ---
 
-**文档版本**: 1.1  
-**最后更新**: 2025-03-03  
+**文档版本**: 1.2  
+**最后更新**: 2025-03-04  
 **作者**: PostgreSQL开发团队

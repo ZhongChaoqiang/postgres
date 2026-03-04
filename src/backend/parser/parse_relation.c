@@ -1334,6 +1334,8 @@ buildNSItemFromTupleDesc(RangeTblEntry *rte, Index rtindex,
 		nscolumns[varattno].p_varcollid = attr->attcollation;
 		nscolumns[varattno].p_varnosyn = rtindex;
 		nscolumns[varattno].p_varattnosyn = varattno + 1;
+		/* Hidden columns are not included in SELECT * expansion */
+		nscolumns[varattno].p_dontexpand = attr->atthidden;
 	}
 
 	/* ... and build the nsitem */

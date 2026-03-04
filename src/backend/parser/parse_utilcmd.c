@@ -1027,6 +1027,43 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 
 		cxt->alist = lappend(cxt->alist, stmt);
 	}
+
+	/*
+	 * If this is a PREDICT column, automatically add a companion column
+	 * with "_predict" suffix to store the prediction result.
+	 */
+	if (column->is_predict)
+	{
+		ColumnDef  *predict_col;
+		char	   *predict_colname;
+
+		predict_colname = psprintf("%s_predict", column->colname);
+
+		predict_col = makeNode(ColumnDef);
+		predict_col->colname = predict_colname;
+		predict_col->typeName = copyObject(column->typeName);
+		predict_col->compression = NULL;
+		predict_col->inhcount = 0;
+		predict_col->is_local = true;
+		predict_col->is_not_null = false;
+		predict_col->is_from_type = false;
+		predict_col->is_predict = false;
+		predict_col->is_hidden = true;
+		predict_col->storage = 0;
+		predict_col->storage_name = NULL;
+		predict_col->raw_default = NULL;
+		predict_col->cooked_default = NULL;
+		predict_col->identity = '\0';
+		predict_col->identitySequence = NULL;
+		predict_col->generated = '\0';
+		predict_col->collClause = NULL;
+		predict_col->collOid = column->collOid;
+		predict_col->constraints = NIL;
+		predict_col->fdwoptions = NIL;
+		predict_col->location = -1;
+
+		cxt->columns = lappend(cxt->columns, predict_col);
+	}
 }
 
 /*

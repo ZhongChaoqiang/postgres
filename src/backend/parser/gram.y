@@ -3904,6 +3904,7 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 					n->collOid = InvalidOid;
 					n->fdwoptions = $5;
 					n->is_predict = $7;
+					n->is_hidden = false;
 					SplitColQualList($6, &n->constraints, &n->collClause,
 									 yyscanner);
 					n->location = @1;
