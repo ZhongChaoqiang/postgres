@@ -1033,6 +1033,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 	 * - "_predict" suffix column: stores the prediction result
 	 * - "_actual" suffix column: stores the actual value for comparison
 	 * Both columns are hidden from SELECT * expansion.
+	 * Also create an index on the PREDICT column for faster queries.
 	 */
 	if (column->is_predict)
 	{
@@ -1040,6 +1041,9 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		ColumnDef  *actual_col;
 		char	   *predict_colname;
 		char	   *actual_colname;
+		IndexStmt  *index;
+		IndexElem  *iparam;
+		IndexElem  *iparam2;
 
 		/* Create _predict column */
 		predict_colname = psprintf("%s_predict", column->colname);
@@ -1096,6 +1100,60 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		actual_col->location = -1;
 
 		cxt->columns = lappend(cxt->columns, actual_col);
+
+		/* Create composite index on PREDICT column and _predict column */
+		index = makeNode(IndexStmt);
+		index->idxname = psprintf("%s_%s_predict_idx", 
+								  cxt->relation->relname, column->colname);
+		index->relation = copyObject(cxt->relation);
+		index->accessMethod = pstrdup("btree");
+		index->tableSpace = NULL;
+		index->options = NIL;
+		index->whereClause = NULL;
+		index->excludeOpNames = NIL;
+		index->idxcomment = NULL;
+		index->indexOid = InvalidOid;
+		index->oldNumber = InvalidRelFileNumber;
+		index->oldCreateSubid = InvalidSubTransactionId;
+		index->oldFirstRelfilelocatorSubid = InvalidSubTransactionId;
+		index->unique = false;
+		index->nulls_not_distinct = false;
+		index->primary = false;
+		index->isconstraint = false;
+		index->iswithoutoverlaps = false;
+		index->deferrable = false;
+		index->initdeferred = false;
+		index->transformed = false;
+		index->concurrent = false;
+		index->if_not_exists = true;
+		index->reset_default_tblspc = false;
+
+		/* Create index element for the PREDICT column */
+		iparam = makeNode(IndexElem);
+		iparam->name = pstrdup(column->colname);
+		iparam->expr = NULL;
+		iparam->indexcolname = NULL;
+		iparam->collation = NIL;
+		iparam->opclass = NIL;
+		iparam->opclassopts = NIL;
+		iparam->ordering = SORTBY_DEFAULT;
+		iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+
+		/* Create index element for the _predict column */
+		iparam2 = makeNode(IndexElem);
+		iparam2->name = psprintf("%s_predict", column->colname);
+		iparam2->expr = NULL;
+		iparam2->indexcolname = NULL;
+		iparam2->collation = NIL;
+		iparam2->opclass = NIL;
+		iparam2->opclassopts = NIL;
+		iparam2->ordering = SORTBY_DEFAULT;
+		iparam2->nulls_ordering = SORTBY_NULLS_DEFAULT;
+
+		index->indexParams = list_make2(iparam, iparam2);
+		index->indexIncludingParams = NIL;
+
+		cxt->alist = lappend(cxt->alist, index);
 	}
 }
 
