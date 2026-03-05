@@ -92,7 +92,7 @@ graph TB
 - **读取时**：直接返回原始数据，无需特殊处理
 
 #### 2.2.2 自动创建预测结果列
-当定义一个PREDICT列时，系统会自动创建两个同类型的隐藏列：
+当定义一个PREDICT列时，系统会自动创建两个同类型的隐藏列和一个索引：
 - **预测结果列**：原列名 + `_predict` 后缀（如 `value` → `value_predict`）
   - 数据类型：与原PREDICT列相同
   - 隐藏属性：自动设置为隐藏列
@@ -102,6 +102,11 @@ graph TB
   - 数据类型：与原PREDICT列相同
   - 隐藏属性：自动设置为隐藏列
   - 用途：存储实际值，用于与预测值进行对比分析
+
+- **自动索引**：`{表名}_{列名}_predict_idx`（如 `predictions_value_predict_idx`）
+  - 索引类型：B-tree复合索引
+  - 索引列：PREDICT列和`_predict`后缀列
+  - 用途：加速对PREDICT列和预测结果的联合查询
 
 #### 2.2.3 隐藏列机制
 - 在`pg_attribute`系统表中添加`atthidden`布尔字段
@@ -1113,6 +1118,48 @@ if (column->is_predict)
 | `value_predict` | 存储预测函数的计算结果 |
 | `value_actual` | 存储实际值，用于与预测值进行对比分析 |
 
+### 8.6 自动创建索引
+
+当创建PREDICT列时，系统会自动在该列和`_predict`后缀列上创建一个复合B-tree索引，以加速查询性能。
+
+**索引命名规则**：`{表名}_{列名}_predict_idx`（如 `predictions_value_predict_idx`）
+
+**实现位置**：`src/backend/parser/parse_utilcmd.c`
+
+```c
+/* Create composite index on PREDICT column and _predict column */
+index = makeNode(IndexStmt);
+index->idxname = psprintf("%s_%s_predict_idx", 
+                          cxt->relation->relname, column->colname);
+index->relation = copyObject(cxt->relation);
+index->accessMethod = pstrdup("btree");
+index->unique = false;
+index->if_not_exists = true;
+
+/* Create index element for the PREDICT column */
+iparam = makeNode(IndexElem);
+iparam->name = pstrdup(column->colname);
+
+/* Create index element for the _predict column */
+iparam2 = makeNode(IndexElem);
+iparam2->name = psprintf("%s_predict", column->colname);
+
+index->indexParams = list_make2(iparam, iparam2);
+
+cxt->alist = lappend(cxt->alist, index);
+```
+
+**索引特性**：
+- 索引类型：B-tree复合索引
+- 索引列：`{列名}`, `{列名}_predict`
+- 非唯一索引
+- 使用 `IF NOT EXISTS` 避免重复创建错误
+
+**索引用途**：
+- 加速对PREDICT列的查询
+- 加速对PREDICT列和预测结果的联合查询
+- 支持范围查询和排序操作
+
 ## 9. 隐藏列机制
 
 ### 9.1 功能概述
@@ -1235,6 +1282,14 @@ CREATE TABLE predictions (
 -- value (integer)                       -- PREDICT列
 -- value_predict (integer, HIDDEN)       -- 自动创建的隐藏列，存储预测结果
 -- value_actual (integer, HIDDEN)        -- 自动创建的隐藏列，存储实际值
+-- 自动创建的索引：
+-- predictions_value_predict_idx (btree复合索引)  -- 自动创建在 (value, value_predict) 列上
+
+-- 查看自动创建的索引
+\d predictions
+-- 或
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'predictions';
+-- 结果包含：predictions_value_predict_idx (btree复合索引 on value, value_predict)
 
 -- INSERT 操作：用户输入值会自动同步到 _actual 列
 INSERT INTO predictions (value) VALUES (100);
