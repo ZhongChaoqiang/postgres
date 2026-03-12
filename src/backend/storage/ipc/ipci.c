@@ -28,6 +28,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/async_predict.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/walsummarizer.h"
@@ -135,6 +136,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, ProcSignalShmemSize());
 	size = add_size(size, CheckpointerShmemSize());
 	size = add_size(size, AutoVacuumShmemSize());
+	size = add_size(size, AsyncPredictShmemSize());
 	size = add_size(size, ReplicationSlotsShmemSize());
 	size = add_size(size, ReplicationOriginShmemSize());
 	size = add_size(size, WalSndShmemSize());
@@ -326,6 +328,7 @@ CreateOrAttachShmemStructs(void)
 	ProcSignalShmemInit();
 	CheckpointerShmemInit();
 	AutoVacuumShmemInit();
+	AsyncPredictShmemInit();
 	ReplicationSlotsShmemInit();
 	ReplicationOriginShmemInit();
 	WalSndShmemInit();

@@ -21,6 +21,8 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/predict.h"
+#include "utils/regproc.h"
 #include "access/relation.h"
 #include "access/htup_details.h"
 #include "catalog/pg_class.h"
@@ -37,6 +39,7 @@
 #include "catalog/pg_namespace.h"
 #include "nodes/makefuncs.h"
 #include "access/reloptions.h"
+#include "funcapi.h"
 
 /*
  * is_predict_column - check if a column has PREDICT attribute
@@ -90,7 +93,7 @@ get_predict_function(Oid relid)
 	HeapTuple	tuple;
 	Datum		reloptions;
 	bool		isnull;
-	char		*predict_func = NULL;
+	char	   *predict_func = NULL;
 
 	/* Get the relation tuple from pg_class */
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
@@ -101,38 +104,45 @@ get_predict_function(Oid relid)
 	reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
 		   &isnull);
 
+	elog(LOG, "async_predict: get_predict_function for relid=%u, reloptions isnull=%s",
+		 relid, isnull ? "true" : "false");
+
 	if (!isnull)
 	{
 		/* reloptions is a text array, so we need to deconstruct it */
 		ArrayType  *array = DatumGetArrayTypeP(reloptions);
-		Datum		*elems;
-		bool		*nulls;
-		int		nitems;
-		int		i;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nitems;
+		int			i;
 		const char *prefix = "predict_function=";
-		const size_t prefix_len = 17;
+		const size_t prefix_len = strlen(prefix);
 
 		/* Deconstruct the array */
 		deconstruct_array(array, TEXTOID, -1, false, 'i', &elems, &nulls, &nitems);
+
+		elog(LOG, "async_predict: reloptions has %d items", nitems);
 
 		/* Iterate through the array elements */
 		for (i = 0; i < nitems; i++)
 		{
 			if (!nulls[i])
 			{
-				text		*t = DatumGetTextP(elems[i]);
-				char		*text_str = VARDATA(t);
-				int		text_len = VARSIZE(t) - VARHDRSZ;
+				char	   *text_str = TextDatumGetCString(elems[i]);
+				int			text_len = strlen(text_str);
+
+				elog(LOG, "async_predict: reloption[%d] = '%s'", i, text_str);
 
 				/* Check if the option matches the expected prefix */
 				if (text_len > prefix_len && strncmp(text_str, prefix, prefix_len) == 0)
 				{
-					/* Extract the function name directly from text_str */
-					predict_func = palloc(text_len - prefix_len + 1);
-					memcpy(predict_func, text_str + prefix_len, text_len - prefix_len);
-					predict_func[text_len - prefix_len] = '\0';
+					/* Extract the function name */
+					predict_func = pstrdup(text_str + prefix_len);
+					elog(LOG, "async_predict: found predict_function = '%s'", predict_func);
+					pfree(text_str);
 					break;
 				}
+				pfree(text_str);
 			}
 		}
 
@@ -142,7 +152,129 @@ get_predict_function(Oid relid)
 	}
 
 	ReleaseSysCache(tuple);
+	
+	if (predict_func == NULL)
+		elog(LOG, "async_predict: no predict_function found for relid=%u", relid);
+	
 	return predict_func;
+}
+
+/*
+ * get_predict_function_oid - Get the OID of the predict function
+ *
+ * Returns the function OID if set, or InvalidOid if not set.
+ */
+Oid
+get_predict_function_oid(Oid relid)
+{
+	char	   *funcname;
+	Oid			funcoid = InvalidOid;
+	List	   *namelist;
+	FuncCandidateList clist;
+	int			fgc_flags;
+
+	funcname = get_predict_function(relid);
+	if (funcname == NULL)
+		return InvalidOid;
+
+	elog(LOG, "async_predict: get_predict_function_oid looking for function '%s'", funcname);
+
+	/*
+	 * Try to find the function. First try as qualified name, then as
+	 * unqualified name in all schemas.
+	 */
+	if (strchr(funcname, '.') != NULL)
+	{
+		/* Qualified name: parse schema.function format */
+		namelist = stringToQualifiedNameList(funcname, NULL);
+	}
+	else
+	{
+		/*
+		 * Unqualified name: search in all schemas.
+		 * We need to search in pg_catalog, public, and any other schema
+		 * that might contain the function.
+		 */
+		namelist = list_make1(makeString(funcname));
+	}
+
+	/* Search for function with 1 argument */
+	clist = FuncnameGetCandidates(namelist, 1, NIL, false, false, false, true, &fgc_flags);
+
+	elog(LOG, "async_predict: FuncnameGetCandidates result, clist=%p", clist);
+
+	if (clist != NULL)
+	{
+		for (; clist != NULL; clist = clist->next)
+		{
+			elog(LOG, "async_predict: candidate oid=%u, nargs=%d", clist->oid, clist->nargs);
+			if (clist->nargs == 1)
+			{
+				funcoid = clist->oid;
+				break;
+			}
+		}
+	}
+
+	/*
+	 * If still not found, try using regprocedure cast which searches
+	 * all schemas regardless of search_path.
+	 */
+	if (!OidIsValid(funcoid))
+	{
+		char	   *query;
+		Datum		result;
+		bool		isnull;
+		MemoryContext oldcontext;
+		MemoryContext querycontext;
+		int			ret;
+
+		elog(LOG, "async_predict: trying direct lookup via pg_proc");
+
+		/* Create a temporary memory context for the query */
+		querycontext = AllocSetContextCreate(CurrentMemoryContext,
+											 "predict_func_lookup",
+											 ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(querycontext);
+
+		/* Build query to find function by name */
+		query = psprintf(
+			"SELECT oid FROM pg_proc "
+			"WHERE proname = '%s' "
+			"AND pronargs = 1 "
+			"ORDER BY oid LIMIT 1",
+			funcname);
+
+		elog(LOG, "async_predict: SPI query: %s", query);
+
+		ret = SPI_connect();
+		elog(LOG, "async_predict: SPI_connect returned %d", ret);
+		
+		if (ret == SPI_OK_CONNECT)
+		{
+			ret = SPI_execute(query, true, 1);
+			elog(LOG, "async_predict: SPI_execute returned %d, SPI_processed=%lu", 
+				 ret, SPI_processed);
+			
+			if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			{
+				result = SPI_getbinval(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc, 1, &isnull);
+				if (!isnull)
+					funcoid = DatumGetObjectId(result);
+				elog(LOG, "async_predict: SPI lookup result=%u", funcoid);
+			}
+			SPI_finish();
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(querycontext);
+	}
+
+	elog(LOG, "async_predict: get_predict_function_oid final result=%u", funcoid);
+
+	pfree(funcname);
+	return funcoid;
 }
 
 /*
@@ -153,7 +285,6 @@ static AttrNumber
 find_column_by_name(TupleDesc tupdesc, const char *colname)
 {
 	int		attnum;
-	int		namelen = strlen(colname);
 
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
