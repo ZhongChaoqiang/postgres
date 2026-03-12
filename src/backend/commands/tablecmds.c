@@ -14069,6 +14069,7 @@ createPredictTriggersForRelation(Relation rel)
 {
 	TupleDesc	tupdesc;
 	int			attnum;
+	Oid			relOid = RelationGetRelid(rel);
 
 	tupdesc = RelationGetDescr(rel);
 
@@ -14083,8 +14084,7 @@ createPredictTriggersForRelation(Relation rel)
 		/* Check if this is a PREDICT column */
 		if (attr->attpredict)
 		{
-			createPredictTrigger(RelationGetRelid(rel), attnum,
-								NameStr(attr->attname));
+			createPredictTrigger(relOid, attnum, NameStr(attr->attname));
 		}
 	}
 }

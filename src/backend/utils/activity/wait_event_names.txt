@@ -332,6 +332,7 @@ BtreeVacuum	"Waiting to read or update vacuum-related information for a B-tree i
 AddinShmemInit	"Waiting to manage an extension's space allocation in shared memory."
 Autovacuum	"Waiting to read or update the current state of autovacuum workers."
 AutovacuumSchedule	"Waiting to ensure that a table selected for autovacuum still needs vacuuming."
+AsyncPredict	"Waiting to read or update async prediction worker state."
 SyncScan	"Waiting to select the starting location of a synchronized table scan."
 RelationMapping	"Waiting to read or update a <filename>pg_filenode.map</filename> file (used to track the filenode assignments of certain system catalogs)."
 NotifyQueue	"Waiting to read or update <command>NOTIFY</command> messages."

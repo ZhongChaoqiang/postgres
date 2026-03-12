@@ -65,6 +65,7 @@
 #include "parser/parser.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/async_predict.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
