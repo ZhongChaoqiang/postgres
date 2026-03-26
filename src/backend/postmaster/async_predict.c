@@ -207,6 +207,8 @@ async_predict_get_next_database(char *dbname_out)
 	HeapTuple	tuple;
 	Oid			result = InvalidOid;
 	bool		found_current = false;
+	Oid			first_dboid = InvalidOid;
+	char		first_dbname[MAX_DBNAME_LEN] = {0};
 
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -221,6 +223,12 @@ async_predict_get_next_database(char *dbname_out)
 
 		if (dbform->datistemplate || !dbform->datallowconn)
 			continue;
+
+		if (!OidIsValid(first_dboid))
+		{
+			first_dboid = dboid;
+			strlcpy(first_dbname, NameStr(dbform->datname), MAX_DBNAME_LEN);
+		}
 
 		if (!OidIsValid(AsyncPredictShmem->next_dboid))
 		{
@@ -249,6 +257,13 @@ async_predict_get_next_database(char *dbname_out)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	if (!OidIsValid(result) && OidIsValid(first_dboid))
+	{
+		result = first_dboid;
+		if (dbname_out)
+			strlcpy(dbname_out, first_dbname, MAX_DBNAME_LEN);
+	}
+
 	return result;
 }
 
@@ -268,7 +283,7 @@ async_predict_launcher_main(Datum main_arg)
 
 	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
 
-	elog(LOG, "async_predict: launcher started, workers=%d, naptime=%d, batch_size=%d, enabled=%s",
+	elog(DEBUG1, "async_predict: launcher started, workers=%d, naptime=%d, batch_size=%d, enabled=%s",
 		 async_predict_workers, async_predict_naptime, async_predict_batch_size,
 		 async_predict_enabled ? "true" : "false");
 
@@ -287,9 +302,6 @@ async_predict_launcher_main(Datum main_arg)
 				  async_predict_naptime * 1000L,
 				  WAIT_EVENT_BGWORKER_SHUTDOWN);
 		ResetLatch(MyLatch);
-
-		elog(DEBUG1, "async_predict: launcher woke up, enabled=%s",
-			 async_predict_enabled ? "true" : "false");
 
 		if (!async_predict_enabled)
 			continue;
@@ -317,7 +329,7 @@ async_predict_launcher_main(Datum main_arg)
 							 "async predict worker %d", worker_slot);
 					strcpy(worker.bgw_type, "async_predict_worker");
 					worker.bgw_main_arg = Int32GetDatum(worker_slot);
-					worker.bgw_notify_pid = MyProcPid;
+					worker.bgw_notify_pid = 0;
 
 					if (RegisterDynamicBackgroundWorker(&worker, &handle))
 					{
@@ -326,7 +338,7 @@ async_predict_launcher_main(Datum main_arg)
 						wi->dboid = dboid;
 						strlcpy(wi->dbname, dbname, MAX_DBNAME_LEN);
 						AsyncPredictShmem->next_dboid = dboid;
-						elog(LOG, "async_predict: started worker %d for database '%s' (oid=%u)",
+						elog(DEBUG1, "async_predict: started worker %d for database '%s' (oid=%u)",
 							 worker_slot, dbname, dboid);
 					}
 					else
@@ -369,8 +381,6 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 	oldcontext = MemoryContextSwitchTo(cbcontext);
 
-	elog(DEBUG1, "async_predict: scanning table %s", relname);
-
 	while (processed < async_predict_batch_size)
 	{
 		tuple = heap_getnext(scan, ForwardScanDirection);
@@ -380,14 +390,12 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 		{
 			bool		predict_isnull;
-			bool		result_isnull;
 
 			total_rows++;
 
 			predict_isnull = heap_attisnull(tuple, predict_attnum, tupdesc);
-			result_isnull = heap_attisnull(tuple, result_attnum, tupdesc);
 
-			if (!predict_isnull || !result_isnull)
+			if (!predict_isnull)
 			{
 				skipped_not_null++;
 				continue;
@@ -398,9 +406,9 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 				Datum		row_datum;
 				Datum		predict_datum;
 				HeapTuple	newtuple;
-				int			modify_attnums[1];
-				Datum		modify_values[1];
-				bool		modify_nulls[1];
+				int			modify_attnums[2];
+				Datum		modify_values[2];
+				bool		modify_nulls[2];
 
 				row_datum = heap_copy_tuple_as_datum(tuple, tupdesc);
 
@@ -410,7 +418,11 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 				modify_values[0] = predict_datum;
 				modify_nulls[0] = false;
 
-				newtuple = heap_modify_tuple_by_cols(tuple, tupdesc, 1,
+				modify_attnums[1] = predict_attnum;
+				modify_values[1] = predict_datum;
+				modify_nulls[1] = false;
+
+				newtuple = heap_modify_tuple_by_cols(tuple, tupdesc, 2,
 													 modify_attnums,
 													 modify_values, modify_nulls);
 
@@ -461,9 +473,6 @@ async_predict_process_database(Oid dboid, int worker_slot)
 	AsyncPredictWorkerInfo *wi = &AsyncPredictShmem->workers[worker_slot];
 	int			table_count = 0;
 	int			predict_col_count = 0;
-
-	elog(DEBUG1, "async_predict: worker %d starting table scan in database %u",
-		 worker_slot, dboid);
 
 	pg_class = table_open(RelationRelationId, AccessShareLock);
 
@@ -587,8 +596,6 @@ async_predict_worker_main(Datum main_arg)
 	elog(DEBUG1, "async_predict: worker started for database '%s' (oid=%u)", dbname, dboid);
 
 	BackgroundWorkerInitializeConnection(dbname, NULL, 0);
-
-	elog(DEBUG1, "async_predict: worker connected to database '%s'", dbname);
 
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
