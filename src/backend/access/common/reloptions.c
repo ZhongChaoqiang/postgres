@@ -390,6 +390,15 @@ static relopt_int intRelOpts[] =
 		},
 		-1, 0, 1024
 	},
+	{
+		{
+			"jolixdb_embedding_vector_len",
+			"Length of embedding vector for prediction columns.",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		10, 0, INT_MAX
+	},
 
 	/* list terminator */
 	{{NULL}}
@@ -1962,7 +1971,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, vacuum_truncate), offsetof(StdRdOptions, vacuum_truncate_set)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
+		{"jolixdb_embedding_vector_len", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, jolixdb_embedding_vector_len)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

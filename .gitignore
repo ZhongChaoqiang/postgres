@@ -46,3 +46,6 @@ lib*.pc
 build
 .vscode
 /.arts
+doc-pak
+deb-pkg
+description-pak

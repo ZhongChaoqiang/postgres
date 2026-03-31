@@ -573,6 +573,7 @@ makeColumnDef(const char *colname, Oid typeOid, int32 typmod, Oid collOid)
 	n->is_not_null = false;
 	n->is_from_type = false;
 	n->is_predict = false;
+	n->is_embedding = false;
 	n->is_hidden = false;
 	n->storage = 0;
 	n->raw_default = NULL;

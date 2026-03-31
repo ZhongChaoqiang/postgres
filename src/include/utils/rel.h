@@ -364,6 +364,7 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+	int			jolixdb_embedding_vector_len;	/* length of embedding vector for prediction */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -418,6 +419,10 @@ typedef struct StdRdOptions
 #define RelationGetParallelWorkers(relation, defaultpw) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->parallel_workers : (defaultpw))
+
+#define RelationGetEmbeddingVectorLen(relation, defaultlen) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_embedding_vector_len : (defaultlen))
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption

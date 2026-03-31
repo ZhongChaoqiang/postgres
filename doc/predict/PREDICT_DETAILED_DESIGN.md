@@ -9,6 +9,7 @@ PREDICT列和PREDICT函数是PostgreSQL的一个扩展功能，用于在插入�
 - **PREDICT函数**：用户自定义的预测计算函数
 - **预测触发器**：自动处理预测逻辑的触发器函数
 - **关系选项**：控制预测行为的表级选项
+- **EMBEDDING列属性**：标记列为嵌入向量列，自动创建向量存储列
 
 ### 1.3 当前实现状态
 PREDICT功能的主要实现包括：
@@ -20,12 +21,16 @@ PREDICT功能的主要实现包括：
 - 预测触发器函数（predict_trigger）
 - PREDICT列验证函数（is_predict_column）
 - 预测时机控制选项（predict_timing表选项）
+- EMBEDDING列属性标记（attembedding字段）
+- 自动创建嵌入向量列（`_embedding`后缀列）
+- 嵌入向量长度控制选项（embedding_vector_len表选项）
 
 ### 1.2 设计目标
 - 提供灵活的数据预测机制
 - 支持用户自定义预测算法
 - 保持与现有PostgreSQL架构的兼容性
 - 提供可配置的预测时机控制
+- 支持嵌入向量自动存储和管理
 
 ## 2. 架构设计
 
@@ -1343,7 +1348,270 @@ FROM predictions;
 | attnum | 正数 | 负数 |
 | 用途 | 存储内部数据 | 系统元数据 |
 
-## 10. 重新构建和初始化
+## 10. EMBEDDING列属性设计
+
+### 10.1 功能概述
+
+EMBEDDING列属性用于标记需要存储嵌入向量的列。当定义一个EMBEDDING列时，系统会自动创建一个隐藏的向量列来存储嵌入向量数据。
+
+### 10.2 设计原理
+
+```mermaid
+graph TB
+    A[CREATE TABLE语句] --> B[列定义处理]
+    B --> C{是否EMBEDDING列?}
+    C -->|是| D[设置attembedding标志]
+    D --> E[获取jolixdb_embedding_vector_len]
+    E --> F[创建_embedding隐藏列]
+    F --> G[类型为vector]
+    C -->|否| G
+```
+
+### 10.3 数据结构设计
+
+#### 10.3.1 系统表扩展
+
+**文件**: `src/include/catalog/pg_attribute.h`
+
+```c
+/* Is EMBEDDING option specified */
+bool        attembedding BKI_DEFAULT(f);
+```
+
+#### 10.3.2 解析器列定义扩展
+
+**文件**: `src/include/nodes/parsenodes.h`
+
+```c
+typedef struct ColumnDef
+{
+    // ... 现有字段
+    bool        is_predict;     /* PREDICT option specified? */
+    bool        is_embedding;   /* EMBEDDING option specified? */
+    bool        is_hidden;      /* hidden from SELECT * expansion? */
+} ColumnDef;
+```
+
+#### 10.3.3 紧凑属性扩展
+
+**文件**: `src/include/access/tupdesc.h`
+
+```c
+typedef struct CompactAttribute
+{
+    // ... 现有字段
+    bool        attpredict;     /* FormData_pg_attribute.attpredict */
+    bool        attembedding;   /* FormData_pg_attribute.attembedding */
+} CompactAttribute;
+```
+
+### 10.4 表级选项设计
+
+#### 10.4.1 jolixdb_embedding_vector_len选项
+
+**文件**: `src/backend/access/common/reloptions.c`
+
+```c
+static relopt_int intRelOpts[] =
+{
+    // ... 其他选项
+    {
+        {
+            "jolix_embedding_vector_len",
+            "Length of embedding vector for prediction columns.",
+            RELOPT_KIND_HEAP,
+            ShareUpdateExclusiveLock
+        },
+        10, 0, INT_MAX    /* 默认值=10, 最小值=0, 最大值=INT_MAX */
+    },
+};
+```
+
+**文件**: `src/include/utils/rel.h`
+
+```c
+typedef struct StdRdOptions
+{
+    // ... 现有字段
+    int         jolix_embedding_vector_len;   /* length of embedding vector for prediction */
+} StdRdOptions;
+
+/* 获取jolix_embedding_vector_len的宏 */
+#define RelationGetEmbeddingVectorLen(relation, defaultlen) \
+    ((relation)->rd_options ? \
+     ((StdRdOptions *) (relation)->rd_options)->jolix_embedding_vector_len : (defaultlen))
+```
+
+### 10.5 语法设计
+
+#### 10.5.1 关键字定义
+
+**文件**: `src/include/parser/kwlist.h`
+
+```c
+PG_KEYWORD("embedding", EMBEDDING, UNRESERVED_KEYWORD, BARE_LABEL)
+```
+
+#### 10.5.2 语法规则
+
+**文件**: `src/backend/parser/gram.y`
+
+```bison
+/* 列定义语法 */
+columnDef: ColId Typename opt_column_storage opt_column_compression 
+           create_generic_options ColQualList opt_predict opt_embedding
+    {
+        ColumnDef *n = makeNode(ColumnDef);
+        // ...
+        n->is_predict = $7;
+        n->is_embedding = $8;
+        // ...
+    }
+;
+
+/* EMBEDDING选项规则 */
+opt_embedding:
+    EMBEDDING     { $$ = true; }
+    | /*EMPTY*/   { $$ = false; }
+;
+```
+
+### 10.6 自动创建嵌入向量列
+
+#### 10.6.1 实现位置
+
+**文件**: `src/backend/parser/parse_utilcmd.c`
+
+**函数**: `transformColumnDefinition()`
+
+```c
+/*
+ * If this is an EMBEDDING column, automatically add a companion hidden
+ * column with "_embedding" suffix to store the embedding vector.
+ * The column type is vector with length specified by jolix_embedding_vector_len.
+ */
+if (column->is_embedding)
+{
+    ColumnDef  *embedding_col;
+    char       *embedding_colname;
+    TypeName   *vector_type;
+    int         vector_len;
+
+    /* Get jolix_embedding_vector_len from relation options */
+    vector_len = cxt->jolix_embedding_vector_len;
+
+    /* Create _embedding column name */
+    embedding_colname = psprintf("%s_embedding", column->colname);
+
+    /* Create vector type: vector(vector_len) */
+    vector_type = makeNode(TypeName);
+    vector_type->names = list_make1(makeString("vector"));
+    vector_type->typmods = list_make1(makeAConst(vector_len));
+    vector_type->typemod = -1;
+    vector_type->location = -1;
+
+    /* Create the _embedding column definition */
+    embedding_col = makeNode(ColumnDef);
+    embedding_col->colname = embedding_colname;
+    embedding_col->typeName = vector_type;
+    embedding_col->is_predict = false;
+    embedding_col->is_embedding = false;
+    embedding_col->is_hidden = true;
+    // ... 其他字段初始化
+
+    cxt->columns = lappend(cxt->columns, embedding_col);
+}
+```
+
+### 10.7 使用示例
+
+```sql
+-- 创建带EMBEDDING列的表，使用默认向量长度(10)
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT EMBEDDING
+);
+
+-- 实际表结构：
+-- id (serial, PRIMARY KEY)
+-- content (text)                        -- EMBEDDING列
+-- content_embedding (vector(10), HIDDEN) -- 自动创建的隐藏向量列
+
+-- 创建带EMBEDDING列的表，指定向量长度
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT EMBEDDING
+) WITH (
+    jolix_embedding_vector_len = 128
+);
+
+-- 实际表结构：
+-- id (serial, PRIMARY KEY)
+-- content (text)                           -- EMBEDDING列
+-- content_embedding (vector(128), HIDDEN)  -- 自动创建的隐藏向量列
+
+-- 同时使用PREDICT和EMBEDDING
+CREATE TABLE predictions (
+    id SERIAL PRIMARY KEY,
+    text_content TEXT EMBEDDING,
+    value INTEGER PREDICT
+) WITH (
+    jolix_embedding_vector_len = 256,
+    predict_timing = immediate,
+    predict_function = 'ml_predict'
+);
+
+-- 实际表结构：
+-- id (serial, PRIMARY KEY)
+-- text_content (text)                        -- EMBEDDING列
+-- text_content_embedding (vector(256), HIDDEN) -- 自动创建
+-- value (integer)                            -- PREDICT列
+-- value_predict (integer, HIDDEN)            -- 自动创建
+-- value_actual (integer, HIDDEN)             -- 自动创建
+
+-- SELECT * 不返回隐藏列
+SELECT * FROM documents;
+-- 结果列：id, content
+
+-- 显式指定可以查询隐藏列
+SELECT id, content, content_embedding FROM documents;
+-- 结果列：id, content, content_embedding
+
+-- 使用向量相似度查询
+SELECT id, content 
+FROM documents 
+ORDER BY content_embedding <=> '[1,2,3,4,5,6,7,8,9,10]'::vector
+LIMIT 10;
+```
+
+### 10.8 代码修改文件清单
+
+| 文件路径 | 功能说明 |
+|---------|----------|
+| `src/include/parser/kwlist.h` | 添加EMBEDDING关键字定义 |
+| `src/backend/parser/gram.y` | 添加EMBEDDING语法规则和关键字声明 |
+| `src/include/nodes/parsenodes.h` | ColumnDef结构体添加is_embedding字段 |
+| `src/include/catalog/pg_attribute.h` | 添加attembedding字段定义 |
+| `src/include/access/tupdesc.h` | CompactAttribute结构体添加attembedding字段 |
+| `src/backend/access/common/reloptions.c` | 添加jolix_embedding_vector_len表选项定义和解析 |
+| `src/backend/access/common/tupdesc.c` | populate_compact_attribute_internal添加attembedding处理 |
+| `src/backend/parser/parse_utilcmd.c` | transformColumnDefinition添加EMBEDDING列处理逻辑 |
+| `src/backend/commands/tablecmds.c` | BuildDescForRelation添加attembedding属性设置 |
+| `src/backend/nodes/makefuncs.c` | makeColumnDef初始化is_embedding字段 |
+| `src/include/utils/rel.h` | StdRdOptions结构体添加jolix_embedding_vector_len字段，添加RelationGetEmbeddingVectorLen宏 |
+
+### 10.9 与PREDICT列的对比
+
+| 特性 | PREDICT列 | EMBEDDING列 |
+|-----|----------|-------------|
+| 标记字段 | attpredict | attembedding |
+| 自动创建列 | `_predict`, `_actual` | `_embedding` |
+| 自动创建列类型 | 与原列相同 | vector(N) |
+| 表级选项 | predict_timing, predict_function | jolix_embedding_vector_len |
+| 触发器 | 自动创建预测触发器 | 无 |
+| 用途 | 存储预测值和实际值 | 存储嵌入向量 |
+
+## 11. 重新构建和初始化
 
 由于修改了`pg_attribute`系统表结构，需要重新构建项目并初始化数据库：
 
@@ -1374,6 +1642,6 @@ pg_ctl start -D /path/to/data
 
 ---
 
-**文档版本**: 1.3  
-**最后更新**: 2025-03-04  
+**文档版本**: 1.4  
+**最后更新**: 2025-03-30  
 **作者**: PostgreSQL开发团队
