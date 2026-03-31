@@ -93,6 +93,7 @@ typedef struct
 	bool		ispartitioned;	/* true if table is partitioned */
 	PartitionBoundSpec *partbound;	/* transformed FOR VALUES */
 	bool		ofType;			/* true if statement contains OF typename */
+	int			jolixdb_embedding_vector_len; /* embedding vector length from WITH options */
 } CreateStmtContext;
 
 /* State shared by transformCreateSchemaStmtElements and its subroutines */
@@ -251,8 +252,26 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.ispartitioned = stmt->partspec != NULL;
 	cxt.partbound = stmt->partbound;
 	cxt.ofType = (stmt->ofTypename != NULL);
+	cxt.jolixdb_embedding_vector_len = 10;	/* default value */
 
 	Assert(!stmt->ofTypename || !stmt->inhRelations);	/* grammar enforces */
+
+	/* Extract jolixdb_embedding_vector_len from WITH options if specified */
+	if (stmt->options)
+	{
+		ListCell   *option;
+
+		foreach(option, stmt->options)
+		{
+			DefElem    *defel = (DefElem *) lfirst(option);
+
+			if (strcmp(defel->defname, "jolixdb_embedding_vector_len") == 0)
+			{
+				cxt.jolixdb_embedding_vector_len = defGetInt32(defel);
+				break;
+			}
+		}
+	}
 
 	if (stmt->ofTypename)
 		transformOfType(&cxt, stmt->ofTypename);
@@ -1154,6 +1173,66 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		index->indexIncludingParams = NIL;
 
 		cxt->alist = lappend(cxt->alist, index);
+	}
+
+	/*
+	 * If this is an EMBEDDING column, automatically add a companion hidden
+	 * column with "_embedding" suffix to store the embedding vector.
+	 * The column type is vector with length specified by embedding_vector_len.
+	 */
+	if (column->is_embedding)
+	{
+		ColumnDef  *embedding_col;
+		char	   *embedding_colname;
+		TypeName   *vector_type;
+		int			vector_len;
+		A_Const    *typmod_const;
+
+		/* Get jolixdb_embedding_vector_len from relation options */
+		vector_len = cxt->jolixdb_embedding_vector_len;
+
+		/* Create _embedding column name */
+		embedding_colname = psprintf("%s_embedding", column->colname);
+
+		/* Create vector type: vector(vector_len) */
+		vector_type = makeNode(TypeName);
+		vector_type->names = list_make1(makeString("vector"));
+
+		/* Create typmod as A_Const node */
+		typmod_const = makeNode(A_Const);
+		typmod_const->val.ival.type = T_Integer;
+		typmod_const->val.ival.ival = vector_len;
+		typmod_const->location = -1;
+		vector_type->typmods = list_make1(typmod_const);
+		vector_type->typemod = -1;	/* Will be computed during analysis */
+		vector_type->location = -1;
+
+		/* Create the _embedding column definition */
+		embedding_col = makeNode(ColumnDef);
+		embedding_col->colname = embedding_colname;
+		embedding_col->typeName = vector_type;
+		embedding_col->compression = NULL;
+		embedding_col->inhcount = 0;
+		embedding_col->is_local = true;
+		embedding_col->is_not_null = false;
+		embedding_col->is_from_type = false;
+		embedding_col->is_predict = false;
+		embedding_col->is_embedding = false;
+		embedding_col->is_hidden = true;
+		embedding_col->storage = 0;
+		embedding_col->storage_name = NULL;
+		embedding_col->raw_default = NULL;
+		embedding_col->cooked_default = NULL;
+		embedding_col->identity = '\0';
+		embedding_col->identitySequence = NULL;
+		embedding_col->generated = '\0';
+		embedding_col->collClause = NULL;
+		embedding_col->collOid = InvalidOid;
+		embedding_col->constraints = NIL;
+		embedding_col->fdwoptions = NIL;
+		embedding_col->location = -1;
+
+		cxt->columns = lappend(cxt->columns, embedding_col);
 	}
 }
 
@@ -3716,6 +3795,7 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 	cxt.ispartitioned = (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 	cxt.partbound = NULL;
 	cxt.ofType = false;
+	cxt.jolixdb_embedding_vector_len = RelationGetEmbeddingVectorLen(rel, 10);
 
 	/*
 	 * Transform ALTER subcommands that need it (most don't).  These largely

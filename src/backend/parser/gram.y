@@ -592,7 +592,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	DomainConstraint TableConstraint TableLikeClause
 %type <ival>	TableLikeOptionList TableLikeOption
 %type <str>		column_compression opt_column_compression column_storage opt_column_storage
-%type <boolean>	opt_predict
+%type <boolean>	opt_predict opt_embedding
 %type <list>	ColQualList
 %type <node>	ColConstraint ColConstraintElem ConstraintAttr
 %type <ival>	key_match
@@ -719,7 +719,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
-	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENFORCED ENUM_P ERROR_P
+	EACH ELSE EMBEDDING EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENFORCED ENUM_P ERROR_P
 	ESCAPE EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN
 	EXPRESSION EXTENSION EXTERNAL EXTRACT
 
@@ -3821,7 +3821,7 @@ TypedTableElement:
 			| TableConstraint					{ $$ = $1; }
 		;
 
-columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList opt_predict
+columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList opt_predict opt_embedding
 				{
 					ColumnDef *n = makeNode(ColumnDef);
 
@@ -3839,6 +3839,7 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 					n->collOid = InvalidOid;
 					n->fdwoptions = $5;
 					n->is_predict = $7;
+					n->is_embedding = $8;
 					n->is_hidden = false;
 					SplitColQualList($6, &n->constraints, &n->collClause,
 									 yyscanner);
@@ -3859,6 +3860,11 @@ opt_column_compression:
 
 opt_predict:
 			PREDICT									{ $$ = true; }
+			| /*EMPTY*/								{ $$ = false; }
+		;
+
+opt_embedding:
+			EMBEDDING								{ $$ = true; }
 			| /*EMPTY*/								{ $$ = false; }
 		;
 
@@ -17739,6 +17745,7 @@ unreserved_keyword:
 			| DOUBLE_P
 			| DROP
 			| EACH
+			| EMBEDDING
 			| EMPTY_P
 			| ENABLE_P
 			| ENCODING
@@ -18319,6 +18326,7 @@ bare_label_keyword:
 			| DROP
 			| EACH
 			| ELSE
+			| EMBEDDING
 			| EMPTY_P
 			| ENABLE_P
 			| ENCODING

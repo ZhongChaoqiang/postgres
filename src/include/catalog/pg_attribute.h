@@ -137,6 +137,9 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	/* Is PREDICT option specified */
 	bool		attpredict BKI_DEFAULT(f);
 
+	/* Is EMBEDDING option specified */
+	bool		attembedding BKI_DEFAULT(f);
+
 	/* Is dropped (ie, logically invisible) or not */
 	bool		attisdropped BKI_DEFAULT(f);
 
