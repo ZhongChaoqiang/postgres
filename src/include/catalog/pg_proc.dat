@@ -12557,4 +12557,10 @@
   proargtypes => 'oid text', proargnames => '{relid,colname}',
   prosrc => 'is_predict_column' },
 
+# EMBEDDING column support functions
+{ oid => '6502', descr => 'trigger to call embedding function for EMBEDDING columns',
+  proname => 'embedding_trigger', proisstrict => 'f', provolatile => 'v',
+  prorettype => 'trigger', proargtypes => '',
+  prosrc => 'embedding_trigger' },
+
 ]

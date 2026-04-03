@@ -457,6 +457,8 @@ static void validateForeignKeyConstraint(char *conname,
 static void CheckAlterTableIsSafe(Relation rel);
 static void createPredictTrigger(Oid relOid, AttrNumber attnum, const char *colname);
 static void createPredictTriggersForRelation(Relation rel);
+static void createEmbeddingTrigger(Oid relOid, AttrNumber attnum, const char *colname);
+static void createEmbeddingTriggersForRelation(Relation rel);
 static void ATController(AlterTableStmt *parsetree,
 						 Relation rel, List *cmds, bool recurse, LOCKMODE lockmode,
 						 AlterTableUtilityContext *context);
@@ -1366,6 +1368,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * relation is fully created and before closing it.
 	 */
 	createPredictTriggersForRelation(rel);
+
+	/*
+	 * Create triggers for EMBEDDING columns. This must be done after the
+	 * relation is fully created and before closing it.
+	 */
+	createEmbeddingTriggersForRelation(rel);
 
 	/*
 	 * Clean up.  We keep lock on new relation (although it shouldn't be
@@ -7672,6 +7680,14 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	if (colDef->is_predict)
 	{
 		createPredictTrigger(myrelid, newattnum, colDef->colname);
+	}
+
+	/*
+	 * If the newly added column is an EMBEDDING column, create the trigger for it.
+	 */
+	if (colDef->is_embedding)
+	{
+		createEmbeddingTrigger(myrelid, newattnum, colDef->colname);
 	}
 
 	ObjectAddressSubSet(address, RelationRelationId, myrelid, newattnum);
@@ -14096,6 +14112,80 @@ createPredictTriggersForRelation(Relation rel)
 		if (attr->attpredict)
 		{
 			createPredictTrigger(relOid, attnum, NameStr(attr->attname));
+		}
+	}
+}
+
+/*
+ * createEmbeddingTrigger
+ *		Create an internal trigger for an EMBEDDING column.
+ *
+ * This function creates a BEFORE INSERT OR UPDATE trigger that calls
+ * the embedding_function and stores the result in the _embedding column.
+ */
+static void
+createEmbeddingTrigger(Oid relOid, AttrNumber attnum, const char *colname)
+{
+	CreateTrigStmt *trigger;
+	char		trigname[NAMEDATALEN];
+
+	/* Generate a unique trigger name */
+	snprintf(trigname, NAMEDATALEN, "pg_embedding_%s_%u", colname, relOid);
+
+	/* Create trigger node */
+	trigger = makeNode(CreateTrigStmt);
+	trigger->replace = false;
+	trigger->isconstraint = false;
+	trigger->trigname = pstrdup(trigname);
+	trigger->relation = NULL;	/* Will be set by CreateTrigger */
+
+	/* This is a BEFORE INSERT OR UPDATE trigger */
+	trigger->funcname = SystemFuncName("embedding_trigger");
+	trigger->args = NIL;  /* No arguments needed - trigger will detect EMBEDDING column */
+	trigger->row = true;
+	trigger->timing = TRIGGER_TYPE_BEFORE;
+	trigger->events = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE;
+	trigger->columns = NIL;
+	trigger->whenClause = NULL;
+	trigger->transitionRels = NIL;
+	trigger->deferrable = false;
+	trigger->initdeferred = false;
+	trigger->constrrel = NULL;
+
+	/* Create the trigger */
+	CreateTrigger(trigger, NULL, relOid, InvalidOid,
+								InvalidOid, InvalidOid, InvalidOid,
+								InvalidOid, NULL, true, false);
+
+	/* Make changes visible */
+	CommandCounterIncrement();
+}
+
+/*
+ * createEmbeddingTriggersForRelation
+ *		Create triggers for all EMBEDDING columns in a relation.
+ */
+static void
+createEmbeddingTriggersForRelation(Relation rel)
+{
+	TupleDesc	tupdesc;
+	int			attnum;
+	Oid			relOid = RelationGetRelid(rel);
+
+	tupdesc = RelationGetDescr(rel);
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+		/* Skip dropped columns */
+		if (attr->attisdropped)
+			continue;
+
+		/* Check if this is an EMBEDDING column */
+		if (attr->attembedding)
+		{
+			createEmbeddingTrigger(relOid, attnum, NameStr(attr->attname));
 		}
 	}
 }

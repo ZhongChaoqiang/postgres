@@ -1076,6 +1076,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		predict_col->is_not_null = false;
 		predict_col->is_from_type = false;
 		predict_col->is_predict = false;
+		predict_col->is_embedding = false;
 		predict_col->is_hidden = true;
 		predict_col->storage = 0;
 		predict_col->storage_name = NULL;
@@ -1104,6 +1105,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		actual_col->is_not_null = false;
 		actual_col->is_from_type = false;
 		actual_col->is_predict = false;
+		actual_col->is_embedding = false;
 		actual_col->is_hidden = true;
 		actual_col->storage = 0;
 		actual_col->storage_name = NULL;

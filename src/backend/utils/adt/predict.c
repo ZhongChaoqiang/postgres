@@ -351,7 +351,12 @@ get_embedding_function_oid(Oid relid)
 
 	funcname = get_embedding_function(relid);
 	if (funcname == NULL)
+	{
+		elog(LOG, "embedding_trigger: no embedding_function set for relid=%u", relid);
 		return InvalidOid;
+	}
+
+	elog(LOG, "embedding_trigger: looking for function '%s'", funcname);
 
 	if (strchr(funcname, '.') != NULL)
 	{
@@ -366,14 +371,20 @@ get_embedding_function_oid(Oid relid)
 
 	if (clist != NULL)
 	{
+		elog(LOG, "embedding_trigger: found %d function candidates", clist->next ? 2 : 1);
 		for (; clist != NULL; clist = clist->next)
 		{
+			elog(LOG, "embedding_trigger: candidate oid=%u, nargs=%d", clist->oid, clist->nargs);
 			if (clist->nargs == 1)
 			{
 				funcoid = clist->oid;
 				break;
 			}
 		}
+	}
+	else
+	{
+		elog(LOG, "embedding_trigger: no function candidates found");
 	}
 
 	if (!OidIsValid(funcoid))
@@ -639,6 +650,109 @@ predict_trigger(PG_FUNCTION_ARGS)
 			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
 												 modify_attnums, modify_values, modify_nulls);
 			newtuple = rettuple;
+		}
+	}
+
+	return PointerGetDatum(newtuple);
+}
+
+/*
+ * embedding_trigger - trigger function for EMBEDDING columns
+ *
+ * This is a BEFORE INSERT/UPDATE trigger that handles EMBEDDING columns:
+ * - Calls embedding_function and saves result to _embedding column
+ */
+PG_FUNCTION_INFO_V1(embedding_trigger);
+
+Datum
+embedding_trigger(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	TupleDesc		tupdesc;
+	HeapTuple		rettuple;
+	HeapTuple		newtuple;
+	Relation		rel;
+	int				attnum;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"embedding_trigger\" was not called by trigger manager")));
+
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"embedding_trigger\" must be called as BEFORE trigger")));
+
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"embedding_trigger\" must be a ROW-level trigger")));
+
+	if (!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event) && !TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"embedding_trigger\" must be called for INSERT or UPDATE")));
+
+	rel = trigdata->tg_relation;
+	tupdesc = RelationGetDescr(rel);
+	newtuple = trigdata->tg_trigtuple;
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+		char	   *embedding_colname;
+		AttrNumber	embedding_attnum;
+
+		if (attr->attisdropped)
+			continue;
+
+		if (!attr->attembedding)
+			continue;
+
+		/* This is an EMBEDDING column */
+
+		/* Find _embedding column */
+		embedding_colname = psprintf("%s_embedding", NameStr(attr->attname));
+		embedding_attnum = find_column_by_name(tupdesc, embedding_colname);
+		pfree(embedding_colname);
+
+		if (embedding_attnum == InvalidAttrNumber)
+			continue;
+
+		/* Get embedding function OID */
+		{
+			Oid embedding_func_oid = get_embedding_function_oid(rel->rd_id);
+
+			if (OidIsValid(embedding_func_oid))
+			{
+				FmgrInfo embedding_func;
+				Datum row_datum;
+				Datum embedding_datum;
+				
+				fmgr_info(embedding_func_oid, &embedding_func);
+				
+				/* Convert the entire row to a datum */
+				row_datum = heap_copy_tuple_as_datum(newtuple, tupdesc);
+				
+				/* Call embedding function */
+				embedding_datum = FunctionCall1(&embedding_func, row_datum);
+				
+				/* Set _embedding column */
+				{
+					int			modify_attnums[1];
+					Datum		modify_values[1];
+					bool		modify_nulls[1];
+
+					modify_attnums[0] = embedding_attnum;
+					modify_values[0] = embedding_datum;
+					modify_nulls[0] = false;
+
+					rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+														 modify_attnums, modify_values, modify_nulls);
+					newtuple = rettuple;
+				}
+			}
 		}
 	}
 

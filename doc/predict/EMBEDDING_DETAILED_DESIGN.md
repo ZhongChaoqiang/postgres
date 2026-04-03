@@ -25,6 +25,8 @@ EMBEDDING列属性用于标记需要存储嵌入向量的列。当定义一个EM
 | jolixdb_embedding_vector_len选项 | ✅ 已完成 | 表级向量长度选项 |
 | embedding_function选项 | ✅ 已完成 | 表级嵌入函数选项 |
 | get_embedding_function_oid | ✅ 已完成 | 获取嵌入函数OID |
+| embedding_trigger触发器 | ✅ 已完成 | 自动调用嵌入函数生成向量 |
+| 自动创建触发器 | ✅ 已完成 | 建表时自动创建embedding触发器 |
 
 ## 2. 设计原理
 
@@ -278,9 +280,124 @@ if (column->is_embedding)
 }
 ```
 
-## 7. 使用示例
+## 7. 自动触发器设计
 
-### 7.1 基本使用
+### 7.1 触发器函数
+
+**文件**: `src/backend/utils/adt/predict.c`
+
+**函数**: `embedding_trigger()`
+
+```c
+/*
+ * embedding_trigger - trigger function for EMBEDDING columns
+ *
+ * This is a BEFORE INSERT/UPDATE trigger that handles EMBEDDING columns:
+ * - Calls embedding_function and saves result to _embedding column
+ */
+PG_FUNCTION_INFO_V1(embedding_trigger);
+
+Datum
+embedding_trigger(PG_FUNCTION_ARGS)
+{
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+    TupleDesc    tupdesc;
+    HeapTuple    rettuple;
+    HeapTuple    newtuple;
+    Relation     rel;
+    int          attnum;
+
+    // 验证触发器调用环境
+    // ...
+
+    rel = trigdata->tg_relation;
+    tupdesc = RelationGetDescr(rel);
+    newtuple = trigdata->tg_trigtuple;
+
+    for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+        if (attr->attisdropped)
+            continue;
+
+        if (!attr->attembedding)
+            continue;
+
+        /* This is an EMBEDDING column */
+
+        /* Find _embedding column */
+        embedding_colname = psprintf("%s_embedding", NameStr(attr->attname));
+        embedding_attnum = find_column_by_name(tupdesc, embedding_colname);
+
+        /* Get embedding function OID and call it */
+        embedding_func_oid = get_embedding_function_oid(rel->rd_id);
+        if (OidIsValid(embedding_func_oid))
+        {
+            // Call embedding function with row data
+            row_datum = heap_copy_tuple_as_datum(newtuple, tupdesc);
+            embedding_datum = FunctionCall1(&embedding_func, row_datum);
+
+            // Set _embedding column value
+            rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, ...);
+            newtuple = rettuple;
+        }
+    }
+
+    return PointerGetDatum(newtuple);
+}
+```
+
+### 7.2 触发器创建
+
+**文件**: `src/backend/commands/tablecmds.c`
+
+**函数**: `createEmbeddingTrigger()`
+
+```c
+/*
+ * createEmbeddingTrigger
+ *      Create an internal trigger for an EMBEDDING column.
+ */
+static void
+createEmbeddingTrigger(Oid relOid, AttrNumber attnum, const char *colname)
+{
+    CreateTrigStmt *trigger;
+    char        trigname[NAMEDATALEN];
+
+    /* Generate a unique trigger name */
+    snprintf(trigname, NAMEDATALEN, "pg_embedding_%s_%u", colname, relOid);
+
+    /* Create trigger node */
+    trigger = makeNode(CreateTrigStmt);
+    trigger->trigname = pstrdup(trigname);
+    trigger->funcname = SystemFuncName("embedding_trigger");
+    trigger->row = true;
+    trigger->timing = TRIGGER_TYPE_BEFORE;
+    trigger->events = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE;
+
+    /* Create the trigger */
+    CreateTrigger(trigger, NULL, relOid, InvalidOid, ...);
+}
+```
+
+### 7.3 触发器调用流程
+
+```mermaid
+graph TB
+    A[INSERT/UPDATE语句] --> B[BEFORE触发器]
+    B --> C[embedding_trigger]
+    C --> D[查找EMBEDDING列]
+    D --> E[获取embedding_function]
+    E --> F[调用函数生成向量]
+    F --> G[设置_embedding列值]
+    G --> H[返回修改后的元组]
+    H --> I[完成INSERT/UPDATE]
+```
+
+## 8. 使用示例
+
+### 8.1 基本使用
 
 ```sql
 -- 创建带EMBEDDING列的表，使用默认向量长度(10)
@@ -295,7 +412,7 @@ CREATE TABLE documents (
 -- content_embedding (vector(10), HIDDEN) -- 自动创建的隐藏向量列
 ```
 
-### 7.2 指定向量长度
+### 8.2 指定向量长度
 
 ```sql
 -- 创建带EMBEDDING列的表，指定向量长度
@@ -312,47 +429,7 @@ CREATE TABLE documents (
 -- content_embedding (vector(128), HIDDEN)  -- 自动创建的隐藏向量列
 ```
 
-### 7.3 同时使用PREDICT和EMBEDDING
-
-```sql
-CREATE TABLE predictions (
-    id SERIAL PRIMARY KEY,
-    text_content TEXT EMBEDDING,
-    value INTEGER PREDICT
-) WITH (
-    jolixdb_embedding_vector_len = 256,
-    predict_timing = immediate,
-    predict_function = 'ml_predict'
-);
-
--- 实际表结构：
--- id (serial, PRIMARY KEY)
--- text_content (text)                        -- EMBEDDING列
--- text_content_embedding (vector(256), HIDDEN) -- 自动创建
--- value (integer)                            -- PREDICT列
--- value_predict (integer, HIDDEN)            -- 自动创建
--- value_actual (integer, HIDDEN)             -- 自动创建
-```
-
-### 7.4 查询隐藏列
-
-```sql
--- SELECT * 不返回隐藏列
-SELECT * FROM documents;
--- 结果列：id, content
-
--- 显式指定可以查询隐藏列
-SELECT id, content, content_embedding FROM documents;
--- 结果列：id, content, content_embedding
-
--- 使用向量相似度查询
-SELECT id, content 
-FROM documents 
-ORDER BY content_embedding <=> '[1,2,3,4,5,6,7,8,9,10]'::vector
-LIMIT 10;
-```
-
-### 7.5 使用embedding_function
+### 8.3 使用embedding_function自动生成向量
 
 ```sql
 -- 确保已安装 pgvector 扩展
@@ -379,15 +456,65 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- 创建带嵌入函数的表
 CREATE TABLE documents (
     id int PRIMARY KEY,
-    title text,
     content text EMBEDDING
 ) WITH (
     jolixdb_embedding_vector_len = 10,
     embedding_function = 'simple_embedding_func'
 );
+
+-- 插入数据时自动调用embedding_function生成向量
+INSERT INTO documents (id, content) VALUES (1, 'Hello World');
+
+-- 查询自动生成的向量
+SELECT id, content, content_embedding FROM documents;
+-- 结果：
+-- id | content     | content_embedding
+-- ---+-------------+----------------------------------
+-- 1  | Hello World | [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0]
 ```
 
-## 8. 代码修改文件清单
+### 8.4 同时使用PREDICT和EMBEDDING
+
+```sql
+CREATE TABLE predictions (
+    id SERIAL PRIMARY KEY,
+    text_content TEXT EMBEDDING,
+    value INTEGER PREDICT
+) WITH (
+    jolixdb_embedding_vector_len = 256,
+    predict_timing = immediate,
+    predict_function = 'ml_predict',
+    embedding_function = 'text_embedding_func'
+);
+
+-- 实际表结构：
+-- id (serial, PRIMARY KEY)
+-- text_content (text)                        -- EMBEDDING列
+-- text_content_embedding (vector(256), HIDDEN) -- 自动创建
+-- value (integer)                            -- PREDICT列
+-- value_predict (integer, HIDDEN)            -- 自动创建
+-- value_actual (integer, HIDDEN)             -- 自动创建
+```
+
+### 8.5 查询隐藏列
+
+```sql
+-- SELECT * 不返回隐藏列
+SELECT * FROM documents;
+-- 结果列：id, content
+
+-- 显式指定可以查询隐藏列
+SELECT id, content, content_embedding FROM documents;
+-- 结果列：id, content, content_embedding
+
+-- 使用向量相似度查询
+SELECT id, content 
+FROM documents 
+ORDER BY content_embedding <=> '[1,2,3,4,5,6,7,8,9,10]'::vector
+LIMIT 10;
+```
+
+## 9. 代码修改文件清单
 
 | 文件路径 | 功能说明 |
 |---------|----------|
@@ -395,17 +522,19 @@ CREATE TABLE documents (
 | `src/backend/parser/gram.y` | 添加EMBEDDING语法规则和关键字声明 |
 | `src/include/nodes/parsenodes.h` | ColumnDef结构体添加is_embedding字段 |
 | `src/include/catalog/pg_attribute.h` | 添加attembedding字段定义 |
+| `src/include/catalog/pg_proc.dat` | 注册embedding_trigger系统函数 |
 | `src/include/access/tupdesc.h` | CompactAttribute结构体添加attembedding字段 |
 | `src/backend/access/common/reloptions.c` | 添加jolixdb_embedding_vector_len和embedding_function表选项定义和解析 |
 | `src/backend/access/common/tupdesc.c` | populate_compact_attribute_internal添加attembedding处理 |
 | `src/backend/parser/parse_utilcmd.c` | transformColumnDefinition添加EMBEDDING列处理逻辑 |
-| `src/backend/commands/tablecmds.c` | BuildDescForRelation添加attembedding属性设置 |
+| `src/backend/commands/tablecmds.c` | BuildDescForRelation添加attembedding属性设置，添加createEmbeddingTrigger和createEmbeddingTriggersForRelation函数 |
+| `src/backend/catalog/heap.c` | AddNewAttributeTuples添加attembedding字段存储 |
 | `src/backend/nodes/makefuncs.c` | makeColumnDef初始化is_embedding字段 |
 | `src/include/utils/rel.h` | StdRdOptions结构体添加jolixdb_embedding_vector_len和embedding_function字段，添加RelationGetEmbeddingVectorLen宏 |
-| `src/backend/utils/adt/predict.c` | 添加get_embedding_function和get_embedding_function_oid函数 |
+| `src/backend/utils/adt/predict.c` | 添加get_embedding_function、get_embedding_function_oid和embedding_trigger函数 |
 | `src/include/utils/predict.h` | 添加get_embedding_function_oid函数声明 |
 
-## 9. 与PREDICT列的对比
+## 10. 与PREDICT列的对比
 
 | 特性 | PREDICT列 | EMBEDDING列 |
 |-----|----------|-------------|
@@ -413,10 +542,10 @@ CREATE TABLE documents (
 | 自动创建列 | `_predict`, `_actual` | `_embedding` |
 | 自动创建列类型 | 与原列相同 | vector(N) |
 | 表级选项 | predict_timing, predict_function | jolixdb_embedding_vector_len, embedding_function |
-| 触发器 | 自动创建预测触发器 | 无 |
+| 触发器 | 自动创建预测触发器 | 自动创建嵌入触发器 |
 | 用途 | 存储预测值和实际值 | 存储嵌入向量 |
 
-## 10. 函数签名要求
+## 11. 函数签名要求
 
 | 属性 | 要求 |
 |-----|------|
@@ -425,11 +554,11 @@ CREATE TABLE documents (
 | 向量维度 | 必须与 `jolixdb_embedding_vector_len` 一致 |
 | 推荐属性 | `IMMUTABLE`（如果结果确定） |
 
-## 11. 重新构建和初始化
+## 12. 重新构建和初始化
 
 由于修改了`pg_attribute`系统表结构，需要重新构建项目并初始化数据库：
 
-### 11.1 重新构建
+### 12.1 重新构建
 
 ```bash
 cd /path/to/postgres/build
@@ -438,7 +567,7 @@ make -j4
 make install
 ```
 
-### 11.2 重新初始化数据库
+### 12.2 重新初始化数据库
 
 ```bash
 # 停止数据库服务
@@ -456,6 +585,6 @@ pg_ctl start -D /path/to/data
 
 ---
 
-**文档版本**: 1.0  
+**文档版本**: 1.2  
 **最后更新**: 2025-04-03  
 **作者**: PostgreSQL开发团队
