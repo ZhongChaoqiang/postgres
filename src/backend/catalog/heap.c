@@ -767,6 +767,7 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 	slot[slotCount]->tts_values[Anum_pg_attribute_attidentity - 1] = CharGetDatum(attrs->attidentity);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attgenerated - 1] = CharGetDatum(attrs->attgenerated);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attpredict - 1] = BoolGetDatum(attrs->attpredict);
+	slot[slotCount]->tts_values[Anum_pg_attribute_attembedding - 1] = BoolGetDatum(attrs->attembedding);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attisdropped - 1] = BoolGetDatum(attrs->attisdropped);
 	slot[slotCount]->tts_values[Anum_pg_attribute_atthidden - 1] = BoolGetDatum(attrs->atthidden);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attislocal - 1] = BoolGetDatum(attrs->attislocal);
