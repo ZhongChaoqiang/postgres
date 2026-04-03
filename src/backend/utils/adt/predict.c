@@ -278,6 +278,150 @@ get_predict_function_oid(Oid relid)
 }
 
 /*
+ * get_embedding_function - Get the embedding function name from reloptions
+ *
+ * Returns the function name if set, or NULL if not set.
+ */
+static char *
+get_embedding_function(Oid relid)
+{
+	HeapTuple	tuple;
+	Datum		reloptions;
+	bool		isnull;
+	char	   *embedding_func = NULL;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
+		   &isnull);
+
+	if (!isnull)
+	{
+		ArrayType  *array = DatumGetArrayTypeP(reloptions);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nitems;
+		int			i;
+		const char *prefix = "embedding_function=";
+		const size_t prefix_len = strlen(prefix);
+
+		deconstruct_array(array, TEXTOID, -1, false, 'i', &elems, &nulls, &nitems);
+
+		for (i = 0; i < nitems; i++)
+		{
+			if (!nulls[i])
+			{
+				char	   *text_str = TextDatumGetCString(elems[i]);
+				int			text_len = strlen(text_str);
+
+				if (text_len > prefix_len && strncmp(text_str, prefix, prefix_len) == 0)
+				{
+					embedding_func = pstrdup(text_str + prefix_len);
+					pfree(text_str);
+					break;
+				}
+				pfree(text_str);
+			}
+		}
+
+		pfree(elems);
+		pfree(nulls);
+	}
+
+	ReleaseSysCache(tuple);
+	
+	return embedding_func;
+}
+
+/*
+ * get_embedding_function_oid - Get the OID of the embedding function
+ *
+ * Returns the function OID if set, or InvalidOid if not set.
+ */
+Oid
+get_embedding_function_oid(Oid relid)
+{
+	char	   *funcname;
+	Oid			funcoid = InvalidOid;
+	List	   *namelist;
+	FuncCandidateList clist;
+	int			fgc_flags;
+
+	funcname = get_embedding_function(relid);
+	if (funcname == NULL)
+		return InvalidOid;
+
+	if (strchr(funcname, '.') != NULL)
+	{
+		namelist = stringToQualifiedNameList(funcname, NULL);
+	}
+	else
+	{
+		namelist = list_make1(makeString(funcname));
+	}
+
+	clist = FuncnameGetCandidates(namelist, 1, NIL, false, false, false, true, &fgc_flags);
+
+	if (clist != NULL)
+	{
+		for (; clist != NULL; clist = clist->next)
+		{
+			if (clist->nargs == 1)
+			{
+				funcoid = clist->oid;
+				break;
+			}
+		}
+	}
+
+	if (!OidIsValid(funcoid))
+	{
+		char	   *query;
+		Datum		result;
+		bool		isnull;
+		MemoryContext oldcontext;
+		MemoryContext querycontext;
+		int			ret;
+
+		querycontext = AllocSetContextCreate(CurrentMemoryContext,
+											 "embedding_func_lookup",
+											 ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(querycontext);
+
+		query = psprintf(
+			"SELECT oid FROM pg_proc "
+			"WHERE proname = '%s' "
+			"AND pronargs = 1 "
+			"ORDER BY oid LIMIT 1",
+			funcname);
+
+		ret = SPI_connect();
+		
+		if (ret == SPI_OK_CONNECT)
+		{
+			ret = SPI_execute(query, true, 1);
+			
+			if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			{
+				result = SPI_getbinval(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc, 1, &isnull);
+				if (!isnull)
+					funcoid = DatumGetObjectId(result);
+			}
+			SPI_finish();
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(querycontext);
+	}
+
+	pfree(funcname);
+	return funcoid;
+}
+
+/*
  * find_column_by_name - find column number by name (1-based)
  * Returns InvalidAttrNumber if not found
  */
