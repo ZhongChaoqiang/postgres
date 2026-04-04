@@ -344,6 +344,13 @@ typedef enum StdRdOptPredictTiming
 	STDRD_OPTION_PREDICT_TIMING_IMMEDIATE,
 } StdRdOptPredictTiming;
 
+/* StdRdOptions->jolixdb_vector_index_type values */
+typedef enum StdRdOptVectorIndexType
+{
+	STDRD_OPTION_VECTOR_INDEX_TYPE_IVFFLAT = 0,
+	STDRD_OPTION_VECTOR_INDEX_TYPE_HNSW,
+} StdRdOptVectorIndexType;
+
 typedef struct StdRdOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
@@ -365,6 +372,7 @@ typedef struct StdRdOptions
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
 	int			jolixdb_embedding_vector_len;	/* length of embedding vector for prediction */
+	StdRdOptVectorIndexType jolixdb_vector_index_type; /* vector index type for embedding columns */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -423,6 +431,10 @@ typedef struct StdRdOptions
 #define RelationGetEmbeddingVectorLen(relation, defaultlen) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_embedding_vector_len : (defaultlen))
+
+#define RelationGetVectorIndexType(relation, defaulttype) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_vector_index_type : (defaulttype))
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption
