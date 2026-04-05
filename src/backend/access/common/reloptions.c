@@ -383,7 +383,7 @@ static relopt_int intRelOpts[] =
 	},
 	{
 		{
-			"jolixdb_embedding_vector_len",
+			"vector_len",
 			"Length of embedding vector for prediction columns.",
 			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
@@ -576,7 +576,7 @@ static relopt_enum enumRelOpts[] =
 	},
 	{
 		{
-			"jolixdb_vector_index_type",
+			"vector_index",
 			"Vector index type for embedding columns",
 			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
@@ -587,7 +587,7 @@ static relopt_enum enumRelOpts[] =
 	},
 	{
 		{
-			"jolixdb_vector_distance_type",
+			"vector_distance",
 			"Vector distance type for embedding columns",
 			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
@@ -2015,12 +2015,12 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, vacuum_truncate), offsetof(StdRdOptions, vacuum_truncate_set)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
 		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
-		{"jolixdb_embedding_vector_len", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, jolixdb_embedding_vector_len)},
-		{"jolixdb_vector_index_type", RELOPT_TYPE_ENUM,
-		offsetof(StdRdOptions, jolixdb_vector_index_type)},
-		{"jolixdb_vector_distance_type", RELOPT_TYPE_ENUM,
-		offsetof(StdRdOptions, jolixdb_vector_distance_type)}
+		{"vector_len", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, vector_len)},
+		{"vector_index", RELOPT_TYPE_ENUM,
+		offsetof(StdRdOptions, vector_index)},
+		{"vector_distance", RELOPT_TYPE_ENUM,
+		offsetof(StdRdOptions, vector_distance)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

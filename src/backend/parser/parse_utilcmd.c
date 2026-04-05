@@ -93,7 +93,7 @@ typedef struct
 	bool		ispartitioned;	/* true if table is partitioned */
 	PartitionBoundSpec *partbound;	/* transformed FOR VALUES */
 	bool		ofType;			/* true if statement contains OF typename */
-	int			jolixdb_embedding_vector_len; /* embedding vector length from WITH options */
+	int			vector_len; /* embedding vector length from WITH options */
 } CreateStmtContext;
 
 /* State shared by transformCreateSchemaStmtElements and its subroutines */
@@ -252,11 +252,11 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.ispartitioned = stmt->partspec != NULL;
 	cxt.partbound = stmt->partbound;
 	cxt.ofType = (stmt->ofTypename != NULL);
-	cxt.jolixdb_embedding_vector_len = 10;	/* default value */
+	cxt.vector_len = 10;	/* default value */
 
 	Assert(!stmt->ofTypename || !stmt->inhRelations);	/* grammar enforces */
 
-	/* Extract jolixdb_embedding_vector_len from WITH options if specified */
+	/* Extract vector_len from WITH options if specified */
 	if (stmt->options)
 	{
 		ListCell   *option;
@@ -265,9 +265,9 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 		{
 			DefElem    *defel = (DefElem *) lfirst(option);
 
-			if (strcmp(defel->defname, "jolixdb_embedding_vector_len") == 0)
+			if (strcmp(defel->defname, "vector_len") == 0)
 			{
-				cxt.jolixdb_embedding_vector_len = defGetInt32(defel);
+				cxt.vector_len = defGetInt32(defel);
 				break;
 			}
 		}
@@ -1190,8 +1190,8 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		int			vector_len;
 		A_Const    *typmod_const;
 
-		/* Get jolixdb_embedding_vector_len from relation options */
-		vector_len = cxt->jolixdb_embedding_vector_len;
+		/* Get vector_len from relation options */
+		vector_len = cxt->vector_len;
 
 		/* Create _embedding column name */
 		embedding_colname = psprintf("%s_embedding", column->colname);
@@ -3797,7 +3797,7 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 	cxt.ispartitioned = (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 	cxt.partbound = NULL;
 	cxt.ofType = false;
-	cxt.jolixdb_embedding_vector_len = RelationGetEmbeddingVectorLen(rel, 10);
+	cxt.vector_len = RelationGetEmbeddingVectorLen(rel, 10);
 
 	/*
 	 * Transform ALTER subcommands that need it (most don't).  These largely

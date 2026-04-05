@@ -24,7 +24,7 @@ CREATE TABLE documents (
     id int PRIMARY KEY,
     content text EMBEDDING
 ) WITH (
-    jolixdb_embedding_vector_len = 10,
+    vector_len = 10,
     embedding_function = 'my_embedding'
 );
 

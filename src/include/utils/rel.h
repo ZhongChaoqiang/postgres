@@ -344,14 +344,14 @@ typedef enum StdRdOptPredictTiming
 	STDRD_OPTION_PREDICT_TIMING_IMMEDIATE,
 } StdRdOptPredictTiming;
 
-/* StdRdOptions->jolixdb_vector_index_type values */
+/* StdRdOptions->vector_index values */
 typedef enum StdRdOptVectorIndexType
 {
 	STDRD_OPTION_VECTOR_INDEX_TYPE_IVFFLAT = 0,
 	STDRD_OPTION_VECTOR_INDEX_TYPE_HNSW,
 } StdRdOptVectorIndexType;
 
-/* StdRdOptions->jolixdb_vector_distance_type values */
+/* StdRdOptions->vector_distance values */
 typedef enum StdRdOptVectorDistanceType
 {
 	STDRD_OPTION_VECTOR_DISTANCE_TYPE_L2 = 0,
@@ -379,9 +379,9 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
-	int			jolixdb_embedding_vector_len;	/* length of embedding vector for prediction */
-	StdRdOptVectorIndexType jolixdb_vector_index_type; /* vector index type for embedding columns */
-	StdRdOptVectorDistanceType jolixdb_vector_distance_type; /* vector distance type for embedding columns */
+	int			vector_len;	/* length of embedding vector for prediction */
+	StdRdOptVectorIndexType vector_index; /* vector index type for embedding columns */
+	StdRdOptVectorDistanceType vector_distance; /* vector distance type for embedding columns */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -439,15 +439,15 @@ typedef struct StdRdOptions
 
 #define RelationGetEmbeddingVectorLen(relation, defaultlen) \
 	((relation)->rd_options ? \
-	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_embedding_vector_len : (defaultlen))
+	 ((StdRdOptions *) (relation)->rd_options)->vector_len : (defaultlen))
 
 #define RelationGetVectorIndexType(relation, defaulttype) \
 	((relation)->rd_options ? \
-	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_vector_index_type : (defaulttype))
+	 ((StdRdOptions *) (relation)->rd_options)->vector_index : (defaulttype))
 
 #define RelationGetVectorDistanceType(relation, defaulttype) \
 	((relation)->rd_options ? \
-	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_vector_distance_type : (defaulttype))
+	 ((StdRdOptions *) (relation)->rd_options)->vector_distance : (defaulttype))
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption
