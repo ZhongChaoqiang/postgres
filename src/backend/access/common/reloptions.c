@@ -532,6 +532,15 @@ static relopt_enum_elt_def StdRdOptVectorIndexTypeValues[] =
 	{(const char *) NULL}		/* list terminator */
 };
 
+/* values from StdRdOptVectorDistanceType */
+static relopt_enum_elt_def StdRdOptVectorDistanceTypeValues[] =
+{
+	{"vector_l2_ops", STDRD_OPTION_VECTOR_DISTANCE_TYPE_L2},
+	{"vector_ip_ops", STDRD_OPTION_VECTOR_DISTANCE_TYPE_IP},
+	{"vector_cosine_ops", STDRD_OPTION_VECTOR_DISTANCE_TYPE_COSINE},
+	{(const char *) NULL}		/* list terminator */
+};
+
 /* values from GistOptBufferingMode */
 static relopt_enum_elt_def gistBufferingOptValues[] =
 {
@@ -584,6 +593,17 @@ static relopt_enum enumRelOpts[] =
 		StdRdOptVectorIndexTypeValues,
 		STDRD_OPTION_VECTOR_INDEX_TYPE_IVFFLAT,
 		gettext_noop("Valid values are \"ivfflat\" and \"hnsw\".")
+	},
+	{
+		{
+			"jolixdb_vector_distance_type",
+			"Vector distance type for embedding columns",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		StdRdOptVectorDistanceTypeValues,
+		STDRD_OPTION_VECTOR_DISTANCE_TYPE_L2,
+		gettext_noop("Valid values are \"vector_l2_ops\", \"vector_ip_ops\", and \"vector_cosine_ops\".")
 	},
 	{
 		{
@@ -2009,7 +2029,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"jolixdb_embedding_vector_len", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, jolixdb_embedding_vector_len)},
 		{"jolixdb_vector_index_type", RELOPT_TYPE_ENUM,
-		offsetof(StdRdOptions, jolixdb_vector_index_type)}
+		offsetof(StdRdOptions, jolixdb_vector_index_type)},
+		{"jolixdb_vector_distance_type", RELOPT_TYPE_ENUM,
+		offsetof(StdRdOptions, jolixdb_vector_distance_type)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,
