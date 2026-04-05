@@ -351,6 +351,14 @@ typedef enum StdRdOptVectorIndexType
 	STDRD_OPTION_VECTOR_INDEX_TYPE_HNSW,
 } StdRdOptVectorIndexType;
 
+/* StdRdOptions->jolixdb_vector_distance_type values */
+typedef enum StdRdOptVectorDistanceType
+{
+	STDRD_OPTION_VECTOR_DISTANCE_TYPE_L2 = 0,
+	STDRD_OPTION_VECTOR_DISTANCE_TYPE_IP,
+	STDRD_OPTION_VECTOR_DISTANCE_TYPE_COSINE,
+} StdRdOptVectorDistanceType;
+
 typedef struct StdRdOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
@@ -373,6 +381,7 @@ typedef struct StdRdOptions
 	double		vacuum_max_eager_freeze_failure_rate;
 	int			jolixdb_embedding_vector_len;	/* length of embedding vector for prediction */
 	StdRdOptVectorIndexType jolixdb_vector_index_type; /* vector index type for embedding columns */
+	StdRdOptVectorDistanceType jolixdb_vector_distance_type; /* vector distance type for embedding columns */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -435,6 +444,10 @@ typedef struct StdRdOptions
 #define RelationGetVectorIndexType(relation, defaulttype) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_vector_index_type : (defaulttype))
+
+#define RelationGetVectorDistanceType(relation, defaulttype) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->jolixdb_vector_distance_type : (defaulttype))
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption
