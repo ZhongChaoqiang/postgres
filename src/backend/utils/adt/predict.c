@@ -66,7 +66,7 @@ is_predict_column(PG_FUNCTION_ARGS)
 	tupdesc = RelationGetDescr(rel);
 
 	/* Find attribute number */
-	attnum = attnameAttNum(tupdesc, text_to_cstring(colname), false);
+	attnum = attnameAttNum(rel, text_to_cstring(colname), false);
 
 	if (attnum == InvalidAttrNumber)
 	{

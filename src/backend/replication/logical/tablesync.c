@@ -1824,3 +1824,14 @@ UpdateTwoPhaseState(Oid suboid, char new_state)
 	heap_freetuple(tup);
 	table_close(rel, RowExclusiveLock);
 }
+
+/*
+ * TableSyncWorkerMain - Main function for table sync worker
+ *
+ * Stub function for compatibility
+ */
+void
+TableSyncWorkerMain(Datum main_arg)
+{
+	elog(ERROR, "TableSyncWorkerMain is not implemented in this version");
+}
