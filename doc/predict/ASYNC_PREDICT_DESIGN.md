@@ -160,6 +160,14 @@ void async_predict_worker_main(Datum main_arg)
 
 ### 3.5 表扫描和处理逻辑
 
+**重要说明**：异步预测工作进程在处理数据时，会将预测值同时设置到两个列：
+1. **result_predict列**：存储预测结果，用于审计和对比
+2. **result列**：存储预测结果，供用户查询使用
+
+这种设计有两个重要目的：
+- **避免重复预测**：设置result列后，下次扫描时会跳过该行（因为result列不再是NULL）
+- **提供查询结果**：用户查询result列时可以直接获得预测值
+
 ```c
 static void
 async_predict_process_tables(int worker_slot)
@@ -226,16 +234,29 @@ async_predict_process_table(Form_pg_predict_table pt)
         Datum       predict_result;
         bool        isnull;
         HeapTuple   newtuple;
+        int         modify_attnums[2];
+        Datum       modify_values[2];
+        bool        modify_nulls[2];
         
         /* 调用预测函数 */
         predict_result = OidFunctionCall1(pt->pt_funcoid,
                                           heap_getattr(tuple, pt->pt_attnum,
                                                        tupdesc, &isnull));
         
-        /* 更新 _predict 列 */
-        newtuple = heap_modify_tuple_by_cols(tuple, tupdesc, 1,
-                                             &pt->pt_result_attnum,
-                                             &predict_result, &isnull);
+        /* 设置 result_predict 列 */
+        modify_attnums[0] = pt->pt_result_attnum;
+        modify_values[0] = predict_result;
+        modify_nulls[0] = false;
+        
+        /* 设置 result 列，避免重复预测并提供查询结果 */
+        modify_attnums[1] = pt->pt_attnum;
+        modify_values[1] = predict_result;
+        modify_nulls[1] = false;
+        
+        /* 更新两个列 */
+        newtuple = heap_modify_tuple_by_cols(tuple, tupdesc, 2,
+                                             modify_attnums,
+                                             modify_values, modify_nulls);
         simple_heap_update(rel, &tuple->t_self, newtuple);
         
         processed++;
@@ -447,8 +468,16 @@ CREATE TABLE predictions (
 INSERT INTO predictions (feature1, feature2) VALUES (1.0, 2.0);
 
 -- Worker 进程在后台扫描并处理
--- 等待 async_predict_naptime 后，result_predict 被填充
+-- 等待 async_predict_naptime 后，result_predict 和 result 都被填充
 ```
+
+**重要说明**：在deferred模式下，异步预测工作进程会将预测值同时设置到两个列：
+- **result_predict列**：存储预测结果，用于审计和对比
+- **result列**：存储预测结果，供用户查询使用
+
+这种设计确保：
+1. 用户查询result列时可以直接获得预测值
+2. 避免重复预测（已预测的行会被跳过）
 
 ### 8.4 模式选择建议
 

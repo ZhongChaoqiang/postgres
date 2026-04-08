@@ -414,10 +414,12 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 				predict_datum = OidFunctionCall1(funcoid, row_datum);
 
+				/* Set result_predict column */
 				modify_attnums[0] = result_attnum;
 				modify_values[0] = predict_datum;
 				modify_nulls[0] = false;
 
+				/* Set result column to avoid re-prediction */
 				modify_attnums[1] = predict_attnum;
 				modify_values[1] = predict_datum;
 				modify_nulls[1] = false;

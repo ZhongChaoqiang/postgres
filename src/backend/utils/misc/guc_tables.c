@@ -800,6 +800,16 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 struct config_bool ConfigureNamesBool[] =
 {
 	{
+		{"async_predict_enabled", PGC_SIGHUP, VACUUM_AUTOVACUUM,
+			gettext_noop("Enables asynchronous prediction workers."),
+			NULL
+		},
+		&async_predict_enabled,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),
 			NULL,
@@ -3534,6 +3544,37 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&autovacuum_naptime,
 		60, 1, INT_MAX / 1000,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"async_predict_workers", PGC_SIGHUP, VACUUM_AUTOVACUUM,
+			gettext_noop("Number of asynchronous prediction workers."),
+			NULL
+		},
+		&async_predict_workers,
+		2, 1, 10,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"async_predict_naptime", PGC_SIGHUP, VACUUM_AUTOVACUUM,
+			gettext_noop("Time to sleep between async predict runs."),
+			NULL,
+			GUC_UNIT_S
+		},
+		&async_predict_naptime,
+		60, 1, INT_MAX / 1000,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"async_predict_batch_size", PGC_SIGHUP, VACUUM_AUTOVACUUM,
+			gettext_noop("Number of rows to process in each batch."),
+			NULL
+		},
+		&async_predict_batch_size,
+		100, 1, 10000,
 		NULL, NULL, NULL
 	},
 	{
