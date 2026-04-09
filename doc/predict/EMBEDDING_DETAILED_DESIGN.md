@@ -22,7 +22,7 @@ EMBEDDING列属性用于标记需要存储嵌入向量的列。当定义一个EM
 | 语法解析 | ✅ 已完成 | gram.y中添加语法规则 |
 | attembedding字段 | ✅ 已完成 | pg_attribute系统表扩展 |
 | 自动创建_embedding列 | ✅ 已完成 | parse_utilcmd.c实现 |
-| jolixdb_embedding_vector_len选项 | ✅ 已完成 | 表级向量长度选项 |
+| vector_len选项 | ✅ 已完成 | 表级向量长度选项 |
 | embedding_function选项 | ✅ 已完成 | 表级嵌入函数选项 |
 | get_embedding_function_oid | ✅ 已完成 | 获取嵌入函数OID |
 | embedding_trigger触发器 | ✅ 已完成 | 自动调用嵌入函数生成向量 |
@@ -37,7 +37,7 @@ graph TB
     A[CREATE TABLE语句] --> B[列定义处理]
     B --> C{是否EMBEDDING列?}
     C -->|是| D[设置attembedding标志]
-    D --> E[获取jolixdb_embedding_vector_len]
+    D --> E[获取vector_len]
     E --> F[创建_embedding隐藏列]
     F --> G[类型为vector]
     C -->|否| G
@@ -50,7 +50,7 @@ graph TB
 | EMBEDDING关键字 | SQL语法中的列属性标记 |
 | attembedding字段 | pg_attribute系统表中的列属性标志 |
 | _embedding隐藏列 | 自动创建的向量存储列 |
-| jolixdb_embedding_vector_len | 表级选项，指定向量维度 |
+| vector_len | 表级选项，指定向量维度 |
 | embedding_function | 表级选项，指定嵌入函数 |
 
 ## 3. 数据结构设计
@@ -93,7 +93,7 @@ typedef struct CompactAttribute
 
 ## 4. 表级选项设计
 
-### 4.1 jolixdb_embedding_vector_len选项
+### 4.1 vector_len选项
 
 **功能描述**: 指定嵌入向量的维度长度。
 
@@ -105,7 +105,7 @@ static relopt_int intRelOpts[] =
     // ... 其他选项
     {
         {
-            "jolixdb_embedding_vector_len",
+            "vector_len",
             "Length of embedding vector for prediction columns.",
             RELOPT_KIND_HEAP,
             ShareUpdateExclusiveLock
@@ -121,18 +121,22 @@ static relopt_int intRelOpts[] =
 typedef struct StdRdOptions
 {
     // ... 现有字段
-    int         jolixdb_embedding_vector_len;   /* length of embedding vector for prediction */
+    int         vector_len;   /* length of embedding vector for prediction */
 } StdRdOptions;
 
-/* 获取jolixdb_embedding_vector_len的宏 */
+/* 获取vector_len的宏 */
 #define RelationGetEmbeddingVectorLen(relation, defaultlen) \
     ((relation)->rd_options ? \
-     ((StdRdOptions *) (relation)->rd_options)->jolixdb_embedding_vector_len : (defaultlen))
+     ((StdRdOptions *) (relation)->rd_options)->vector_len : (defaultlen))
 ```
 
 ### 4.2 embedding_function选项
 
 **功能描述**: 设置表的嵌入函数，用于生成嵌入向量。该函数接收整行数据作为参数，返回vector类型的嵌入向量。
+
+支持两种格式：
+1. **单个函数名**：`embedding_function = 'func_name'` — 为该表所有EMBEDDING列设置相同的嵌入函数
+2. **列特定函数名**：`embedding_function = 'col_a:func_a;col_b:func_b'` — 为不同列设置不同的嵌入函数，格式为`列名:函数名`，多个用分号`;`分隔
 
 **文件**: `src/backend/access/common/reloptions.c`
 
@@ -170,7 +174,7 @@ typedef struct StdRdOptions
 **函数签名要求**:
 - 输入参数: `record` 类型（整行数据）
 - 返回类型: `vector` 类型
-- 向量维度: 必须与 `jolixdb_embedding_vector_len` 设置一致
+- 向量维度: 必须与 `vector_len` 设置一致
 
 **获取函数OID的接口**:
 
@@ -178,7 +182,7 @@ typedef struct StdRdOptions
 
 ```c
 extern PGDLLIMPORT Oid get_predict_function_oid(Oid relid);
-extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid);
+extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid, const char *colname);
 ```
 
 **文件**: `src/backend/utils/adt/predict.c`
@@ -187,17 +191,33 @@ extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid);
 /*
  * get_embedding_function - Get the embedding function name from reloptions
  * Returns the function name if set, or NULL if not set.
+ * Supports two formats:
+ *   1. Single function name: "func_name" - applies to all EMBEDDING columns
+ *   2. Column-specific: "col_a:func_a;col_b:func_b" - applies func_a to col_a, func_b to col_b
+ *
+ * If colname is provided (non-NULL), looks up the function for that specific column.
+ * If colname is NULL, returns the single function name (format 1) or NULL (format 2).
  */
 static char *
-get_embedding_function(Oid relid);
+get_embedding_function(Oid relid, const char *colname);
 
 /*
  * get_embedding_function_oid - Get the OID of the embedding function
  * Returns the function OID if set, or InvalidOid if not set.
+ * colname specifies which EMBEDDING column to look up the function for.
  */
 Oid
-get_embedding_function_oid(Oid relid);
+get_embedding_function_oid(Oid relid, const char *colname);
 ```
+
+**函数查找逻辑**:
+
+当 `embedding_function` 值不包含冒号`:`时，作为单个函数名处理，适用于所有EMBEDDING列。
+
+当 `embedding_function` 值包含冒号`:`时，按列特定格式解析：
+1. 以分号`;`分隔多个`列名:函数名`对
+2. 根据当前EMBEDDING列名查找对应的函数名
+3. 如果找不到对应列名的函数，则该列不调用嵌入函数
 
 ## 5. 语法设计
 
@@ -245,7 +265,7 @@ opt_embedding:
 /*
  * If this is an EMBEDDING column, automatically add a companion hidden
  * column with "_embedding" suffix to store the embedding vector.
- * The column type is vector with length specified by jolixdb_embedding_vector_len.
+ * The column type is vector with length specified by vector_len.
  */
 if (column->is_embedding)
 {
@@ -254,8 +274,8 @@ if (column->is_embedding)
     TypeName   *vector_type;
     int         vector_len;
 
-    /* Get jolixdb_embedding_vector_len from relation options */
-    vector_len = cxt->jolixdb_embedding_vector_len;
+    /* Get vector_len from relation options */
+    vector_len = cxt->vector_len;
 
     /* Create _embedding column name */
     embedding_colname = psprintf("%s_embedding", column->colname);
@@ -420,7 +440,7 @@ CREATE TABLE documents (
     id SERIAL PRIMARY KEY,
     content TEXT EMBEDDING
 ) WITH (
-    jolixdb_embedding_vector_len = 128
+    vector_len = 128
 );
 
 -- 实际表结构：
@@ -453,12 +473,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- 创建带嵌入函数的表
+-- 创建带嵌入函数的表（单个函数名，适用于所有EMBEDDING列）
 CREATE TABLE documents (
     id int PRIMARY KEY,
     content text EMBEDDING
 ) WITH (
-    jolixdb_embedding_vector_len = 10,
+    vector_len = 10,
     embedding_function = 'simple_embedding_func'
 );
 
@@ -473,7 +493,50 @@ SELECT id, content, content_embedding FROM documents;
 -- 1  | Hello World | [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0]
 ```
 
-### 8.4 同时使用PREDICT和EMBEDDING
+### 8.4 为不同EMBEDDING列设置不同的嵌入函数
+
+```sql
+-- 创建两个不同的嵌入函数
+CREATE OR REPLACE FUNCTION title_embedding_func(row_data record)
+RETURNS vector
+AS $$
+BEGIN
+    -- 标题嵌入逻辑
+    RETURN '[1,0,0,0,0]'::vector;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION body_embedding_func(row_data record)
+RETURNS vector
+AS $$
+BEGIN
+    -- 正文嵌入逻辑
+    RETURN '[0,0,0,0,1]'::vector;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- 使用列特定函数名格式：列名:函数名，多个用分号分隔
+CREATE TABLE articles (
+    id int PRIMARY KEY,
+    title text EMBEDDING,
+    body text EMBEDDING
+) WITH (
+    vector_len = 5,
+    embedding_function = 'title:title_embedding_func;body:body_embedding_func'
+);
+
+-- 插入数据时，title列使用title_embedding_func，body列使用body_embedding_func
+INSERT INTO articles (id, title, body) VALUES (1, 'Hello', 'World');
+
+-- 查询结果
+SELECT id, title, title_embedding, body, body_embedding FROM articles;
+-- 结果：
+-- id | title | title_embedding | body  | body_embedding
+-- ---+-------+-----------------+-------+----------------
+-- 1  | Hello | [1,0,0,0,0]     | World | [0,0,0,0,1]
+```
+
+### 8.5 同时使用PREDICT和EMBEDDING
 
 ```sql
 CREATE TABLE predictions (
@@ -481,7 +544,7 @@ CREATE TABLE predictions (
     text_content TEXT EMBEDDING,
     value INTEGER PREDICT
 ) WITH (
-    jolixdb_embedding_vector_len = 256,
+    vector_len = 256,
     predict_timing = immediate,
     predict_function = 'ml_predict',
     embedding_function = 'text_embedding_func'
@@ -496,7 +559,7 @@ CREATE TABLE predictions (
 -- value_actual (integer, HIDDEN)             -- 自动创建
 ```
 
-### 8.5 查询隐藏列
+### 8.6 查询隐藏列
 
 ```sql
 -- SELECT * 不返回隐藏列
@@ -524,13 +587,13 @@ LIMIT 10;
 | `src/include/catalog/pg_attribute.h` | 添加attembedding字段定义 |
 | `src/include/catalog/pg_proc.dat` | 注册embedding_trigger系统函数 |
 | `src/include/access/tupdesc.h` | CompactAttribute结构体添加attembedding字段 |
-| `src/backend/access/common/reloptions.c` | 添加jolixdb_embedding_vector_len和embedding_function表选项定义和解析 |
+| `src/backend/access/common/reloptions.c` | 添加vector_len和embedding_function表选项定义和解析 |
 | `src/backend/access/common/tupdesc.c` | populate_compact_attribute_internal添加attembedding处理 |
 | `src/backend/parser/parse_utilcmd.c` | transformColumnDefinition添加EMBEDDING列处理逻辑 |
 | `src/backend/commands/tablecmds.c` | BuildDescForRelation添加attembedding属性设置，添加createEmbeddingTrigger和createEmbeddingTriggersForRelation函数 |
 | `src/backend/catalog/heap.c` | AddNewAttributeTuples添加attembedding字段存储 |
 | `src/backend/nodes/makefuncs.c` | makeColumnDef初始化is_embedding字段 |
-| `src/include/utils/rel.h` | StdRdOptions结构体添加jolixdb_embedding_vector_len和embedding_function字段，添加RelationGetEmbeddingVectorLen宏 |
+| `src/include/utils/rel.h` | StdRdOptions结构体添加vector_len和embedding_function字段，添加RelationGetEmbeddingVectorLen宏 |
 | `src/backend/utils/adt/predict.c` | 添加get_embedding_function、get_embedding_function_oid和embedding_trigger函数 |
 | `src/include/utils/predict.h` | 添加get_embedding_function_oid函数声明 |
 
@@ -541,7 +604,7 @@ LIMIT 10;
 | 标记字段 | attpredict | attembedding |
 | 自动创建列 | `_predict`, `_actual` | `_embedding` |
 | 自动创建列类型 | 与原列相同 | vector(N) |
-| 表级选项 | predict_timing, predict_function | jolixdb_embedding_vector_len, embedding_function |
+| 表级选项 | predict_timing, predict_function | vector_len, embedding_function |
 | 触发器 | 自动创建预测触发器 | 自动创建嵌入触发器 |
 | 用途 | 存储预测值和实际值 | 存储嵌入向量 |
 
@@ -551,7 +614,7 @@ LIMIT 10;
 |-----|------|
 | 输入参数类型 | `record`（整行数据） |
 | 返回类型 | `vector` |
-| 向量维度 | 必须与 `jolixdb_embedding_vector_len` 一致 |
+| 向量维度 | 必须与 `vector_len` 一致 |
 | 推荐属性 | `IMMUTABLE`（如果结果确定） |
 
 ## 12. 重新构建和初始化
@@ -585,6 +648,6 @@ pg_ctl start -D /path/to/data
 
 ---
 
-**文档版本**: 1.2  
-**最后更新**: 2025-04-03  
+**文档版本**: 1.3  
+**最后更新**: 2025-04-09  
 **作者**: PostgreSQL开发团队

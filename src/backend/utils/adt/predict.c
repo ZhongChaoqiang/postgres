@@ -281,9 +281,15 @@ get_predict_function_oid(Oid relid)
  * get_embedding_function - Get the embedding function name from reloptions
  *
  * Returns the function name if set, or NULL if not set.
+ * Supports two formats:
+ *   1. Single function name: "func_name" - applies to all EMBEDDING columns
+ *   2. Column-specific: "col_a:func_a;col_b:func_b" - applies func_a to col_a, func_b to col_b
+ *
+ * If colname is provided (non-NULL), looks up the function for that specific column.
+ * If colname is NULL, returns the single function name (format 1) or NULL (format 2).
  */
 static char *
-get_embedding_function(Oid relid)
+get_embedding_function(Oid relid, const char *colname)
 {
 	HeapTuple	tuple;
 	Datum		reloptions;
@@ -318,7 +324,47 @@ get_embedding_function(Oid relid)
 
 				if (text_len > prefix_len && strncmp(text_str, prefix, prefix_len) == 0)
 				{
-					embedding_func = pstrdup(text_str + prefix_len);
+					char	   *value = text_str + prefix_len;
+
+					if (colname == NULL)
+					{
+						if (strchr(value, ':') == NULL)
+							embedding_func = pstrdup(value);
+					}
+					else
+					{
+						if (strchr(value, ':') == NULL)
+						{
+							embedding_func = pstrdup(value);
+						}
+						else
+						{
+							char	   *copy = pstrdup(value);
+							char	   *token;
+							char	   *saveptr;
+
+							token = strtok_r(copy, ";", &saveptr);
+							while (token != NULL)
+							{
+								char	   *colon = strchr(token, ':');
+
+								if (colon != NULL)
+								{
+									char	   *key = token;
+									*colon = '\0';
+									char	   *func = colon + 1;
+
+									if (strcmp(key, colname) == 0)
+									{
+										embedding_func = pstrdup(func);
+										break;
+									}
+								}
+								token = strtok_r(NULL, ";", &saveptr);
+							}
+							pfree(copy);
+						}
+					}
 					pfree(text_str);
 					break;
 				}
@@ -339,9 +385,10 @@ get_embedding_function(Oid relid)
  * get_embedding_function_oid - Get the OID of the embedding function
  *
  * Returns the function OID if set, or InvalidOid if not set.
+ * colname specifies which EMBEDDING column to look up the function for.
  */
 Oid
-get_embedding_function_oid(Oid relid)
+get_embedding_function_oid(Oid relid, const char *colname)
 {
 	char	   *funcname;
 	Oid			funcoid = InvalidOid;
@@ -349,14 +396,14 @@ get_embedding_function_oid(Oid relid)
 	FuncCandidateList clist;
 	int			fgc_flags;
 
-	funcname = get_embedding_function(relid);
+	funcname = get_embedding_function(relid, colname);
 	if (funcname == NULL)
 	{
-		elog(LOG, "embedding_trigger: no embedding_function set for relid=%u", relid);
+		elog(LOG, "embedding_trigger: no embedding_function set for relid=%u, colname=%s", relid, colname ? colname : "(null)");
 		return InvalidOid;
 	}
 
-	elog(LOG, "embedding_trigger: looking for function '%s'", funcname);
+	elog(LOG, "embedding_trigger: looking for function '%s' for column '%s'", funcname, colname ? colname : "(all)");
 
 	if (strchr(funcname, '.') != NULL)
 	{
@@ -722,7 +769,7 @@ embedding_trigger(PG_FUNCTION_ARGS)
 
 		/* Get embedding function OID */
 		{
-			Oid embedding_func_oid = get_embedding_function_oid(rel->rd_id);
+			Oid embedding_func_oid = get_embedding_function_oid(rel->rd_id, NameStr(attr->attname));
 
 			if (OidIsValid(embedding_func_oid))
 			{
