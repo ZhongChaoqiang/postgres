@@ -255,8 +255,8 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.partbound = stmt->partbound;
 	cxt.ofType = (stmt->ofTypename != NULL);
 	cxt.vector_len = 10;	/* default value */
-	cxt.vector_index = NULL;	/* default: no auto index */
-	cxt.vector_distance = NULL;	/* default: no auto index */
+	cxt.vector_index = "ivfflat";	/* default vector index type */
+	cxt.vector_distance = "vector_l2_ops";	/* default vector distance type */
 
 	Assert(!stmt->ofTypename || !stmt->inhRelations);	/* grammar enforces */
 
@@ -1248,8 +1248,9 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		cxt->columns = lappend(cxt->columns, embedding_col);
 
 		/*
-		 * Create vector index on the _embedding column if vector_index
-		 * and vector_distance options are specified.
+		 * Create vector index on the _embedding column using
+		 * vector_index and vector_distance options (defaults: ivfflat,
+		 * vector_l2_ops).
 		 */
 		if (cxt->vector_index != NULL && cxt->vector_distance != NULL)
 		{
