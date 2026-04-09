@@ -94,6 +94,8 @@ typedef struct
 	PartitionBoundSpec *partbound;	/* transformed FOR VALUES */
 	bool		ofType;			/* true if statement contains OF typename */
 	int			vector_len; /* embedding vector length from WITH options */
+	char	   *vector_index;	/* vector index type from WITH options */
+	char	   *vector_distance; /* vector distance type from WITH options */
 } CreateStmtContext;
 
 /* State shared by transformCreateSchemaStmtElements and its subroutines */
@@ -253,10 +255,12 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.partbound = stmt->partbound;
 	cxt.ofType = (stmt->ofTypename != NULL);
 	cxt.vector_len = 10;	/* default value */
+	cxt.vector_index = NULL;	/* default: no auto index */
+	cxt.vector_distance = NULL;	/* default: no auto index */
 
 	Assert(!stmt->ofTypename || !stmt->inhRelations);	/* grammar enforces */
 
-	/* Extract vector_len from WITH options if specified */
+	/* Extract vector_len, vector_index, vector_distance from WITH options if specified */
 	if (stmt->options)
 	{
 		ListCell   *option;
@@ -268,7 +272,14 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 			if (strcmp(defel->defname, "vector_len") == 0)
 			{
 				cxt.vector_len = defGetInt32(defel);
-				break;
+			}
+			else if (strcmp(defel->defname, "vector_index") == 0)
+			{
+				cxt.vector_index = defGetString(defel);
+			}
+			else if (strcmp(defel->defname, "vector_distance") == 0)
+			{
+				cxt.vector_distance = defGetString(defel);
 			}
 		}
 	}
@@ -1235,6 +1246,58 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		embedding_col->location = -1;
 
 		cxt->columns = lappend(cxt->columns, embedding_col);
+
+		/*
+		 * Create vector index on the _embedding column if vector_index
+		 * and vector_distance options are specified.
+		 */
+		if (cxt->vector_index != NULL && cxt->vector_distance != NULL)
+		{
+			IndexStmt  *index;
+			IndexElem  *iparam;
+
+			index = makeNode(IndexStmt);
+			index->idxname = psprintf("%s_%s_embedding_idx",
+									  cxt->relation->relname, column->colname);
+			index->relation = copyObject(cxt->relation);
+			index->accessMethod = pstrdup(cxt->vector_index);
+			index->tableSpace = NULL;
+			index->options = NIL;
+			index->whereClause = NULL;
+			index->excludeOpNames = NIL;
+			index->idxcomment = NULL;
+			index->indexOid = InvalidOid;
+			index->oldNumber = InvalidRelFileNumber;
+			index->oldCreateSubid = InvalidSubTransactionId;
+			index->oldFirstRelfilelocatorSubid = InvalidSubTransactionId;
+			index->unique = false;
+			index->nulls_not_distinct = false;
+			index->primary = false;
+			index->isconstraint = false;
+			index->iswithoutoverlaps = false;
+			index->deferrable = false;
+			index->initdeferred = false;
+			index->transformed = false;
+			index->concurrent = false;
+			index->if_not_exists = true;
+			index->reset_default_tblspc = false;
+
+			/* Create index element for the _embedding column */
+			iparam = makeNode(IndexElem);
+			iparam->name = psprintf("%s_embedding", column->colname);
+			iparam->expr = NULL;
+			iparam->indexcolname = NULL;
+			iparam->collation = NIL;
+			iparam->opclass = list_make1(makeString(cxt->vector_distance));
+			iparam->opclassopts = NIL;
+			iparam->ordering = SORTBY_DEFAULT;
+			iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+
+			index->indexParams = list_make1(iparam);
+			index->indexIncludingParams = NIL;
+
+			cxt->alist = lappend(cxt->alist, index);
+		}
 	}
 }
 
@@ -3798,6 +3861,8 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 	cxt.partbound = NULL;
 	cxt.ofType = false;
 	cxt.vector_len = RelationGetEmbeddingVectorLen(rel, 10);
+	cxt.vector_index = NULL;
+	cxt.vector_distance = NULL;
 
 	/*
 	 * Transform ALTER subcommands that need it (most don't).  These largely
