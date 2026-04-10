@@ -531,7 +531,7 @@ async_predict_process_database(Oid dboid, int worker_slot)
 
 			pfree(predict_colname);
 
-			funcoid = get_predict_function_oid(reloid);
+			funcoid = get_predict_function_oid(reloid, attrname);
 			if (!OidIsValid(funcoid))
 			{
 				elog(DEBUG1, "async_predict: no predict function for table %s", relname);

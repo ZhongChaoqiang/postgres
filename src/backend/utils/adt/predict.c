@@ -86,30 +86,33 @@ is_predict_column(PG_FUNCTION_ARGS)
  * get_predict_function - Get the predict function name from reloptions
  *
  * Returns the function name if set, or NULL if not set.
+ * Supports two formats:
+ *   1. Single function name: "func_name" - applies to all PREDICT columns
+ *   2. Column-specific: "col_a:func_a;col_b:func_b" - applies func_a to col_a, func_b to col_b
+ *
+ * If colname is provided (non-NULL), looks up the function for that specific column.
+ * If colname is NULL, returns the single function name (format 1) or NULL (format 2).
  */
 static char *
-get_predict_function(Oid relid)
+get_predict_function(Oid relid, const char *colname)
 {
 	HeapTuple	tuple;
 	Datum		reloptions;
 	bool		isnull;
 	char	   *predict_func = NULL;
 
-	/* Get the relation tuple from pg_class */
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for relation %u", relid);
 
-	/* Get reloptions */
 	reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
 		   &isnull);
 
-	elog(LOG, "async_predict: get_predict_function for relid=%u, reloptions isnull=%s",
-		 relid, isnull ? "true" : "false");
+	elog(LOG, "predict_function: get_predict_function for relid=%u, colname=%s, reloptions isnull=%s",
+		 relid, colname ? colname : "(null)", isnull ? "true" : "false");
 
 	if (!isnull)
 	{
-		/* reloptions is a text array, so we need to deconstruct it */
 		ArrayType  *array = DatumGetArrayTypeP(reloptions);
 		Datum	   *elems;
 		bool	   *nulls;
@@ -118,12 +121,10 @@ get_predict_function(Oid relid)
 		const char *prefix = "predict_function=";
 		const size_t prefix_len = strlen(prefix);
 
-		/* Deconstruct the array */
 		deconstruct_array(array, TEXTOID, -1, false, 'i', &elems, &nulls, &nitems);
 
-		elog(LOG, "async_predict: reloptions has %d items", nitems);
+		elog(LOG, "predict_function: reloptions has %d items", nitems);
 
-		/* Iterate through the array elements */
 		for (i = 0; i < nitems; i++)
 		{
 			if (!nulls[i])
@@ -131,14 +132,51 @@ get_predict_function(Oid relid)
 				char	   *text_str = TextDatumGetCString(elems[i]);
 				int			text_len = strlen(text_str);
 
-				elog(LOG, "async_predict: reloption[%d] = '%s'", i, text_str);
+				elog(LOG, "predict_function: reloption[%d] = '%s'", i, text_str);
 
-				/* Check if the option matches the expected prefix */
 				if (text_len > prefix_len && strncmp(text_str, prefix, prefix_len) == 0)
 				{
-					/* Extract the function name */
-					predict_func = pstrdup(text_str + prefix_len);
-					elog(LOG, "async_predict: found predict_function = '%s'", predict_func);
+					char	   *value = text_str + prefix_len;
+
+					if (colname == NULL)
+					{
+						if (strchr(value, ':') == NULL)
+							predict_func = pstrdup(value);
+					}
+					else
+					{
+						if (strchr(value, ':') == NULL)
+						{
+							predict_func = pstrdup(value);
+						}
+						else
+						{
+							char	   *copy = pstrdup(value);
+							char	   *token;
+							char	   *saveptr;
+
+							token = strtok_r(copy, ";", &saveptr);
+							while (token != NULL)
+							{
+								char	   *colon = strchr(token, ':');
+
+								if (colon != NULL)
+								{
+									char	   *key = token;
+									*colon = '\0';
+									char	   *func = colon + 1;
+
+									if (strcmp(key, colname) == 0)
+									{
+										predict_func = pstrdup(func);
+										break;
+									}
+								}
+								token = strtok_r(NULL, ";", &saveptr);
+							}
+							pfree(copy);
+						}
+					}
 					pfree(text_str);
 					break;
 				}
@@ -146,7 +184,6 @@ get_predict_function(Oid relid)
 			}
 		}
 
-		/* Free the array elements */
 		pfree(elems);
 		pfree(nulls);
 	}
@@ -154,7 +191,11 @@ get_predict_function(Oid relid)
 	ReleaseSysCache(tuple);
 	
 	if (predict_func == NULL)
-		elog(LOG, "async_predict: no predict_function found for relid=%u", relid);
+		elog(LOG, "predict_function: no predict_function found for relid=%u, colname=%s", 
+			 relid, colname ? colname : "(null)");
+	else
+		elog(LOG, "predict_function: found predict_function = '%s' for colname=%s", 
+			 predict_func, colname ? colname : "(all)");
 	
 	return predict_func;
 }
@@ -163,9 +204,10 @@ get_predict_function(Oid relid)
  * get_predict_function_oid - Get the OID of the predict function
  *
  * Returns the function OID if set, or InvalidOid if not set.
+ * colname specifies which PREDICT column to look up the function for.
  */
 Oid
-get_predict_function_oid(Oid relid)
+get_predict_function_oid(Oid relid, const char *colname)
 {
 	char	   *funcname;
 	Oid			funcoid = InvalidOid;
@@ -173,41 +215,35 @@ get_predict_function_oid(Oid relid)
 	FuncCandidateList clist;
 	int			fgc_flags;
 
-	funcname = get_predict_function(relid);
+	funcname = get_predict_function(relid, colname);
 	if (funcname == NULL)
+	{
+		elog(LOG, "predict_function: no predict_function set for relid=%u, colname=%s", 
+			 relid, colname ? colname : "(null)");
 		return InvalidOid;
+	}
 
-	elog(LOG, "async_predict: get_predict_function_oid looking for function '%s'", funcname);
+	elog(LOG, "predict_function: looking for function '%s' for column '%s'", 
+		 funcname, colname ? colname : "(all)");
 
-	/*
-	 * Try to find the function. First try as qualified name, then as
-	 * unqualified name in all schemas.
-	 */
 	if (strchr(funcname, '.') != NULL)
 	{
-		/* Qualified name: parse schema.function format */
 		namelist = stringToQualifiedNameList(funcname, NULL);
 	}
 	else
 	{
-		/*
-		 * Unqualified name: search in all schemas.
-		 * We need to search in pg_catalog, public, and any other schema
-		 * that might contain the function.
-		 */
 		namelist = list_make1(makeString(funcname));
 	}
 
-	/* Search for function with 1 argument */
 	clist = FuncnameGetCandidates(namelist, 1, NIL, false, false, false, true, &fgc_flags);
 
-	elog(LOG, "async_predict: FuncnameGetCandidates result, clist=%p", clist);
+	elog(LOG, "predict_function: FuncnameGetCandidates result, clist=%p", clist);
 
 	if (clist != NULL)
 	{
 		for (; clist != NULL; clist = clist->next)
 		{
-			elog(LOG, "async_predict: candidate oid=%u, nargs=%d", clist->oid, clist->nargs);
+			elog(LOG, "predict_function: candidate oid=%u, nargs=%d", clist->oid, clist->nargs);
 			if (clist->nargs == 1)
 			{
 				funcoid = clist->oid;
@@ -216,10 +252,6 @@ get_predict_function_oid(Oid relid)
 		}
 	}
 
-	/*
-	 * If still not found, try using regprocedure cast which searches
-	 * all schemas regardless of search_path.
-	 */
 	if (!OidIsValid(funcoid))
 	{
 		char	   *query;
@@ -229,15 +261,13 @@ get_predict_function_oid(Oid relid)
 		MemoryContext querycontext;
 		int			ret;
 
-		elog(LOG, "async_predict: trying direct lookup via pg_proc");
+		elog(LOG, "predict_function: trying direct lookup via pg_proc");
 
-		/* Create a temporary memory context for the query */
 		querycontext = AllocSetContextCreate(CurrentMemoryContext,
 											 "predict_func_lookup",
 											 ALLOCSET_DEFAULT_SIZES);
 		oldcontext = MemoryContextSwitchTo(querycontext);
 
-		/* Build query to find function by name */
 		query = psprintf(
 			"SELECT oid FROM pg_proc "
 			"WHERE proname = '%s' "
@@ -245,15 +275,15 @@ get_predict_function_oid(Oid relid)
 			"ORDER BY oid LIMIT 1",
 			funcname);
 
-		elog(LOG, "async_predict: SPI query: %s", query);
+		elog(LOG, "predict_function: SPI query: %s", query);
 
 		ret = SPI_connect();
-		elog(LOG, "async_predict: SPI_connect returned %d", ret);
+		elog(LOG, "predict_function: SPI_connect returned %d", ret);
 		
 		if (ret == SPI_OK_CONNECT)
 		{
 			ret = SPI_execute(query, true, 1);
-			elog(LOG, "async_predict: SPI_execute returned %d, SPI_processed=%lu", 
+			elog(LOG, "predict_function: SPI_execute returned %d, SPI_processed=%lu", 
 				 ret, SPI_processed);
 			
 			if (ret == SPI_OK_SELECT && SPI_processed > 0)
@@ -262,7 +292,7 @@ get_predict_function_oid(Oid relid)
 									   SPI_tuptable->tupdesc, 1, &isnull);
 				if (!isnull)
 					funcoid = DatumGetObjectId(result);
-				elog(LOG, "async_predict: SPI lookup result=%u", funcoid);
+				elog(LOG, "predict_function: SPI lookup result=%u", funcoid);
 			}
 			SPI_finish();
 		}
@@ -271,7 +301,7 @@ get_predict_function_oid(Oid relid)
 		MemoryContextDelete(querycontext);
 	}
 
-	elog(LOG, "async_predict: get_predict_function_oid final result=%u", funcoid);
+	elog(LOG, "predict_function: get_predict_function_oid final result=%u", funcoid);
 
 	pfree(funcname);
 	return funcoid;
@@ -518,6 +548,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 	HeapTuple		newtuple;
 	Relation		rel;
 	int				attnum;
+	AttrNumber		target_attnum;
 	Datum			coldatum;
 	Datum			actual_datum;
 	Datum			predict_datum;
@@ -551,6 +582,14 @@ predict_trigger(PG_FUNCTION_ARGS)
 	tupdesc = RelationGetDescr(rel);
 	newtuple = trigdata->tg_trigtuple;
 
+	/* Get target attnum from trigger argument if provided */
+	target_attnum = InvalidAttrNumber;
+	if (trigdata->tg_trigger->tgnargs > 0)
+	{
+		char *arg_str = trigdata->tg_trigger->tgargs[0];
+		target_attnum = atoi(arg_str);
+	}
+
 	/* Get predict_timing option */
 	relopts = (StdRdOptions *) rel->rd_options;
 	predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
@@ -571,10 +610,14 @@ predict_trigger(PG_FUNCTION_ARGS)
 		if (!attr->attpredict)
 			continue;
 
+		/* If target_attnum is specified, only process that column */
+		if (target_attnum != InvalidAttrNumber && attnum != target_attnum)
+			continue;
+
 		/* This is a PREDICT column */
 
-		/* Get user input value */
-		coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+		/* Get user input value from ORIGINAL tuple (not modified one) */
+		coldatum = heap_getattr(trigdata->tg_trigtuple, attnum, tupdesc, &isnull);
 		actual_datum = coldatum;
 		actual_isnull = isnull;
 
@@ -594,8 +637,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 
 		if (isnull && predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
 		{
-			/* PREDICT column is NULL and timing is immediate: call predict function */
-			char *predict_func_name = get_predict_function(rel->rd_id);
+			char *predict_func_name = get_predict_function(rel->rd_id, NameStr(attr->attname));
 
 			if (predict_func_name != NULL)
 			{
@@ -640,8 +682,8 @@ predict_trigger(PG_FUNCTION_ARGS)
 					
 					fmgr_info(predict_func_oid, &predict_func);
 					
-					/* Convert the entire row to a datum */
-					row_datum = heap_copy_tuple_as_datum(newtuple, tupdesc);
+					/* Use ORIGINAL tuple for prediction, not modified one */
+					row_datum = heap_copy_tuple_as_datum(trigdata->tg_trigtuple, tupdesc);
 					
 					predict_datum = FunctionCall1(&predict_func, row_datum);
 					predict_isnull = false;
@@ -651,48 +693,97 @@ predict_trigger(PG_FUNCTION_ARGS)
 			}
 		}
 
-		/* Modify tuple to set _actual and _predict columns */
+		/* Modify tuple to set PREDICT column, _actual and _predict columns */
 		if (actual_attnum != InvalidAttrNumber && predict_attnum != InvalidAttrNumber)
 		{
-			int			modify_attnums[2];
-			Datum		modify_values[2];
-			bool		modify_nulls[2];
+			int			modify_attnums[3];
+			Datum		modify_values[3];
+			bool		modify_nulls[3];
+			int			nmodify = 0;
 
-			modify_attnums[0] = actual_attnum;
-			modify_values[0] = actual_datum;
-			modify_nulls[0] = actual_isnull;
+			/* Set _actual column */
+			modify_attnums[nmodify] = actual_attnum;
+			modify_values[nmodify] = actual_datum;
+			modify_nulls[nmodify] = actual_isnull;
+			nmodify++;
 
-			modify_attnums[1] = predict_attnum;
-			modify_values[1] = predict_datum;
-			modify_nulls[1] = predict_isnull;
+			/* Set _predict column */
+			modify_attnums[nmodify] = predict_attnum;
+			modify_values[nmodify] = predict_datum;
+			modify_nulls[nmodify] = predict_isnull;
+			nmodify++;
 
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 2,
+			/* Set PREDICT column if we have a prediction */
+			if (!predict_isnull)
+			{
+				modify_attnums[nmodify] = attnum;
+				modify_values[nmodify] = predict_datum;
+				modify_nulls[nmodify] = false;
+				nmodify++;
+			}
+
+			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, nmodify,
 												 modify_attnums, modify_values, modify_nulls);
 			newtuple = rettuple;
 		}
 		else if (actual_attnum != InvalidAttrNumber)
 		{
-			int			modify_attnums[1];
-			Datum		modify_values[1];
-			bool		modify_nulls[1];
+			int			modify_attnums[2];
+			Datum		modify_values[2];
+			bool		modify_nulls[2];
+			int			nmodify = 0;
 
-			modify_attnums[0] = actual_attnum;
-			modify_values[0] = actual_datum;
-			modify_nulls[0] = actual_isnull;
+			/* Set _actual column */
+			modify_attnums[nmodify] = actual_attnum;
+			modify_values[nmodify] = actual_datum;
+			modify_nulls[nmodify] = actual_isnull;
+			nmodify++;
 
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+			/* Set PREDICT column if we have a prediction */
+			if (!predict_isnull)
+			{
+				modify_attnums[nmodify] = attnum;
+				modify_values[nmodify] = predict_datum;
+				modify_nulls[nmodify] = false;
+				nmodify++;
+			}
+
+			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, nmodify,
 												 modify_attnums, modify_values, modify_nulls);
 			newtuple = rettuple;
 		}
 		else if (predict_attnum != InvalidAttrNumber && !predict_isnull)
 		{
+			int			modify_attnums[2];
+			Datum		modify_values[2];
+			bool		modify_nulls[2];
+			int			nmodify = 0;
+
+			/* Set _predict column */
+			modify_attnums[nmodify] = predict_attnum;
+			modify_values[nmodify] = predict_datum;
+			modify_nulls[nmodify] = false;
+			nmodify++;
+
+			/* Set PREDICT column */
+			modify_attnums[nmodify] = attnum;
+			modify_values[nmodify] = predict_datum;
+			modify_nulls[nmodify] = false;
+			nmodify++;
+
+			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, nmodify,
+												 modify_attnums, modify_values, modify_nulls);
+			newtuple = rettuple;
+		}
+		else if (!predict_isnull)
+		{
 			int			modify_attnums[1];
 			Datum		modify_values[1];
 			bool		modify_nulls[1];
 
-			modify_attnums[0] = predict_attnum;
+			modify_attnums[0] = attnum;
 			modify_values[0] = predict_datum;
-			modify_nulls[0] = predict_isnull;
+			modify_nulls[0] = false;
 
 			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
 												 modify_attnums, modify_values, modify_nulls);

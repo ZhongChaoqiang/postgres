@@ -130,6 +130,9 @@ graph TB
 - 支持自定义预测算法
 - 函数签名：`function_name(record) returns element_type`
 - 函数接收整行数据作为参数，返回预测结果
+- **支持两种格式**：
+  - **单个函数名**：`predict_function = 'func_name'` - 为所有PREDICT列设置相同的预测函数
+  - **列特定格式**：`predict_function = 'col_a:func_a;col_b:func_b'` - 为不同的PREDICT列设置不同的预测函数
 
 **预测函数样例代码：**
 
@@ -709,13 +712,57 @@ sequenceDiagram
 
 #### 5.1.1 SQL接口
 ```sql
--- 创建带PREDICT列的表
+-- 创建带PREDICT列的表（单个预测函数）
 CREATE TABLE sensor_data (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP,
     temperature FLOAT PREDICT,  -- PREDICT列，保持原始基础类型
     predict_function = 'temperature_predict'
 );
+
+-- 创建带多个PREDICT列的表（每个列使用不同的预测函数）
+CREATE TABLE multi_predict_table (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP,
+    temperature FLOAT PREDICT,
+    humidity FLOAT PREDICT,
+    pressure FLOAT PREDICT
+) WITH (
+    predict_timing = immediate,
+    predict_function = 'temperature:temp_predict;humidity:humidity_predict;pressure:pressure_predict'
+);
+
+-- 创建预测函数（接受record类型参数）
+CREATE OR REPLACE FUNCTION temp_predict(rec record) 
+RETURNS FLOAT AS $$
+BEGIN
+    -- 从记录中提取特征值进行预测
+    RETURN rec.temperature * 1.05;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION humidity_predict(rec record) 
+RETURNS FLOAT AS $$
+BEGIN
+    RETURN rec.humidity * 0.95;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION pressure_predict(rec record) 
+RETURNS FLOAT AS $$
+BEGIN
+    RETURN rec.pressure * 1.02;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 插入数据，系统会自动调用对应的预测函数
+INSERT INTO multi_predict_table (timestamp, temperature, humidity, pressure) 
+VALUES ('2024-01-01 10:00:00', 25.5, 60.0, 1013.25);
+
+-- 查询预测结果
+SELECT id, timestamp, temperature, temperature_predict, 
+       humidity, humidity_predict, pressure, pressure_predict 
+FROM multi_predict_table;
 
 -- 使用predict_timing选项控制预测时机
 CREATE TABLE sensor_data (
@@ -799,11 +846,22 @@ CREATE TABLE example (
 根据当前代码，PREDICT功能支持的表级选项：
 
 ```sql
--- 预测函数指定
+-- 预测函数指定（单个函数，应用于所有PREDICT列）
 CREATE TABLE example (
     data INTEGER PREDICT
 ) WITH (
     predict_function = 'custom_predict_func'
+);
+
+-- 预测函数指定（多个函数，每个PREDICT列使用不同的函数）
+CREATE TABLE multi_example (
+    id SERIAL PRIMARY KEY,
+    temp FLOAT PREDICT,
+    humidity FLOAT PREDICT,
+    pressure FLOAT PREDICT
+) WITH (
+    predict_timing = immediate,
+    predict_function = 'temp:temp_predict_func;humidity:humidity_predict_func;pressure:pressure_predict_func'
 );
 
 -- 预测时机控制（新增）
@@ -813,6 +871,99 @@ CREATE TABLE example (
     predict_timing = deferred,      -- 延迟预测（默认）
     predict_function = 'custom_predict_func'
 );
+```
+
+### 6.2.1 predict_function多列支持
+
+#### 功能概述
+`predict_function`选项支持两种格式，允许为不同的PREDICT列指定不同的预测函数：
+
+1. **单个函数名格式**：`predict_function = 'func_name'`
+   - 为表中所有PREDICT列设置相同的预测函数
+   - 适用于所有PREDICT列使用相同预测算法的场景
+
+2. **列特定格式**：`predict_function = 'col_a:func_a;col_b:func_b'`
+   - 为每个PREDICT列指定不同的预测函数
+   - 格式：`列名:函数名`，多个列用分号`;`分隔
+   - 适用于不同PREDICT列需要不同预测算法的场景
+
+#### 使用示例
+
+```sql
+-- 场景1：所有PREDICT列使用相同的预测函数
+CREATE TABLE sensor_data (
+    id SERIAL PRIMARY KEY,
+    temperature FLOAT PREDICT,
+    humidity FLOAT PREDICT
+) WITH (
+    predict_timing = immediate,
+    predict_function = 'general_predict'
+);
+
+-- 场景2：每个PREDICT列使用不同的预测函数
+CREATE TABLE advanced_sensor_data (
+    id SERIAL PRIMARY KEY,
+    temperature FLOAT PREDICT,
+    humidity FLOAT PREDICT,
+    pressure FLOAT PREDICT
+) WITH (
+    predict_timing = immediate,
+    predict_function = 'temperature:temp_ml_predict;humidity:humidity_nn_predict;pressure:pressure_arima_predict'
+);
+
+-- 创建对应的预测函数
+CREATE OR REPLACE FUNCTION temp_ml_predict(rec record) 
+RETURNS FLOAT AS $$
+BEGIN
+    -- 使用机器学习模型预测温度
+    RETURN rec.temperature * 1.05 + 0.3 * rec.humidity;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION humidity_nn_predict(rec record) 
+RETURNS FLOAT AS $$
+BEGIN
+    -- 使用神经网络模型预测湿度
+    RETURN rec.humidity * 0.95;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION pressure_arima_predict(rec record) 
+RETURNS FLOAT AS $$
+BEGIN
+    -- 使用ARIMA模型预测气压
+    RETURN rec.pressure * 1.02;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### 实现原理
+
+当系统处理PREDICT列时，会按照以下逻辑查找对应的预测函数：
+
+1. 检查`predict_function`选项的格式
+2. 如果是单个函数名（不包含`:`），则为所有PREDICT列使用该函数
+3. 如果是列特定格式（包含`:`），则根据列名查找对应的函数
+4. 如果未找到对应的函数，则跳过预测
+
+```c
+// 伪代码示例
+char *get_predict_function(Oid relid, const char *colname)
+{
+    char *value = get_reloption_value(relid, "predict_function");
+    
+    if (strchr(value, ':') == NULL)
+    {
+        // 单个函数名格式：应用于所有列
+        return pstrdup(value);
+    }
+    else
+    {
+        // 列特定格式：查找对应列的函数
+        // 格式: "col_a:func_a;col_b:func_b"
+        return lookup_column_function(value, colname);
+    }
+}
 ```
 
 ### 6.3 predict_timing表选项详细设计
@@ -1379,6 +1530,6 @@ pg_ctl start -D /path/to/data
 
 ---
 
-**文档版本**: 1.5  
-**最后更新**: 2025-04-03  
+**文档版本**: 1.6  
+**最后更新**: 2026-04-09  
 **作者**: PostgreSQL开发团队

@@ -14067,7 +14067,8 @@ createPredictTrigger(Oid relOid, AttrNumber attnum, const char *colname)
 
 	/* This is a BEFORE INSERT OR UPDATE trigger */
 	trigger->funcname = SystemFuncName("predict_trigger");
-	trigger->args = NIL;  /* No arguments needed - trigger will detect PREDICT column */
+	/* Pass attnum as argument so trigger knows which PREDICT column to process */
+	trigger->args = list_make1(makeString(pstrdup(attnum_str)));
 	trigger->row = true;
 	trigger->timing = TRIGGER_TYPE_BEFORE;
 	trigger->events = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE;
