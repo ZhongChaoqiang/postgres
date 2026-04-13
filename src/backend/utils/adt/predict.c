@@ -37,6 +37,7 @@
 #include "catalog/catversion.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/namespace.h"
 #include "nodes/makefuncs.h"
 #include "access/reloptions.h"
 #include "funcapi.h"
@@ -451,12 +452,29 @@ get_embedding_function_oid(Oid relid, const char *colname)
 		elog(LOG, "embedding_trigger: found %d function candidates", clist->next ? 2 : 1);
 		for (; clist != NULL; clist = clist->next)
 		{
+			HeapTuple	proc_tuple;
+			Form_pg_proc proc_form;
+			
 			elog(LOG, "embedding_trigger: candidate oid=%u, nargs=%d", clist->oid, clist->nargs);
-			if (clist->nargs == 1)
+			
+			if (clist->nargs != 1)
+				continue;
+			
+			/* Check if the argument type is text */
+			proc_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(clist->oid));
+			if (!HeapTupleIsValid(proc_tuple))
+				continue;
+			
+			proc_form = (Form_pg_proc) GETSTRUCT(proc_tuple);
+			if (proc_form->proargtypes.values[0] == TEXTOID)
 			{
 				funcoid = clist->oid;
+				ReleaseSysCache(proc_tuple);
+				elog(LOG, "embedding_trigger: found text-accepting function oid=%u", funcoid);
 				break;
 			}
+			
+			ReleaseSysCache(proc_tuple);
 		}
 	}
 	else
@@ -794,6 +812,48 @@ predict_trigger(PG_FUNCTION_ARGS)
 	return PointerGetDatum(newtuple);
 }
 
+PG_FUNCTION_INFO_V1(text_vector_l2_distance);
+
+Datum
+text_vector_l2_distance(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("text vector distance operator should be rewritten"),
+			 errdetail("This operator should be automatically rewritten to use vector type."),
+			 errhint("This is an internal error if you see this message.")));
+	
+	PG_RETURN_NULL();
+}
+
+PG_FUNCTION_INFO_V1(text_vector_cosine_distance);
+
+Datum
+text_vector_cosine_distance(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("text vector distance operator should be rewritten"),
+			 errdetail("This operator should be automatically rewritten to use vector type."),
+			 errhint("This is an internal error if you see this message.")));
+	
+	PG_RETURN_NULL();
+}
+
+PG_FUNCTION_INFO_V1(text_vector_ip_distance);
+
+Datum
+text_vector_ip_distance(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("text vector distance operator should be rewritten"),
+			 errdetail("This operator should be automatically rewritten to use vector type."),
+			 errhint("This is an internal error if you see this message.")));
+	
+	PG_RETURN_NULL();
+}
+
 /*
  * embedding_trigger - trigger function for EMBEDDING columns
  *
@@ -865,31 +925,52 @@ embedding_trigger(PG_FUNCTION_ARGS)
 			if (OidIsValid(embedding_func_oid))
 			{
 				FmgrInfo embedding_func;
-				Datum row_datum;
+				Datum col_datum;
+				bool col_isnull;
 				Datum embedding_datum;
+				char *col_value;
 				
 				fmgr_info(embedding_func_oid, &embedding_func);
 				
-				/* Convert the entire row to a datum */
-				row_datum = heap_copy_tuple_as_datum(newtuple, tupdesc);
+				/* Get the value of the current embedding column */
+				col_datum = heap_getattr(newtuple, attnum, tupdesc, &col_isnull);
 				
-				/* Call embedding function */
-				embedding_datum = FunctionCall1(&embedding_func, row_datum);
-				
-				/* Set _embedding column */
+				if (!col_isnull)
 				{
-					int			modify_attnums[1];
-					Datum		modify_values[1];
-					bool		modify_nulls[1];
+					/* Get the text value for logging */
+					col_value = TextDatumGetCString(col_datum);
+					elog(LOG, "embedding_trigger: calling function for column '%s' with value '%s'", 
+						 NameStr(attr->attname), col_value);
+					pfree(col_value);
+					
+					/* Call embedding function with the column value */
+					embedding_datum = FunctionCall1(&embedding_func, col_datum);
+					
+					elog(LOG, "embedding_trigger: function returned successfully");
+					
+					/* Set _embedding column */
+					{
+						int			modify_attnums[1];
+						Datum		modify_values[1];
+						bool		modify_nulls[1];
 
-					modify_attnums[0] = embedding_attnum;
-					modify_values[0] = embedding_datum;
-					modify_nulls[0] = false;
+						modify_attnums[0] = embedding_attnum;
+						modify_values[0] = embedding_datum;
+						modify_nulls[0] = false;
 
-					rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
-														 modify_attnums, modify_values, modify_nulls);
-					newtuple = rettuple;
+						rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+															 modify_attnums, modify_values, modify_nulls);
+						newtuple = rettuple;
+					}
 				}
+				else
+				{
+					elog(LOG, "embedding_trigger: column '%s' is null, skipping", NameStr(attr->attname));
+				}
+			}
+			else
+			{
+				elog(LOG, "embedding_trigger: no embedding function found for column '%s'", NameStr(attr->attname));
 			}
 		}
 	}

@@ -49,3 +49,5 @@ build
 doc-pak
 deb-pkg
 description-pak
+deb-pkgapt
+doc-pak

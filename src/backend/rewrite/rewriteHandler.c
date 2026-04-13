@@ -44,6 +44,13 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/predict.h"
+#include "catalog/pg_operator.h"
+#include "catalog/pg_proc.h"
+#include "catalog/namespace.h"
+#include "parser/parse_oper.h"
+#include "utils/syscache.h"
+#include "fmgr.h"
 
 
 /* We use a list of these to detect recursion in RewriteQuery */
@@ -98,6 +105,9 @@ static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
 static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
 static Node *expand_generated_columns_internal(Node *node, Relation rel, int rt_index,
 											   RangeTblEntry *rte, int result_relation);
+static bool is_vector_distance_operator(Oid opno);
+static Node *rewrite_embedding_orderby_expr(Node *node, Query *query);
+static void rewrite_embedding_orderby(Query *parsetree);
 
 
 /*
@@ -4426,6 +4436,11 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
 					 errmsg("WITH cannot be used in a query that is rewritten by rules into multiple queries")));
 	}
 
+	if (parsetree->commandType == CMD_SELECT)
+	{
+		rewrite_embedding_orderby(parsetree);
+	}
+
 	return rewritten;
 }
 
@@ -4652,4 +4667,305 @@ QueryRewrite(Query *parsetree)
 		lastInstead->canSetTag = true;
 
 	return results;
+}
+
+static bool
+is_vector_distance_operator(Oid opno)
+{
+	char	   *opname;
+	
+	opname = get_opname(opno);
+	if (opname == NULL)
+		return false;
+	
+	if (strcmp(opname, "<->") == 0 ||
+		strcmp(opname, "<=>") == 0 ||
+		strcmp(opname, "<#>") == 0)
+	{
+		pfree(opname);
+		return true;
+	}
+	
+	pfree(opname);
+	return false;
+}
+
+static bool
+is_text_vector_distance_operator(Oid opno)
+{
+	Oid			text_oid;
+	Oid			left_type;
+	Oid			right_type;
+	
+	text_oid = TEXTOID;
+	
+	get_opcode(opno);
+	left_type = get_leftop(opno);
+	right_type = get_rightop(opno);
+	
+	if (left_type == text_oid && right_type == text_oid)
+	{
+		return is_vector_distance_operator(opno);
+	}
+	
+	return false;
+}
+
+static Oid
+get_vector_distance_operator(char *opname)
+{
+	Oid			vector_oid;
+	Oid			op_oid;
+	
+	vector_oid = TypenameGetTypid("vector");
+	if (!OidIsValid(vector_oid))
+		return InvalidOid;
+	
+	op_oid = OpernameGetOprid(list_make1(makeString(opname)), vector_oid, vector_oid);
+	
+	return op_oid;
+}
+
+static Node *
+rewrite_embedding_orderby_expr(Node *node, Query *query)
+{
+	OpExpr	   *opexpr;
+	Node	   *left;
+	Node	   *right;
+	Var		   *var;
+	RangeTblEntry *rte;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			attnum;
+	char	   *colname;
+	char	   *embedding_colname;
+	Oid			embedding_func_oid;
+	FmgrInfo	flinfo;
+	Datum		embedding_result;
+	Const	   *const_node;
+	Const	   *new_const;
+	Oid			vector_oid;
+	char	   *opname;
+	Oid			vector_op_oid;
+	
+	if (!IsA(node, OpExpr))
+		return node;
+	
+	opexpr = (OpExpr *) node;
+	
+	if (!is_vector_distance_operator(opexpr->opno))
+		return node;
+	
+	if (list_length(opexpr->args) != 2)
+		return node;
+	
+	left = linitial(opexpr->args);
+	right = lsecond(opexpr->args);
+	
+	if (!IsA(left, Var))
+		return node;
+	
+	var = (Var *) left;
+	
+	if (var->varno <= 0 || var->varno > list_length(query->rtable))
+		return node;
+	
+	rte = rt_fetch(var->varno, query->rtable);
+	
+	if (rte->rtekind != RTE_RELATION)
+		return node;
+	
+	rel = table_open(rte->relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	
+	if (var->varattno <= 0 || var->varattno > tupdesc->natts)
+	{
+		table_close(rel, AccessShareLock);
+		return node;
+	}
+	
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, var->varattno - 1);
+		
+		if (!attr->attembedding)
+		{
+			table_close(rel, AccessShareLock);
+			return node;
+		}
+		
+		colname = pstrdup(NameStr(attr->attname));
+	}
+	
+	embedding_colname = psprintf("%s_embedding", colname);
+	
+	{
+		AttrNumber	embedding_attnum;
+		Var		   *new_var;
+		
+		embedding_attnum = InvalidAttrNumber;
+		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+			if (namestrcmp(&attr->attname, embedding_colname) == 0)
+			{
+				embedding_attnum = attnum;
+				break;
+			}
+		}
+		
+		if (embedding_attnum == InvalidAttrNumber)
+		{
+			pfree(colname);
+			pfree(embedding_colname);
+			table_close(rel, AccessShareLock);
+			return node;
+		}
+		
+		new_var = makeVar(var->varno, embedding_attnum, 
+						  get_atttype(rte->relid, embedding_attnum),
+						  -1, InvalidOid, var->varlevelsup);
+		
+		linitial(opexpr->args) = (Node *) new_var;
+	}
+	
+	vector_oid = TypenameGetTypid("vector");
+	if (!OidIsValid(vector_oid))
+	{
+		elog(ERROR, "vector type not found");
+	}
+	
+	opname = get_opname(opexpr->opno);
+	if (opname == NULL)
+	{
+		pfree(colname);
+		pfree(embedding_colname);
+		table_close(rel, AccessShareLock);
+		return node;
+	}
+	
+	vector_op_oid = get_vector_distance_operator(opname);
+	if (!OidIsValid(vector_op_oid))
+	{
+		pfree(opname);
+		pfree(colname);
+		pfree(embedding_colname);
+		table_close(rel, AccessShareLock);
+		elog(LOG, "rewrite_embedding_orderby: vector distance operator not found for %s", opname);
+		return node;
+	}
+	
+	opexpr->opno = vector_op_oid;
+	opexpr->opfuncid = InvalidOid;
+	opexpr->opresulttype = FLOAT8OID;
+	
+	pfree(opname);
+	
+	embedding_func_oid = get_embedding_function_oid(rte->relid, colname);
+	
+	if (!OidIsValid(embedding_func_oid))
+	{
+		elog(LOG, "rewrite_embedding_orderby: no embedding function found for column %s", colname);
+		pfree(colname);
+		pfree(embedding_colname);
+		table_close(rel, AccessShareLock);
+		return node;
+	}
+	
+	if (!IsA(right, Const))
+	{
+		elog(LOG, "rewrite_embedding_orderby: right operand is not a constant, skipping embedding transformation");
+		pfree(colname);
+		pfree(embedding_colname);
+		table_close(rel, AccessShareLock);
+		return node;
+	}
+	
+	const_node = (Const *) right;
+	
+	if (const_node->constisnull)
+	{
+		pfree(colname);
+		pfree(embedding_colname);
+		table_close(rel, AccessShareLock);
+		return node;
+	}
+	
+	{
+		HeapTuple	proc_tuple;
+		Form_pg_proc proc_form;
+		int			nargs;
+		Datum		text_datum;
+		
+		proc_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(embedding_func_oid));
+		if (!HeapTupleIsValid(proc_tuple))
+			elog(ERROR, "cache lookup failed for function %u", embedding_func_oid);
+		
+		proc_form = (Form_pg_proc) GETSTRUCT(proc_tuple);
+		nargs = proc_form->pronargs;
+		
+		if (nargs != 1 || proc_form->proargtypes.values[0] != TEXTOID)
+		{
+			ReleaseSysCache(proc_tuple);
+			elog(LOG, "rewrite_embedding_orderby: embedding function must accept a single text argument. Skipping transformation.");
+			pfree(colname);
+			pfree(embedding_colname);
+			table_close(rel, AccessShareLock);
+			return node;
+		}
+		
+		ReleaseSysCache(proc_tuple);
+		
+		text_datum = const_node->constvalue;
+		
+		fmgr_info(embedding_func_oid, &flinfo);
+		
+		PG_TRY();
+		{
+			embedding_result = FunctionCall1(&flinfo, text_datum);
+		}
+		PG_CATCH();
+		{
+			elog(LOG, "rewrite_embedding_orderby: failed to call embedding function");
+			pfree(colname);
+			pfree(embedding_colname);
+			table_close(rel, AccessShareLock);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		
+		elog(LOG, "rewrite_embedding_orderby: successfully transformed text to vector");
+		
+		new_const = makeConst(vector_oid, -1, InvalidOid, -1,
+							   embedding_result, false, false);
+		
+		lsecond(opexpr->args) = (Node *) new_const;
+	}
+	
+	pfree(colname);
+	pfree(embedding_colname);
+	table_close(rel, AccessShareLock);
+	
+	return node;
+}
+
+static void
+rewrite_embedding_orderby(Query *parsetree)
+{
+	ListCell   *lc;
+	
+	if (parsetree->sortClause == NIL)
+		return;
+	
+	foreach(lc, parsetree->sortClause)
+	{
+		SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle;
+		
+		tle = get_sortgroupclause_tle(sortcl, parsetree->targetList);
+		
+		if (tle->expr)
+		{
+			tle->expr = (Expr *) rewrite_embedding_orderby_expr((Node *) tle->expr, parsetree);
+		}
+	}
 }

@@ -12563,4 +12563,15 @@
   prorettype => 'trigger', proargtypes => '',
   prosrc => 'embedding_trigger' },
 
+# Text vector distance operators
+{ oid => '6503', descr => 'L2 distance between text vectors',
+  proname => 'text_vector_l2_distance', prorettype => 'float8',
+  proargtypes => 'text text', prosrc => 'text_vector_l2_distance' },
+{ oid => '6504', descr => 'cosine distance between text vectors',
+  proname => 'text_vector_cosine_distance', prorettype => 'float8',
+  proargtypes => 'text text', prosrc => 'text_vector_cosine_distance' },
+{ oid => '6505', descr => 'inner product distance between text vectors',
+  proname => 'text_vector_ip_distance', prorettype => 'float8',
+  proargtypes => 'text text', prosrc => 'text_vector_ip_distance' },
+
 ]
