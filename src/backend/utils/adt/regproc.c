@@ -92,7 +92,7 @@ regprocin(PG_FUNCTION_ARGS)
 	if (names == NIL)
 		PG_RETURN_NULL();
 
-	clist = FuncnameGetCandidates(names, -1, NIL, false, false, false, true);
+	clist = FuncnameGetCandidates(names, -1, NIL, false, false, false, true, NULL);
 
 	if (clist == NULL)
 		ereturn(escontext, (Datum) 0,
@@ -169,7 +169,7 @@ regprocout(PG_FUNCTION_ARGS)
 			 * qualify it.
 			 */
 			clist = FuncnameGetCandidates(list_make1(makeString(proname)),
-										  -1, NIL, false, false, false, false);
+										  -1, NIL, false, false, false, false, NULL);
 			if (clist != NULL && clist->next == NULL &&
 				clist->oid == proid)
 				nspname = NULL;
@@ -251,7 +251,7 @@ regprocedurein(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	clist = FuncnameGetCandidates(names, nargs, NIL, false, false,
-								  false, true);
+								  false, true, NULL);
 
 	for (; clist; clist = clist->next)
 	{
@@ -501,7 +501,7 @@ regoperin(PG_FUNCTION_ARGS)
 	if (names == NIL)
 		PG_RETURN_NULL();
 
-	clist = OpernameGetCandidates(names, '\0', true);
+	clist = OpernameGetCandidates(names, '\0', true, NULL);
 
 	if (clist == NULL)
 		ereturn(escontext, (Datum) 0,
@@ -577,7 +577,7 @@ regoperout(PG_FUNCTION_ARGS)
 			 * qualify it.
 			 */
 			clist = OpernameGetCandidates(list_make1(makeString(oprname)),
-										  '\0', false);
+										  '\0', false, NULL);
 			if (clist != NULL && clist->next == NULL &&
 				clist->oid == oprid)
 				result = pstrdup(oprname);

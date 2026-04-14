@@ -1191,7 +1191,7 @@ TypeIsVisibleExt(Oid typid, bool *is_missing)
 FuncCandidateList
 FuncnameGetCandidates(List *names, int nargs, List *argnames,
 					  bool expand_variadic, bool expand_defaults,
-					  bool include_out_arguments, bool missing_ok)
+					  bool include_out_arguments, bool missing_ok, int *fgc_flags)
 {
 	FuncCandidateList resultList = NULL;
 	bool		any_special = false;
@@ -1750,7 +1750,7 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 		visible = false;
 
 		clist = FuncnameGetCandidates(list_make1(makeString(proname)),
-									  nargs, NIL, false, false, false, false);
+									  nargs, NIL, false, false, false, false, NULL);
 
 		for (; clist; clist = clist->next)
 		{
@@ -1885,7 +1885,7 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
  * InvalidOid for a prefix oprkind.  nargs is always 2, too.
  */
 FuncCandidateList
-OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
+OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok, int *fgc_flags)
 {
 	FuncCandidateList resultList = NULL;
 	char	   *resultSpace = NULL;

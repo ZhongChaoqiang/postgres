@@ -1424,7 +1424,7 @@ func_get_detail(List *funcname,
 	/* Get list of possible candidates from namespace search */
 	raw_candidates = FuncnameGetCandidates(funcname, nargs, fargnames,
 										   expand_variadic, expand_defaults,
-										   include_out_arguments, false);
+										   include_out_arguments, false, NULL);
 
 	/*
 	 * Quickly check if there is an exact match to the input datatypes (there
@@ -2062,7 +2062,7 @@ LookupFuncNameInternal(ObjectType objtype, List *funcname,
 
 	/* Get list of candidate objects */
 	clist = FuncnameGetCandidates(funcname, nargs, NIL, false, false,
-								  include_out_arguments, missing_ok);
+								  include_out_arguments, missing_ok, NULL);
 
 	/* Scan list for a match to the arg types (if specified) and the objtype */
 	for (; clist != NULL; clist = clist->next)

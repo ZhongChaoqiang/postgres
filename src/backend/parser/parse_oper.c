@@ -404,7 +404,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 		FuncCandidateList clist;
 
 		/* Get binary operators of given name */
-		clist = OpernameGetCandidates(opname, 'b', false);
+		clist = OpernameGetCandidates(opname, 'b', false, NULL);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
@@ -551,7 +551,7 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 		FuncCandidateList clist;
 
 		/* Get prefix operators of given name */
-		clist = OpernameGetCandidates(op, 'l', false);
+		clist = OpernameGetCandidates(op, 'l', false, NULL);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
