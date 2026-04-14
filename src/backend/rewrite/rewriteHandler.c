@@ -4882,21 +4882,29 @@ rewrite_embedding_expr(Node *node, Query *query)
 	
 	pfree(opname);
 	
-	embedding_func_oid = get_embedding_function_oid(rte->relid, colname);
+	const_node = (Const *) const_operand;
 	
-	if (!OidIsValid(embedding_func_oid))
+	if (const_node->constisnull)
 	{
-		elog(LOG, "rewrite_embedding: no embedding function found for column %s", colname);
 		pfree(colname);
 		pfree(embedding_colname);
 		table_close(rel, AccessShareLock);
 		return node;
 	}
 	
-	const_node = (Const *) const_operand;
-	
-	if (const_node->constisnull)
+	if (const_node->consttype == vector_oid)
 	{
+		pfree(colname);
+		pfree(embedding_colname);
+		table_close(rel, AccessShareLock);
+		return node;
+	}
+	
+	embedding_func_oid = get_embedding_function_oid(rte->relid, colname);
+	
+	if (!OidIsValid(embedding_func_oid))
+	{
+		elog(LOG, "rewrite_embedding: no embedding function found for column %s", colname);
 		pfree(colname);
 		pfree(embedding_colname);
 		table_close(rel, AccessShareLock);
