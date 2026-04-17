@@ -48,6 +48,64 @@ CREATE TABLE documents (
 );
 ```
 
+建表时会自动创建以下对象：
+- **隐藏列** `{column}_embedding`：类型为 `vector(vector_len)`，存储嵌入向量
+- **触发器** `pg_embedding_{column}_{oid}`：BEFORE INSERT OR UPDATE，自动调用嵌入函数
+- **向量索引** `{table}_{column}_embedding_idx`：自动创建，默认使用 ivfflat + vector_l2_ops
+
+### 2.1 自动创建向量索引
+
+EMBEDDING 功能在建表时会自动为每个 EMBEDDING 列创建向量索引，无需手动创建。可通过 `vector_index` 和 `vector_distance` 表参数控制索引类型和距离度量：
+
+```sql
+-- 使用 ivfflat 索引 + L2 距离（默认）
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT EMBEDDING
+) WITH (
+    vector_len = 384,
+    embedding_function = 'local_embedding',
+    vector_index = ivfflat,           -- 索引类型: ivfflat 或 hnsw
+    vector_distance = vector_l2_ops   -- 距离度量: vector_l2_ops, vector_cosine_ops, vector_ip_ops
+);
+
+-- 使用 HNSW 索引 + 余弦距离（推荐用于文本搜索）
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT EMBEDDING
+) WITH (
+    vector_len = 384,
+    embedding_function = 'local_embedding',
+    vector_index = hnsw,
+    vector_distance = vector_cosine_ops
+);
+```
+
+**vector_index 参数**（索引类型）：
+
+| 值 | 说明 | 适用场景 |
+|----|------|----------|
+| `ivfflat` | 倒排文件索引（默认） | 数据量较大（>10万行），需要较高召回率 |
+| `hnsw` | 层级可导航小世界图索引 | 低延迟查询，数据量适中 |
+
+**vector_distance 参数**（距离度量）：
+
+| 值 | 操作符 | 说明 | 适用场景 |
+|----|--------|------|----------|
+| `vector_l2_ops` | `<->` | L2/欧几里得距离（默认） | 通用场景 |
+| `vector_cosine_ops` | `<=>` | 余弦距离 | 文本语义相似度搜索（推荐） |
+| `vector_ip_ops` | `<#>` | 内积距离 | 归一化向量的相似度搜索 |
+
+**组合推荐**：
+
+| 场景 | vector_index | vector_distance | 说明 |
+|------|-------------|-----------------|------|
+| 文本语义搜索 | `hnsw` | `vector_cosine_ops` | 最佳文本搜索体验 |
+| 通用向量搜索 | `ivfflat` | `vector_l2_ops` | 默认配置，适合大多数场景 |
+| 推荐系统 | `hnsw` | `vector_ip_ops` | 适合归一化向量 |
+
+> **注意**：如果不指定 `vector_index` 和 `vector_distance` 参数，系统会使用默认值 `ivfflat` + `vector_l2_ops` 自动创建索引。
+
 ### 3. 插入数据（自动向量化）
 
 ```sql
@@ -76,17 +134,21 @@ SELECT * FROM documents ORDER BY content <=> 'search query' LIMIT 10;
 SELECT * FROM documents ORDER BY content <#> 'search query' LIMIT 10;
 ```
 
-### 5. 创建向量索引（加速查询）
+### 5. 向量索引
+
+EMBEDDING 功能在建表时会自动创建向量索引（参见 2.1 节），通常无需手动创建。如需自定义索引参数或重建索引，可使用以下命令：
 
 ```sql
--- ivfflat索引
+-- ivfflat索引（自定义lists参数）
 CREATE INDEX idx_embedding ON documents 
 USING ivfflat (content_embedding) WITH (lists = 100);
 
--- HNSW索引（更高性能）
+-- HNSW索引（自定义m和ef_construction参数）
 CREATE INDEX idx_embedding_hnsw ON documents 
 USING hnsw (content_embedding) WITH (m = 16, ef_construction = 64);
 ```
+
+> **提示**：ivfflat 索引在数据量较少时创建会提示低召回率，建议在数据量达到一定规模后再创建。HNSW 索引没有此限制。
 
 ## 性能优化
 
@@ -176,7 +238,8 @@ CREATE TABLE articles (
     id SERIAL PRIMARY KEY,
     title TEXT,
     body TEXT EMBEDDING
-) WITH (vector_len = 384, embedding_function = 'local_embedding');
+) WITH (vector_len = 384, embedding_function = 'local_embedding',
+        vector_index = hnsw, vector_distance = vector_cosine_ops);
 
 -- 搜索相关文章
 SELECT title, body
@@ -192,12 +255,13 @@ CREATE TABLE qa_pairs (
     id SERIAL PRIMARY KEY,
     question TEXT EMBEDDING,
     answer TEXT
-) WITH (vector_len = 384, embedding_function = 'local_embedding');
+) WITH (vector_len = 384, embedding_function = 'local_embedding',
+        vector_index = hnsw, vector_distance = vector_cosine_ops);
 
 -- 找到最相似的问题
 SELECT question, answer
 FROM qa_pairs
-ORDER BY question <-> 'user query here'
+ORDER BY question <=> 'user query here'
 LIMIT 1;
 ```
 
@@ -208,13 +272,14 @@ CREATE TABLE products (
     id SERIAL PRIMARY KEY,
     name TEXT,
     description TEXT EMBEDDING
-) WITH (vector_len = 384, embedding_function = 'local_embedding');
+) WITH (vector_len = 384, embedding_function = 'local_embedding',
+        vector_index = hnsw, vector_distance = vector_ip_ops);
 
 -- 相似产品推荐
 SELECT name, description
 FROM products
 WHERE id != :current_product_id
-ORDER BY description <-> (SELECT description FROM products WHERE id = :current_product_id)
+ORDER BY description <#> (SELECT description FROM products WHERE id = :current_product_id)
 LIMIT 5;
 ```
 
@@ -224,8 +289,8 @@ PostgreSQL EMBEDDING功能提供了：
 
 - ✅ 自动向量化（触发器）
 - ✅ 自动查询重写
+- ✅ 自动创建向量索引（支持 ivfflat/hnsw + 多种距离度量）
 - ✅ 支持真实ML模型
-- ✅ 高性能向量索引
 - ✅ 简单易用的SQL接口
 
 让向量搜索像普通SQL查询一样简单！

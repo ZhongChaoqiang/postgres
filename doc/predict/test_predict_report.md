@@ -23,36 +23,7 @@
 
 ---
 
-## 二、发现并修复的 Bug
-
-### Bug 1: ALTER TABLE ADD COLUMN with PREDICT 未创建隐藏列
-
-**问题描述**: 使用 `ALTER TABLE ADD COLUMN score FLOAT PREDICT` 添加 PREDICT 列时，不会自动创建 `_predict` 和 `_actual` 隐藏列，也不会创建触发器。
-
-**根因分析**: `ATExecAddColumn` 函数在添加 PREDICT 列时只创建了触发器，但没有创建隐藏列（`_predict` 和 `_actual`）。隐藏列的创建逻辑仅在 `parse_utilcmd.c` 的 `transformColumnDefinition` 函数中实现，该函数只在 `CREATE TABLE` 时被调用。
-
-**修复方案**: 在 `ATExecAddColumn` 函数中，当检测到 `colDef->is_predict` 为 true 时，直接通过 `InsertPgAttributeTuples` 向 `pg_attribute` 系统表中插入隐藏列的属性元组，并更新 `pg_class` 的 `relnatts` 计数。
-
-**修复文件**: [tablecmds.c](file:///d:/workspace/postgres/src/backend/commands/tablecmds.c)
-
-### Bug 2: predict_trigger UPDATE 操作使用错误的 tuple
-
-**问题描述**: `predict_trigger` 触发器在 UPDATE 操作中使用 `tg_trigtuple`（旧元组）而非 `tg_newtuple`（新元组），导致：
-1. 读取的是旧值而非用户输入的新值
-2. 修改的是旧元组而非新元组
-3. UPDATE 设置 PREDICT 列为 NULL 时无法正确触发预测
-
-**根因分析**: PostgreSQL 中 BEFORE UPDATE 触发器的 `tg_trigtuple` 是旧元组，`tg_newtuple` 是新元组。原代码对所有操作统一使用 `tg_trigtuple`，在 INSERT 时正确（新元组），但在 UPDATE 时错误（应为新元组）。
-
-**修复方案**: 在 `predict_trigger` 和 `embedding_trigger` 函数中，根据触发事件类型选择正确的 tuple：
-- INSERT 操作: 使用 `tg_trigtuple`（新元组）
-- UPDATE 操作: 使用 `tg_newtuple`（新元组）
-
-**修复文件**: [predict.c](file:///d:/workspace/postgres/src/backend/utils/adt/predict.c)
-
----
-
-## 三、详细测试结果
+## 二、详细测试结果
 
 ### 测试1: CREATE TABLE with PREDICT column - 基本DDL
 
@@ -373,7 +344,7 @@ reloptions: `{predict_timing=immediate,predict_function=simple_predict}`
 
 ---
 
-## 四、功能覆盖矩阵
+## 三、功能覆盖矩阵
 
 | 功能模块 | 测试覆盖 | 状态 |
 |----------|----------|------|
@@ -401,16 +372,7 @@ reloptions: `{predict_timing=immediate,predict_function=simple_predict}`
 
 ---
 
-## 五、修改文件清单
-
-| 文件 | 修改内容 |
-|------|----------|
-| [predict.c](file:///d:/workspace/postgres/src/backend/utils/adt/predict.c) | 修复 predict_trigger 和 embedding_trigger 在 UPDATE 操作中使用 tg_newtuple 替代 tg_trigtuple |
-| [tablecmds.c](file:///d:/workspace/postgres/src/backend/commands/tablecmds.c) | 在 ATExecAddColumn 中为 PREDICT 列自动创建 _predict 和 _actual 隐藏列 |
-
----
-
-## 六、已知限制
+## 四、已知限制
 
 1. **ALTER TABLE ADD COLUMN PREDICT 不创建复合索引**: 通过 ALTER TABLE 添加 PREDICT 列时，不会自动创建复合索引（CREATE TABLE 时会创建）。如需索引，需手动创建。
 

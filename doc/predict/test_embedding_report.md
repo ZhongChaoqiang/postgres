@@ -23,21 +23,7 @@
 
 ---
 
-## 二、发现并修复的 Bug
-
-### Bug: ALTER TABLE ADD COLUMN with EMBEDDING 未创建隐藏列
-
-**问题描述**: 使用 `ALTER TABLE ADD COLUMN description TEXT EMBEDDING` 添加 EMBEDDING 列时，不会自动创建 `_embedding` 隐藏列，导致后续查询和嵌入函数调用失败。
-
-**根因分析**: `ATExecAddColumn` 函数在添加 EMBEDDING 列时只创建了触发器，但没有创建 `_embedding` 隐藏列。隐藏列的创建逻辑仅在 `parse_utilcmd.c` 的 `transformColumnDefinition` 函数中实现，该函数只在 `CREATE TABLE` 时被调用。
-
-**修复方案**: 在 `ATExecAddColumn` 函数中，当检测到 `colDef->is_embedding` 为 true 时，直接通过 `InsertPgAttributeTuples` 向 `pg_attribute` 系统表中插入 `_embedding` 隐藏列的属性元组，并更新 `pg_class` 的 `relnatts` 计数。同时从 `reloptions` 中读取 `vector_len` 设置正确的向量维度。
-
-**修复文件**: [tablecmds.c](file:///d:/workspace/postgres/src/backend/commands/tablecmds.c)
-
----
-
-## 三、详细测试结果
+## 二、详细测试结果
 
 ### 测试1: CREATE TABLE with EMBEDDING column - 基本DDL
 
@@ -774,7 +760,7 @@ DROP TABLE test_emb_no_func CASCADE;
 
 ---
 
-## 四、功能覆盖矩阵
+## 三、功能覆盖矩阵
 
 | 功能模块 | 测试覆盖 | 状态 |
 |----------|----------|------|
@@ -805,15 +791,9 @@ DROP TABLE test_emb_no_func CASCADE;
 
 ---
 
-## 五、修改文件清单
 
-| 文件 | 修改内容 |
-|------|----------|
-| [tablecmds.c](file:///d:/workspace/postgres/src/backend/commands/tablecmds.c) | 在 ATExecAddColumn 中为 EMBEDDING 列自动创建 _embedding 隐藏列，从 reloptions 读取 vector_len 设置向量维度 |
 
----
-
-## 六、已知限制
+## 四、已知限制
 
 1. **ALTER TABLE ADD COLUMN EMBEDDING 不创建向量索引**: 通过 ALTER TABLE 添加 EMBEDDING 列时，不会自动创建 ivfflat 向量索引（CREATE TABLE 时会创建）。如需索引，需手动创建。
 
