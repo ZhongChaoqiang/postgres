@@ -96,6 +96,9 @@ typedef struct
 	int			vector_len; /* embedding vector length from WITH options */
 	char	   *vector_index;	/* vector index type from WITH options */
 	char	   *vector_distance; /* vector distance type from WITH options */
+	int			vector_index_lists; /* lists param for ivfflat, -1 = not set */
+	int			vector_index_m;	/* m param for hnsw, -1 = not set */
+	int			vector_index_ef_construction; /* ef_construction param for hnsw, -1 = not set */
 } CreateStmtContext;
 
 /* State shared by transformCreateSchemaStmtElements and its subroutines */
@@ -257,10 +260,13 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.vector_len = 10;	/* default value */
 	cxt.vector_index = "ivfflat";	/* default vector index type */
 	cxt.vector_distance = "vector_l2_ops";	/* default vector distance type */
+	cxt.vector_index_lists = -1;	/* -1 means not specified */
+	cxt.vector_index_m = -1;
+	cxt.vector_index_ef_construction = -1;
 
 	Assert(!stmt->ofTypename || !stmt->inhRelations);	/* grammar enforces */
 
-	/* Extract vector_len, vector_index, vector_distance from WITH options if specified */
+	/* Extract vector_len, vector_index, vector_distance and index params from WITH options if specified */
 	if (stmt->options)
 	{
 		ListCell   *option;
@@ -280,6 +286,18 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 			else if (strcmp(defel->defname, "vector_distance") == 0)
 			{
 				cxt.vector_distance = defGetString(defel);
+			}
+			else if (strcmp(defel->defname, "lists") == 0)
+			{
+				cxt.vector_index_lists = defGetInt32(defel);
+			}
+			else if (strcmp(defel->defname, "m") == 0)
+			{
+				cxt.vector_index_m = defGetInt32(defel);
+			}
+			else if (strcmp(defel->defname, "ef_construction") == 0)
+			{
+				cxt.vector_index_ef_construction = defGetInt32(defel);
 			}
 		}
 	}
@@ -1256,6 +1274,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		{
 			IndexStmt  *index;
 			IndexElem  *iparam;
+			List	   *index_options = NIL;
 
 			index = makeNode(IndexStmt);
 			index->idxname = psprintf("%s_%s_embedding_idx",
@@ -1263,7 +1282,27 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 			index->relation = copyObject(cxt->relation);
 			index->accessMethod = pstrdup(cxt->vector_index);
 			index->tableSpace = NULL;
-			index->options = NIL;
+
+			if (cxt->vector_index_lists != -1)
+			{
+				DefElem    *opt = makeDefElem("lists",
+											  (Node *) makeInteger(cxt->vector_index_lists), -1);
+				index_options = lappend(index_options, opt);
+			}
+			if (cxt->vector_index_m != -1)
+			{
+				DefElem    *opt = makeDefElem("m",
+											  (Node *) makeInteger(cxt->vector_index_m), -1);
+				index_options = lappend(index_options, opt);
+			}
+			if (cxt->vector_index_ef_construction != -1)
+			{
+				DefElem    *opt = makeDefElem("ef_construction",
+											  (Node *) makeInteger(cxt->vector_index_ef_construction), -1);
+				index_options = lappend(index_options, opt);
+			}
+
+			index->options = index_options;
 			index->whereClause = NULL;
 			index->excludeOpNames = NIL;
 			index->idxcomment = NULL;

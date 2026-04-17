@@ -390,6 +390,33 @@ static relopt_int intRelOpts[] =
 		},
 		10, 0, INT_MAX
 	},
+	{
+		{
+			"lists",
+			"Number of lists for ivfflat vector index.",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		-1, -1, INT_MAX
+	},
+	{
+		{
+			"m",
+			"Max connections per layer for hnsw vector index.",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		-1, -1, INT_MAX
+	},
+	{
+		{
+			"ef_construction",
+			"Size of dynamic candidate list for hnsw vector index construction.",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		-1, -1, INT_MAX
+	},
 
 	/* list terminator */
 	{{NULL}}
@@ -2020,7 +2047,13 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vector_index", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, vector_index)},
 		{"vector_distance", RELOPT_TYPE_ENUM,
-		offsetof(StdRdOptions, vector_distance)}
+		offsetof(StdRdOptions, vector_distance)},
+		{"lists", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, lists)},
+		{"m", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, m)},
+		{"ef_construction", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, ef_construction)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

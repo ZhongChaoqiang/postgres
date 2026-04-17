@@ -106,6 +106,64 @@ CREATE TABLE documents (
 
 > **注意**：如果不指定 `vector_index` 和 `vector_distance` 参数，系统会使用默认值 `ivfflat` + `vector_l2_ops` 自动创建索引。
 
+### 2.2 向量索引参数
+
+建表时可以在 WITH 子句中指定向量索引的构建参数，这些参数会自动传递到自动创建的向量索引中：
+
+**ivfflat 索引参数**：
+
+| 参数 | 说明 | 默认值 | 推荐值 |
+|------|------|--------|--------|
+| `lists` | 倒排列表数量 | 无（pgvector自动计算） | √行数，如100万行设1000 |
+
+**hnsw 索引参数**：
+
+| 参数 | 说明 | 默认值 | 推荐值 |
+|------|------|--------|--------|
+| `m` | 每层最大连接数 | 16 | 16~64，越大召回率越高但内存越多 |
+| `ef_construction` | 构建时动态候选列表大小 | 64 | 64~200，越大构建越慢但质量越高 |
+
+```sql
+-- ivfflat 索引 + lists 参数
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT EMBEDDING
+) WITH (
+    vector_len = 384,
+    embedding_function = 'local_embedding',
+    vector_index = ivfflat,
+    vector_distance = vector_l2_ops,
+    lists = 100                    -- ivfflat 倒排列表数量
+);
+
+-- HNSW 索引 + m 和 ef_construction 参数
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT EMBEDDING
+) WITH (
+    vector_len = 384,
+    embedding_function = 'local_embedding',
+    vector_index = hnsw,
+    vector_distance = vector_cosine_ops,
+    m = 16,                        -- HNSW 每层最大连接数
+    ef_construction = 64           -- HNSW 构建时候选列表大小
+);
+```
+
+上述建表语句会自动创建如下索引（等效于手动执行）：
+
+```sql
+-- ivfflat + lists 自动创建的索引等效于：
+CREATE INDEX documents_content_embedding_idx ON documents
+USING ivfflat (content_embedding) WITH (lists = 100);
+
+-- hnsw + m + ef_construction 自动创建的索引等效于：
+CREATE INDEX documents_content_embedding_idx ON documents
+USING hnsw (content_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+```
+
+> **提示**：如果不指定这些参数，pgvector 会使用自身默认值。`lists` 参数建议在数据量较大时设置（推荐为 √行数），`m` 和 `ef_construction` 在对召回率有较高要求时调整。
+
 ### 3. 插入数据（自动向量化）
 
 ```sql
@@ -134,11 +192,14 @@ SELECT * FROM documents ORDER BY content <=> 'search query' LIMIT 10;
 SELECT * FROM documents ORDER BY content <#> 'search query' LIMIT 10;
 ```
 
-### 5. 向量索引
+### 5. 手动创建向量索引（可选）
 
-EMBEDDING 功能在建表时会自动创建向量索引（参见 2.1 节），通常无需手动创建。如需自定义索引参数或重建索引，可使用以下命令：
+EMBEDDING 功能在建表时会自动创建向量索引（参见 2.1 和 2.2 节），通常无需手动创建。如需自定义索引参数或重建索引，可先删除自动创建的索引再手动创建：
 
 ```sql
+-- 删除自动创建的索引
+DROP INDEX documents_content_embedding_idx;
+
 -- ivfflat索引（自定义lists参数）
 CREATE INDEX idx_embedding ON documents 
 USING ivfflat (content_embedding) WITH (lists = 100);
@@ -201,6 +262,7 @@ FROM generate_series(1, 1000) AS i;
 2. **向量维度**：表定义的vector_len必须与模型输出维度一致
 3. **内存使用**：模型会缓存在每个会话的内存中
 4. **网络**：首次下载模型需要网络连接（或使用本地模型）
+5. **索引参数**：`lists` 适用于 ivfflat 索引，`m` 和 `ef_construction` 适用于 hnsw 索引，不相关的参数会被忽略
 
 ## 故障排除
 
@@ -239,12 +301,13 @@ CREATE TABLE articles (
     title TEXT,
     body TEXT EMBEDDING
 ) WITH (vector_len = 384, embedding_function = 'local_embedding',
-        vector_index = hnsw, vector_distance = vector_cosine_ops);
+        vector_index = hnsw, vector_distance = vector_cosine_ops,
+        m = 16, ef_construction = 64);
 
 -- 搜索相关文章
 SELECT title, body
 FROM articles
-ORDER BY body <-> 'machine learning applications'
+ORDER BY body <=> 'machine learning applications'
 LIMIT 10;
 ```
 
@@ -273,7 +336,8 @@ CREATE TABLE products (
     name TEXT,
     description TEXT EMBEDDING
 ) WITH (vector_len = 384, embedding_function = 'local_embedding',
-        vector_index = hnsw, vector_distance = vector_ip_ops);
+        vector_index = hnsw, vector_distance = vector_ip_ops,
+        m = 32, ef_construction = 128);
 
 -- 相似产品推荐
 SELECT name, description
@@ -283,6 +347,18 @@ ORDER BY description <#> (SELECT description FROM products WHERE id = :current_p
 LIMIT 5;
 ```
 
+## WITH 参数完整参考
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `vector_len` | int | 10 | 向量维度，必须与embedding函数输出一致 |
+| `embedding_function` | string | 无 | embedding函数名称 |
+| `vector_index` | enum | ivfflat | 向量索引类型：ivfflat 或 hnsw |
+| `vector_distance` | enum | vector_l2_ops | 距离度量：vector_l2_ops, vector_cosine_ops, vector_ip_ops |
+| `lists` | int | 无 | ivfflat索引的倒排列表数量 |
+| `m` | int | 无 | hnsw索引每层最大连接数 |
+| `ef_construction` | int | 无 | hnsw索引构建时动态候选列表大小 |
+
 ## 总结
 
 PostgreSQL EMBEDDING功能提供了：
@@ -290,6 +366,7 @@ PostgreSQL EMBEDDING功能提供了：
 - ✅ 自动向量化（触发器）
 - ✅ 自动查询重写
 - ✅ 自动创建向量索引（支持 ivfflat/hnsw + 多种距离度量）
+- ✅ 向量索引参数自动传递（lists/m/ef_construction）
 - ✅ 支持真实ML模型
 - ✅ 简单易用的SQL接口
 

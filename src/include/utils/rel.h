@@ -382,6 +382,9 @@ typedef struct StdRdOptions
 	int			vector_len;	/* length of embedding vector for prediction */
 	StdRdOptVectorIndexType vector_index; /* vector index type for embedding columns */
 	StdRdOptVectorDistanceType vector_distance; /* vector distance type for embedding columns */
+	int			lists;		/* number of lists for ivfflat vector index, -1 = not set */
+	int			m;			/* max connections per layer for hnsw vector index, -1 = not set */
+	int			ef_construction; /* size of dynamic candidate list for hnsw, -1 = not set */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
