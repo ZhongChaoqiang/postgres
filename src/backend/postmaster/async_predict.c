@@ -30,6 +30,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
+#include "executor/spi.h"
 #include "funcapi.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -92,6 +93,14 @@ typedef struct AsyncPredictShmemStruct
 } AsyncPredictShmemStruct;
 
 static AsyncPredictShmemStruct *AsyncPredictShmem = NULL;
+
+typedef struct PredictColumnInfo
+{
+	Oid			reloid;
+	AttrNumber	attnum;
+	AttrNumber	predict_attnum;
+	Oid			funcoid;
+} PredictColumnInfo;
 
 /* Forward declarations */
 static void async_predict_process_database(Oid dboid, int worker_slot);
@@ -368,14 +377,17 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 	int			total_rows = 0;
 	MemoryContext cbcontext;
 	MemoryContext oldcontext;
-	TU_UpdateIndexes update_indexes;
 	char	   *relname = RelationGetRelationName(rel);
 	Oid			reloid = RelationGetRelid(rel);
 	AsyncPredictWorkerInfo *wi = &AsyncPredictShmem->workers[worker_slot];
+	int			ret;
+	StringInfoData query;
 
 	cbcontext = AllocSetContextCreate(CurrentMemoryContext,
 									  "async_predict callback",
 									  ALLOCSET_DEFAULT_SIZES);
+
+	SPI_connect();
 
 	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 
@@ -401,44 +413,53 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 				continue;
 			}
 
-			PG_TRY();
 			{
 				Datum		row_datum;
 				Datum		predict_datum;
-				HeapTuple	newtuple;
-				int			modify_attnums[2];
-				Datum		modify_values[2];
-				bool		modify_nulls[2];
+				Oid			typoutput;
+				bool		typIsVarlena;
+				char	   *predict_str;
+				char	   *result_colname;
+				char	   *predict_colname;
+				char	   *rel_quoted;
 
 				row_datum = heap_copy_tuple_as_datum(tuple, tupdesc);
 
 				predict_datum = OidFunctionCall1(funcoid, row_datum);
 
-				/* Set result_predict column */
-				modify_attnums[0] = result_attnum;
-				modify_values[0] = predict_datum;
-				modify_nulls[0] = false;
+				getTypeOutputInfo(FLOAT8OID, &typoutput, &typIsVarlena);
+				predict_str = OidOutputFunctionCall(typoutput, predict_datum);
 
-				/* Set result column to avoid re-prediction */
-				modify_attnums[1] = predict_attnum;
-				modify_values[1] = predict_datum;
-				modify_nulls[1] = false;
+				result_colname = get_attname(reloid, result_attnum, false);
+				predict_colname = get_attname(reloid, predict_attnum, false);
 
-				newtuple = heap_modify_tuple_by_cols(tuple, tupdesc, 2,
-													 modify_attnums,
-													 modify_values, modify_nulls);
+				rel_quoted = quote_identifier(relname);
 
-				simple_heap_update(rel, &tuple->t_self, newtuple, &update_indexes);
+				initStringInfo(&query);
+				appendStringInfo(&query,
+								 "UPDATE %s SET %s = %s, %s = %s WHERE ctid = '(%u,%u)'",
+								 rel_quoted,
+								 quote_identifier(result_colname),
+								 predict_str,
+								 quote_identifier(predict_colname),
+								 predict_str,
+								 ItemPointerGetBlockNumber(&tuple->t_self),
+								 ItemPointerGetOffsetNumber(&tuple->t_self));
 
-				processed++;
+				pfree(result_colname);
+				pfree(predict_colname);
+
+				ret = SPI_execute(query.data, false, 0);
+
+				pfree(query.data);
+
+				if (ret == SPI_OK_UPDATE)
+					processed++;
+				else
+					elog(LOG, "async_predict: SPI_execute failed for table %s (result=%d)", relname, ret);
+
+				CommandCounterIncrement();
 			}
-			PG_CATCH();
-			{
-				EmitErrorReport();
-				FlushErrorState();
-				elog(LOG, "async_predict: error processing tuple in table %s", relname);
-			}
-			PG_END_TRY();
 
 			MemoryContextReset(cbcontext);
 		}
@@ -448,6 +469,8 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 	MemoryContextSwitchTo(oldcontext);
 	MemoryContextDelete(cbcontext);
+
+	SPI_finish();
 
 	LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
 	wi->processing = false;

@@ -598,7 +598,11 @@ predict_trigger(PG_FUNCTION_ARGS)
 
 	rel = trigdata->tg_relation;
 	tupdesc = RelationGetDescr(rel);
-	newtuple = trigdata->tg_trigtuple;
+
+	if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		newtuple = trigdata->tg_newtuple;
+	else
+		newtuple = trigdata->tg_trigtuple;
 
 	/* Get target attnum from trigger argument if provided */
 	target_attnum = InvalidAttrNumber;
@@ -634,8 +638,11 @@ predict_trigger(PG_FUNCTION_ARGS)
 
 		/* This is a PREDICT column */
 
-		/* Get user input value from ORIGINAL tuple (not modified one) */
-		coldatum = heap_getattr(trigdata->tg_trigtuple, attnum, tupdesc, &isnull);
+		/* Get user input value from the new tuple */
+		if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+			coldatum = heap_getattr(trigdata->tg_newtuple, attnum, tupdesc, &isnull);
+		else
+			coldatum = heap_getattr(trigdata->tg_trigtuple, attnum, tupdesc, &isnull);
 		actual_datum = coldatum;
 		actual_isnull = isnull;
 
@@ -700,8 +707,10 @@ predict_trigger(PG_FUNCTION_ARGS)
 					
 					fmgr_info(predict_func_oid, &predict_func);
 					
-					/* Use ORIGINAL tuple for prediction, not modified one */
-					row_datum = heap_copy_tuple_as_datum(trigdata->tg_trigtuple, tupdesc);
+					if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+						row_datum = heap_copy_tuple_as_datum(trigdata->tg_newtuple, tupdesc);
+					else
+						row_datum = heap_copy_tuple_as_datum(trigdata->tg_trigtuple, tupdesc);
 					
 					predict_datum = FunctionCall1(&predict_func, row_datum);
 					predict_isnull = false;
@@ -894,7 +903,11 @@ embedding_trigger(PG_FUNCTION_ARGS)
 
 	rel = trigdata->tg_relation;
 	tupdesc = RelationGetDescr(rel);
-	newtuple = trigdata->tg_trigtuple;
+
+	if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		newtuple = trigdata->tg_newtuple;
+	else
+		newtuple = trigdata->tg_trigtuple;
 
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{

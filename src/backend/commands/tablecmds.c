@@ -7675,18 +7675,191 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	}
 
 	/*
-	 * If the newly added column is a PREDICT column, create the trigger for it.
+	 * If the newly added column is a PREDICT column, create the hidden
+	 * companion columns (_predict, _actual) and the trigger for it.
 	 */
 	if (colDef->is_predict)
 	{
+		ColumnDef  *hidden_col;
+		char	   *predict_colname;
+		char	   *actual_colname;
+		Relation	pgclass_rel;
+		HeapTuple	rel_tup;
+		Form_pg_class rel_form;
+		TupleDesc	hidden_tupdesc;
+		Form_pg_attribute hidden_attr;
+		int			next_attnum;
+
+		predict_colname = psprintf("%s_predict", colDef->colname);
+		actual_colname = psprintf("%s_actual", colDef->colname);
+
+		hidden_col = makeNode(ColumnDef);
+		hidden_col->colname = predict_colname;
+		hidden_col->typeName = copyObject(colDef->typeName);
+		hidden_col->compression = NULL;
+		hidden_col->inhcount = 0;
+		hidden_col->is_local = true;
+		hidden_col->is_not_null = false;
+		hidden_col->is_from_type = false;
+		hidden_col->is_predict = false;
+		hidden_col->is_embedding = false;
+		hidden_col->is_hidden = true;
+		hidden_col->storage = 0;
+		hidden_col->storage_name = NULL;
+		hidden_col->raw_default = NULL;
+		hidden_col->cooked_default = NULL;
+		hidden_col->identity = '\0';
+		hidden_col->identitySequence = NULL;
+		hidden_col->generated = '\0';
+		hidden_col->collClause = NULL;
+		hidden_col->collOid = InvalidOid;
+		hidden_col->constraints = NIL;
+		hidden_col->fdwoptions = NIL;
+		hidden_col->location = -1;
+
+		pgclass_rel = table_open(RelationRelationId, RowExclusiveLock);
+		rel_tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(myrelid));
+		if (!HeapTupleIsValid(rel_tup))
+			elog(ERROR, "cache lookup failed for relation %u", myrelid);
+		rel_form = (Form_pg_class) GETSTRUCT(rel_tup);
+		next_attnum = rel_form->relnatts + 1;
+
+		hidden_tupdesc = BuildDescForRelation(list_make1(hidden_col));
+		hidden_attr = TupleDescAttr(hidden_tupdesc, 0);
+		hidden_attr->attnum = next_attnum;
+		hidden_attr->atthidden = true;
+
+		{
+			Relation	attr_rel = table_open(AttributeRelationId, RowExclusiveLock);
+			InsertPgAttributeTuples(attr_rel, hidden_tupdesc, myrelid, NULL, NULL);
+			table_close(attr_rel, RowExclusiveLock);
+		}
+
+		rel_form->relnatts = next_attnum;
+		CatalogTupleUpdate(pgclass_rel, &rel_tup->t_self, rel_tup);
+		heap_freetuple(rel_tup);
+		table_close(pgclass_rel, RowExclusiveLock);
+		CommandCounterIncrement();
+
+		hidden_col->colname = actual_colname;
+
+		pgclass_rel = table_open(RelationRelationId, RowExclusiveLock);
+		rel_tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(myrelid));
+		if (!HeapTupleIsValid(rel_tup))
+			elog(ERROR, "cache lookup failed for relation %u", myrelid);
+		rel_form = (Form_pg_class) GETSTRUCT(rel_tup);
+		next_attnum = rel_form->relnatts + 1;
+
+		hidden_tupdesc = BuildDescForRelation(list_make1(hidden_col));
+		hidden_attr = TupleDescAttr(hidden_tupdesc, 0);
+		hidden_attr->attnum = next_attnum;
+		hidden_attr->atthidden = true;
+
+		{
+			Relation	attr_rel = table_open(AttributeRelationId, RowExclusiveLock);
+			InsertPgAttributeTuples(attr_rel, hidden_tupdesc, myrelid, NULL, NULL);
+			table_close(attr_rel, RowExclusiveLock);
+		}
+
+		rel_form->relnatts = next_attnum;
+		CatalogTupleUpdate(pgclass_rel, &rel_tup->t_self, rel_tup);
+		heap_freetuple(rel_tup);
+		table_close(pgclass_rel, RowExclusiveLock);
+		CommandCounterIncrement();
+
+		pfree(predict_colname);
+		pfree(actual_colname);
+
 		createPredictTrigger(myrelid, newattnum, colDef->colname);
 	}
 
 	/*
-	 * If the newly added column is an EMBEDDING column, create the trigger for it.
+	 * If the newly added column is an EMBEDDING column, create the hidden
+	 * _embedding companion column and the trigger for it.
 	 */
 	if (colDef->is_embedding)
 	{
+		ColumnDef  *hidden_col;
+		char	   *embedding_colname;
+		Relation	pgclass_rel;
+		HeapTuple	rel_tup;
+		Form_pg_class rel_form;
+		TupleDesc	hidden_tupdesc;
+		Form_pg_attribute hidden_attr;
+		int			next_attnum;
+		TypeName   *vector_typename;
+		A_Const    *typmod_const;
+		int			vec_len = 10;
+
+		if (rel->rd_options)
+		{
+			StdRdOptions *opts = (StdRdOptions *) rel->rd_options;
+			vec_len = opts->vector_len;
+		}
+
+		embedding_colname = psprintf("%s_embedding", colDef->colname);
+
+		vector_typename = makeNode(TypeName);
+		vector_typename->names = list_make1(makeString("vector"));
+
+		typmod_const = makeNode(A_Const);
+		typmod_const->val.ival.type = T_Integer;
+		typmod_const->val.ival.ival = vec_len;
+		typmod_const->location = -1;
+		vector_typename->typmods = list_make1(typmod_const);
+		vector_typename->typemod = -1;
+		vector_typename->location = -1;
+
+		hidden_col = makeNode(ColumnDef);
+		hidden_col->colname = embedding_colname;
+		hidden_col->typeName = vector_typename;
+		hidden_col->compression = NULL;
+		hidden_col->inhcount = 0;
+		hidden_col->is_local = true;
+		hidden_col->is_not_null = false;
+		hidden_col->is_from_type = false;
+		hidden_col->is_predict = false;
+		hidden_col->is_embedding = false;
+		hidden_col->is_hidden = true;
+		hidden_col->storage = 0;
+		hidden_col->storage_name = NULL;
+		hidden_col->raw_default = NULL;
+		hidden_col->cooked_default = NULL;
+		hidden_col->identity = '\0';
+		hidden_col->identitySequence = NULL;
+		hidden_col->generated = '\0';
+		hidden_col->collClause = NULL;
+		hidden_col->collOid = InvalidOid;
+		hidden_col->constraints = NIL;
+		hidden_col->fdwoptions = NIL;
+		hidden_col->location = -1;
+
+		pgclass_rel = table_open(RelationRelationId, RowExclusiveLock);
+		rel_tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(myrelid));
+		if (!HeapTupleIsValid(rel_tup))
+			elog(ERROR, "cache lookup failed for relation %u", myrelid);
+		rel_form = (Form_pg_class) GETSTRUCT(rel_tup);
+		next_attnum = rel_form->relnatts + 1;
+
+		hidden_tupdesc = BuildDescForRelation(list_make1(hidden_col));
+		hidden_attr = TupleDescAttr(hidden_tupdesc, 0);
+		hidden_attr->attnum = next_attnum;
+		hidden_attr->atthidden = true;
+
+		{
+			Relation	attr_rel = table_open(AttributeRelationId, RowExclusiveLock);
+			InsertPgAttributeTuples(attr_rel, hidden_tupdesc, myrelid, NULL, NULL);
+			table_close(attr_rel, RowExclusiveLock);
+		}
+
+		rel_form->relnatts = next_attnum;
+		CatalogTupleUpdate(pgclass_rel, &rel_tup->t_self, rel_tup);
+		heap_freetuple(rel_tup);
+		table_close(pgclass_rel, RowExclusiveLock);
+		CommandCounterIncrement();
+
+		pfree(embedding_colname);
+
 		createEmbeddingTrigger(myrelid, newattnum, colDef->colname);
 	}
 
