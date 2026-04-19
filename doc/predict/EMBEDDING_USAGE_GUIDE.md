@@ -18,13 +18,19 @@ AS $$
 import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
+# 使用会话级缓存，避免重复加载模型
 if 'embedding_model' not in SD:
     from sentence_transformers import SentenceTransformer
     model_path = '/root/sentence_transformers_model'
     SD['embedding_model'] = SentenceTransformer(model_path)
 
+# 获取缓存的模型
 model = SD['embedding_model']
+
+# 生成embedding
 embedding = model.encode(input_text)
+
+# 转换为PostgreSQL vector格式
 return '[' + ','.join(map(str, embedding)) + ']'
 $$ LANGUAGE plpython3u IMMUTABLE;
 ```
@@ -35,21 +41,12 @@ $$ LANGUAGE plpython3u IMMUTABLE;
 CREATE TABLE documents (
     id SERIAL PRIMARY KEY,
     title TEXT,
-    content TEXT EMBEDDING
+    content TEXT EMBEDDING  -- 标记为embedding列
 ) WITH (
-    vector_len = 384,
-    embedding_function = 'local_embedding',
-    vector_index = hnsw,
-    vector_distance = vector_cosine_ops,
-    m = 16,
-    ef_construction = 64
+    vector_len = 384,  -- all-MiniLM-L6-v2输出384维
+    embedding_function = 'local_embedding'
 );
 ```
-
-建表时自动创建：
-- **隐藏列** `{column}_embedding`：类型 `vector(vector_len)`
-- **触发器** `pg_embedding_{column}_{oid}`：自动调用嵌入函数
-- **向量索引** `{table}_{column}_embedding_idx`：自动创建
 
 ### 3. 插入数据（自动向量化）
 
@@ -62,6 +59,13 @@ INSERT INTO documents (title, content) VALUES
 ### 4. 语义搜索
 
 ```sql
+-- 搜索与"database"相关的内容
+SELECT id, title, content
+FROM documents
+ORDER BY content <-> 'database management system'
+LIMIT 10;
+
+-- 使用不同的距离度量
 -- L2距离
 SELECT * FROM documents ORDER BY content <-> 'search query' LIMIT 10;
 
@@ -70,154 +74,19 @@ SELECT * FROM documents ORDER BY content <=> 'search query' LIMIT 10;
 
 -- 内积
 SELECT * FROM documents ORDER BY content <#> 'search query' LIMIT 10;
-
--- L1距离
-SELECT * FROM documents ORDER BY content <+> 'search query' LIMIT 10;
 ```
 
-### 5. 向量函数
-
-EMBEDDING 列可直接用于 pgvector 向量函数，系统自动将列替换为 `_embedding` 列：
+### 5. 创建向量索引（加速查询）
 
 ```sql
--- 距离函数
-SELECT id, l2_distance(content, 'search text') AS dist FROM documents ORDER BY dist;
-SELECT id, cosine_distance(content, 'search text') AS dist FROM documents ORDER BY dist;
-SELECT id, inner_product(content, 'search text') AS ip FROM documents ORDER BY ip;
-SELECT id, l1_distance(content, 'search text') AS dist FROM documents ORDER BY dist;
-
--- 工具函数
-SELECT id, vector_dims(content) AS dims FROM documents;
-SELECT id, vector_norm(content) AS norm FROM documents;
-SELECT id, l2_normalize(content) AS normalized FROM documents;
-```
-
-### 6. 聚合函数
-
-```sql
--- 平均向量
-SELECT avg(content) AS avg_vec FROM documents;
-
--- 分组平均向量
-SELECT category, avg(content) AS avg_vec FROM documents GROUP BY category;
-
--- 向量求和
-SELECT sum(content) AS sum_vec FROM documents;
-```
-
-### 7. 高级查询
-
-```sql
--- WHERE + ORDER BY + SELECT距离
-SELECT id, content, content <=> 'search' AS dist
-FROM documents WHERE category = 'tech' ORDER BY dist LIMIT 5;
-
--- 距离过滤
-SELECT * FROM documents WHERE content <-> 'search' < 0.5;
-
--- CASE表达式
-SELECT id, CASE WHEN content <=> 'search' < 0.5 THEN 'close' ELSE 'far' END AS proximity
-FROM documents;
-
--- JOIN条件
-SELECT a.id, b.id FROM documents a, documents b
-WHERE a.id != b.id AND a.content <-> b.content < 1.0;
-
--- 子查询
-SELECT * FROM documents WHERE id IN (
-    SELECT id FROM documents WHERE content <-> 'search' < 0.5
-);
-```
-
-### 8. 创建向量索引（可选）
-
-建表时已自动创建向量索引。如需自定义：
-
-```sql
-DROP INDEX documents_content_embedding_idx;
-
+-- ivfflat索引
 CREATE INDEX idx_embedding ON documents 
 USING ivfflat (content_embedding) WITH (lists = 100);
 
+-- HNSW索引（更高性能）
 CREATE INDEX idx_embedding_hnsw ON documents 
 USING hnsw (content_embedding) WITH (m = 16, ef_construction = 64);
 ```
-
-## 查询重写机制
-
-EMBEDDING 功能使用**通用 Var 节点替换 walker**，自动遍历整个查询树，将 EMBEDDING 列（text 类型）替换为 `_embedding` 列（vector 类型）。
-
-### 重写范围
-
-| SQL 构造 | 支持状态 | 示例 |
-|----------|---------|------|
-| SELECT 目标列表 | ✅ | `SELECT content <-> 'text' AS dist` |
-| WHERE 子句 | ✅ | `WHERE content <-> 'text' < 0.5` |
-| ORDER BY 子句 | ✅ | `ORDER BY content <=> 'text'` |
-| HAVING 子句 | ✅ | `HAVING avg(content) <-> '[0]' < 1` |
-| JOIN 条件 | ✅ | `ON a.content <-> b.content < 0.5` |
-| CASE 表达式 | ✅ | `CASE WHEN content <=> 'text' < 0.5` |
-| 子查询 | ✅ | `WHERE id IN (SELECT ... WHERE content <-> ...)` |
-| GROUP BY | ✅ | `GROUP BY category` |
-
-### 重写模式
-
-| 模式 | 说明 | 处理方式 |
-|------|------|---------|
-| 距离操作符 | `<->`, `<=>`, `<#>`, `<+>` | 替换列 + 替换操作符 + 转换常量 |
-| 向量函数 | `l2_distance`, `cosine_distance` 等 | 替换列 + 转换常量 |
-| 向量工具函数 | `vector_dims`, `vector_norm` 等 | 替换列 |
-| 向量聚合 | `avg`, `sum` | 替换列 |
-| Var-Var 距离 | `a.content <-> b.content` | 替换两侧列 + 替换操作符 |
-
-## 支持的操作符
-
-| 操作符 | 名称 | 说明 |
-|--------|------|------|
-| `<->` | L2距离 | 欧几里得距离，最常用 |
-| `<=>` | 余弦距离 | 适合文本相似度 |
-| `<#>` | 内积 | 负内积，适合归一化向量 |
-| `<+>` | L1距离 | 曼哈顿距离 |
-
-## 支持的向量函数
-
-### 距离函数
-
-| 函数 | 说明 |
-|------|------|
-| `l2_distance(vector, vector)` | L2/欧几里得距离 |
-| `cosine_distance(vector, vector)` | 余弦距离 |
-| `inner_product(vector, vector)` | 内积 |
-| `l1_distance(vector, vector)` | L1/曼哈顿距离 |
-
-### 工具函数
-
-| 函数 | 说明 |
-|------|------|
-| `vector_dims(vector)` | 向量维度数 |
-| `vector_norm(vector)` | 欧几里得范数 |
-| `l2_normalize(vector)` | L2归一化 |
-| `subvector(vector, int, int)` | 子向量提取 |
-| `binary_quantize(vector)` | 二值量化 |
-
-### 聚合函数
-
-| 函数 | 说明 |
-|------|------|
-| `avg(vector)` | 向量平均值 |
-| `sum(vector)` | 向量求和 |
-
-## WITH 参数完整参考
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `vector_len` | int | 10 | 向量维度，必须与embedding函数输出一致 |
-| `embedding_function` | string | 无 | embedding函数名称 |
-| `vector_index` | enum | ivfflat | 向量索引类型：ivfflat 或 hnsw |
-| `vector_distance` | enum | vector_l2_ops | 距离度量：vector_l2_ops, vector_cosine_ops, vector_ip_ops |
-| `lists` | int | 无 | ivfflat索引的倒排列表数量 |
-| `m` | int | 无 | hnsw索引每层最大连接数 |
-| `ef_construction` | int | 无 | hnsw索引构建时动态候选列表大小 |
 
 ## 性能优化
 
@@ -233,11 +102,21 @@ model = SD['embedding_model']
 
 ### 批量插入
 
+对于大量数据，考虑批量插入：
+
 ```sql
 INSERT INTO documents (title, content)
 SELECT 'Doc' || i, 'Content ' || i
 FROM generate_series(1, 1000) AS i;
 ```
+
+## 支持的操作符
+
+| 操作符 | 名称 | 说明 |
+|--------|------|------|
+| `<->` | L2距离 | 欧几里得距离，最常用 |
+| `<=>` | 余弦距离 | 适合文本相似度 |
+| `<#>` | 内积 | 负内积，适合归一化向量 |
 
 ## 工作原理
 
@@ -247,13 +126,12 @@ FROM generate_series(1, 1000) AS i;
 2. 将文本转换为向量
 3. 存储在`{column}_embedding`列
 
-### 查询时（通用 Var 节点替换 Walker）
+### 查询时
 
-1. 遍历查询树的所有节点（SELECT、WHERE、ORDER BY、HAVING、JOIN、子查询等）
-2. 检测 EMBEDDING 列（text 类型）出现在期望 vector 类型的上下文中
-3. 自动将 EMBEDDING 列替换为 `_embedding` 列（vector 类型）
-4. 将距离操作符替换为 vector 版本
-5. 将文本常量通过 embedding 函数转换为向量常量
+1. 检测ORDER BY中的embedding列和向量操作符
+2. 自动将查询文本转换为向量
+3. 将操作符替换为vector类型的对应操作符
+4. 执行向量搜索
 
 ## 注意事项
 
@@ -261,7 +139,6 @@ FROM generate_series(1, 1000) AS i;
 2. **向量维度**：表定义的vector_len必须与模型输出维度一致
 3. **内存使用**：模型会缓存在每个会话的内存中
 4. **网络**：首次下载模型需要网络连接（或使用本地模型）
-5. **向量函数参数**：使用向量函数时，EMBEDDING 列会自动替换为 `_embedding` 列，文本常量也会自动转换
 
 ## 故障排除
 
@@ -283,7 +160,10 @@ FROM generate_series(1, 1000) AS i;
 
 **解决**：
 ```bash
+# 检查模型是否存在
 ls -la /root/sentence_transformers_model/
+
+# 重新下载模型
 python3 download_model_mirror.py
 ```
 
@@ -296,13 +176,12 @@ CREATE TABLE articles (
     id SERIAL PRIMARY KEY,
     title TEXT,
     body TEXT EMBEDDING
-) WITH (vector_len = 384, embedding_function = 'local_embedding',
-        vector_index = hnsw, vector_distance = vector_cosine_ops,
-        m = 16, ef_construction = 64);
+) WITH (vector_len = 384, embedding_function = 'local_embedding');
 
+-- 搜索相关文章
 SELECT title, body
 FROM articles
-ORDER BY body <=> 'machine learning applications'
+ORDER BY body <-> 'machine learning applications'
 LIMIT 10;
 ```
 
@@ -315,9 +194,10 @@ CREATE TABLE qa_pairs (
     answer TEXT
 ) WITH (vector_len = 384, embedding_function = 'local_embedding');
 
+-- 找到最相似的问题
 SELECT question, answer
 FROM qa_pairs
-ORDER BY question <=> 'user query here'
+ORDER BY question <-> 'user query here'
 LIMIT 1;
 ```
 
@@ -328,9 +208,9 @@ CREATE TABLE products (
     id SERIAL PRIMARY KEY,
     name TEXT,
     description TEXT EMBEDDING
-) WITH (vector_len = 384, embedding_function = 'local_embedding',
-        vector_index = hnsw, vector_distance = vector_ip_ops);
+) WITH (vector_len = 384, embedding_function = 'local_embedding');
 
+-- 相似产品推荐
 SELECT name, description
 FROM products
 WHERE id != :current_product_id
@@ -343,14 +223,9 @@ LIMIT 5;
 PostgreSQL EMBEDDING功能提供了：
 
 - ✅ 自动向量化（触发器）
-- ✅ 通用查询重写（Var节点替换Walker）
-- ✅ 全查询树覆盖（SELECT/WHERE/ORDER BY/HAVING/JOIN/子查询）
-- ✅ 支持距离操作符（`<->`/`<=>`/`<#>`/`<+>`）
-- ✅ 支持向量函数（l2_distance/cosine_distance/vector_dims等）
-- ✅ 支持向量聚合（avg/sum）
-- ✅ 自动创建向量索引（支持 ivfflat/hnsw + 多种距离度量）
-- ✅ 索引参数自动传递（lists/m/ef_construction）
+- ✅ 自动查询重写
 - ✅ 支持真实ML模型
+- ✅ 高性能向量索引
 - ✅ 简单易用的SQL接口
 
 让向量搜索像普通SQL查询一样简单！
