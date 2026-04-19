@@ -106,10 +106,14 @@ static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
 static Node *expand_generated_columns_internal(Node *node, Relation rel, int rt_index,
 											   RangeTblEntry *rte, int result_relation);
 static bool is_vector_distance_operator(Oid opno);
-static Node *rewrite_embedding_expr(Node *node, Query *query);
-static Node *rewrite_embedding_where_expr(Node *node, Query *query);
-static void rewrite_embedding_orderby(Query *parsetree);
-static void rewrite_embedding_where(Query *parsetree);
+static bool is_embedding_var(Var *var, Query *query, Oid *out_relid, int *out_embedding_attnum, char **out_colname);
+static Var *make_embedding_var(Var *old_var, int embedding_attnum, Oid relid);
+static Const *convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname);
+static Node *rewrite_embedding_opexpr(OpExpr *opexpr, Query *query);
+static Node *rewrite_embedding_funcexpr(FuncExpr *funcexpr, Query *query);
+static Node *rewrite_embedding_aggref(Aggref *aggref, Query *query);
+static Node *rewrite_embedding_walker(Node *node, Query *query);
+static void rewrite_embedding_query(Query *parsetree);
 
 
 /*
@@ -4440,8 +4444,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
 
 	if (parsetree->commandType == CMD_SELECT)
 	{
-		rewrite_embedding_where(parsetree);
-		rewrite_embedding_orderby(parsetree);
+		rewrite_embedding_query(parsetree);
 	}
 
 	return rewritten;
@@ -4683,34 +4686,14 @@ is_vector_distance_operator(Oid opno)
 	
 	if (strcmp(opname, "<->") == 0 ||
 		strcmp(opname, "<=>") == 0 ||
-		strcmp(opname, "<#>") == 0)
+		strcmp(opname, "<#>") == 0 ||
+		strcmp(opname, "<+>") == 0)
 	{
 		pfree(opname);
 		return true;
 	}
 	
 	pfree(opname);
-	return false;
-}
-
-static bool
-is_text_vector_distance_operator(Oid opno)
-{
-	Oid			text_oid;
-	Oid			left_type;
-	Oid			right_type;
-	
-	text_oid = TEXTOID;
-	
-	get_opcode(opno);
-	left_type = get_leftop(opno);
-	right_type = get_rightop(opno);
-	
-	if (left_type == text_oid && right_type == text_oid)
-	{
-		return is_vector_distance_operator(opno);
-	}
-	
 	return false;
 }
 
@@ -4729,273 +4712,404 @@ get_vector_distance_operator(char *opname)
 	return op_oid;
 }
 
-static Node *
-rewrite_embedding_expr(Node *node, Query *query)
+static bool
+is_embedding_var(Var *var, Query *query, Oid *out_relid, int *out_embedding_attnum, char **out_colname)
 {
-	OpExpr	   *opexpr;
-	Node	   *left;
-	Node	   *right;
-	Var		   *var;
-	Node	   *const_operand;
-	bool		var_on_left;
 	RangeTblEntry *rte;
 	Relation	rel;
 	TupleDesc	tupdesc;
 	int			attnum;
+	Form_pg_attribute attr;
 	char	   *colname;
 	char	   *embedding_colname;
-	Oid			embedding_func_oid;
-	FmgrInfo	flinfo;
-	Datum		embedding_result;
-	Const	   *const_node;
-	Const	   *new_const;
-	Oid			vector_oid;
-	char	   *opname;
-	Oid			vector_op_oid;
-	
-	if (!IsA(node, OpExpr))
-		return node;
-	
-	opexpr = (OpExpr *) node;
-	
-	if (!is_vector_distance_operator(opexpr->opno))
-		return node;
-	
-	if (list_length(opexpr->args) != 2)
-		return node;
-	
-	left = linitial(opexpr->args);
-	right = lsecond(opexpr->args);
-	
-	var_on_left = false;
-	var = NULL;
-	const_operand = NULL;
-	
-	if (IsA(left, Var) && IsA(right, Const))
-	{
-		var = (Var *) left;
-		const_operand = right;
-		var_on_left = true;
-	}
-	else if (IsA(right, Var) && IsA(left, Const))
-	{
-		var = (Var *) right;
-		const_operand = left;
-		var_on_left = false;
-	}
-	else
-		return node;
+	AttrNumber	embedding_attnum;
 	
 	if (var->varno <= 0 || var->varno > list_length(query->rtable))
-		return node;
+		return false;
 	
 	rte = rt_fetch(var->varno, query->rtable);
-	
 	if (rte->rtekind != RTE_RELATION)
-		return node;
+		return false;
+	if (var->varattno <= 0)
+		return false;
 	
 	rel = table_open(rte->relid, AccessShareLock);
 	tupdesc = RelationGetDescr(rel);
 	
-	if (var->varattno <= 0 || var->varattno > tupdesc->natts)
+	if (var->varattno > tupdesc->natts)
 	{
 		table_close(rel, AccessShareLock);
-		return node;
+		return false;
 	}
 	
+	attr = TupleDescAttr(tupdesc, var->varattno - 1);
+	if (!attr->attembedding)
 	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, var->varattno - 1);
-		
-		if (!attr->attembedding)
-		{
-			table_close(rel, AccessShareLock);
-			return node;
-		}
-		
-		colname = pstrdup(NameStr(attr->attname));
+		table_close(rel, AccessShareLock);
+		return false;
 	}
 	
+	colname = pstrdup(NameStr(attr->attname));
 	embedding_colname = psprintf("%s_embedding", colname);
 	
+	embedding_attnum = InvalidAttrNumber;
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
-		AttrNumber	embedding_attnum;
-		Var		   *new_var;
-		
-		embedding_attnum = InvalidAttrNumber;
-		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+		Form_pg_attribute eattr = TupleDescAttr(tupdesc, attnum - 1);
+		if (namestrcmp(&eattr->attname, embedding_colname) == 0)
 		{
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
-			if (namestrcmp(&attr->attname, embedding_colname) == 0)
-			{
-				embedding_attnum = attnum;
-				break;
-			}
+			embedding_attnum = attnum;
+			break;
 		}
-		
-		if (embedding_attnum == InvalidAttrNumber)
-		{
-			pfree(colname);
-			pfree(embedding_colname);
-			table_close(rel, AccessShareLock);
-			return node;
-		}
-		
-		new_var = makeVar(var->varno, embedding_attnum, 
-						  get_atttype(rte->relid, embedding_attnum),
-						  -1, InvalidOid, var->varlevelsup);
-		
-		if (var_on_left)
-			linitial(opexpr->args) = (Node *) new_var;
-		else
-			lsecond(opexpr->args) = (Node *) new_var;
 	}
+	pfree(embedding_colname);
+	
+	if (embedding_attnum == InvalidAttrNumber)
+	{
+		pfree(colname);
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+	
+	if (out_relid)
+		*out_relid = rte->relid;
+	if (out_embedding_attnum)
+		*out_embedding_attnum = embedding_attnum;
+	if (out_colname)
+		*out_colname = colname;
+	else
+		pfree(colname);
+	
+	table_close(rel, AccessShareLock);
+	return true;
+}
+
+static Var *
+make_embedding_var(Var *old_var, int embedding_attnum, Oid relid)
+{
+	return makeVar(old_var->varno, embedding_attnum,
+				   get_atttype(relid, embedding_attnum),
+				   -1, InvalidOid, old_var->varlevelsup);
+}
+
+static Const *
+convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname)
+{
+	Oid			vector_oid;
+	Oid			embedding_func_oid;
+	FmgrInfo	flinfo;
+	Datum		embedding_result;
+	HeapTuple	proc_tuple;
+	Form_pg_proc proc_form;
+	Datum		text_datum;
 	
 	vector_oid = TypenameGetTypid("vector");
 	if (!OidIsValid(vector_oid))
-	{
-		elog(ERROR, "vector type not found");
-	}
+		return NULL;
+	if (text_const->constisnull)
+		return NULL;
+	if (text_const->consttype == vector_oid)
+		return NULL;
 	
-	opname = get_opname(opexpr->opno);
-	if (opname == NULL)
-	{
-		pfree(colname);
-		pfree(embedding_colname);
-		table_close(rel, AccessShareLock);
-		return node;
-	}
-	
-	vector_op_oid = get_vector_distance_operator(opname);
-	if (!OidIsValid(vector_op_oid))
-	{
-		pfree(opname);
-		pfree(colname);
-		pfree(embedding_colname);
-		table_close(rel, AccessShareLock);
-		elog(LOG, "rewrite_embedding: vector distance operator not found for %s", opname);
-		return node;
-	}
-	
-	opexpr->opno = vector_op_oid;
-	opexpr->opfuncid = InvalidOid;
-	opexpr->opresulttype = FLOAT8OID;
-	
-	pfree(opname);
-	
-	const_node = (Const *) const_operand;
-	
-	if (const_node->constisnull)
-	{
-		pfree(colname);
-		pfree(embedding_colname);
-		table_close(rel, AccessShareLock);
-		return node;
-	}
-	
-	if (const_node->consttype == vector_oid)
-	{
-		pfree(colname);
-		pfree(embedding_colname);
-		table_close(rel, AccessShareLock);
-		return node;
-	}
-	
-	embedding_func_oid = get_embedding_function_oid(rte->relid, colname);
-	
+	embedding_func_oid = get_embedding_function_oid(relid, colname);
 	if (!OidIsValid(embedding_func_oid))
 	{
 		elog(LOG, "rewrite_embedding: no embedding function found for column %s", colname);
-		pfree(colname);
-		pfree(embedding_colname);
-		table_close(rel, AccessShareLock);
-		return node;
+		return NULL;
 	}
 	
+	proc_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(embedding_func_oid));
+	if (!HeapTupleIsValid(proc_tuple))
+		elog(ERROR, "cache lookup failed for function %u", embedding_func_oid);
+	
+	proc_form = (Form_pg_proc) GETSTRUCT(proc_tuple);
+	if (proc_form->pronargs != 1 || proc_form->proargtypes.values[0] != TEXTOID)
 	{
-		HeapTuple	proc_tuple;
-		Form_pg_proc proc_form;
-		int			nargs;
-		Datum		text_datum;
-		
-		proc_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(embedding_func_oid));
-		if (!HeapTupleIsValid(proc_tuple))
-			elog(ERROR, "cache lookup failed for function %u", embedding_func_oid);
-		
-		proc_form = (Form_pg_proc) GETSTRUCT(proc_tuple);
-		nargs = proc_form->pronargs;
-		
-		if (nargs != 1 || proc_form->proargtypes.values[0] != TEXTOID)
-		{
-			ReleaseSysCache(proc_tuple);
-			elog(LOG, "rewrite_embedding: embedding function must accept a single text argument. Skipping transformation.");
-			pfree(colname);
-			pfree(embedding_colname);
-			table_close(rel, AccessShareLock);
-			return node;
-		}
-		
 		ReleaseSysCache(proc_tuple);
-		
-		text_datum = const_node->constvalue;
-		
-		fmgr_info(embedding_func_oid, &flinfo);
-		
-		PG_TRY();
-		{
-			embedding_result = FunctionCall1(&flinfo, text_datum);
-		}
-		PG_CATCH();
-		{
-			elog(LOG, "rewrite_embedding: failed to call embedding function");
-			pfree(colname);
-			pfree(embedding_colname);
-			table_close(rel, AccessShareLock);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-		
-		elog(LOG, "rewrite_embedding: successfully transformed text to vector");
-		
-		new_const = makeConst(vector_oid, -1, InvalidOid, -1,
-							   embedding_result, false, false);
-		
-		if (var_on_left)
-			lsecond(opexpr->args) = (Node *) new_const;
-		else
-			linitial(opexpr->args) = (Node *) new_const;
+		elog(LOG, "rewrite_embedding: embedding function must accept a single text argument");
+		return NULL;
 	}
+	ReleaseSysCache(proc_tuple);
 	
-	pfree(colname);
-	pfree(embedding_colname);
-	table_close(rel, AccessShareLock);
+	text_datum = text_const->constvalue;
+	fmgr_info(embedding_func_oid, &flinfo);
 	
-	return node;
-}
-
-static void
-rewrite_embedding_orderby(Query *parsetree)
-{
-	ListCell   *lc;
-	
-	if (parsetree->sortClause == NIL)
-		return;
-	
-	foreach(lc, parsetree->sortClause)
+	PG_TRY();
 	{
-		SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
-		TargetEntry *tle;
-		
-		tle = get_sortgroupclause_tle(sortcl, parsetree->targetList);
-		
-		if (tle->expr)
-		{
-			tle->expr = (Expr *) rewrite_embedding_expr((Node *) tle->expr, parsetree);
-		}
+		embedding_result = FunctionCall1(&flinfo, text_datum);
 	}
+	PG_CATCH();
+	{
+		elog(LOG, "rewrite_embedding: failed to call embedding function");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	
+	elog(LOG, "rewrite_embedding: successfully transformed text to vector");
+	return makeConst(vector_oid, -1, InvalidOid, -1,
+					 embedding_result, false, false);
 }
 
 static Node *
-rewrite_embedding_where_expr(Node *node, Query *query)
+rewrite_embedding_opexpr(OpExpr *opexpr, Query *query)
+{
+	Node	   *left;
+	Node	   *right;
+	Oid			relid;
+	int			embedding_attnum;
+	char	   *colname;
+	Var		   *new_var;
+	Const	   *new_const;
+	char	   *opname;
+	Oid			vector_op_oid;
+	
+	if (!is_vector_distance_operator(opexpr->opno))
+		return (Node *) opexpr;
+	
+	if (list_length(opexpr->args) != 2)
+		return (Node *) opexpr;
+	
+	left = linitial(opexpr->args);
+	right = lsecond(opexpr->args);
+	
+	if (IsA(left, Var) && IsA(right, Const))
+	{
+		Var	   *var = (Var *) left;
+		
+		if (is_embedding_var(var, query, &relid, &embedding_attnum, &colname))
+		{
+			new_var = make_embedding_var(var, embedding_attnum, relid);
+			linitial(opexpr->args) = (Node *) new_var;
+			
+			opname = get_opname(opexpr->opno);
+			if (opname)
+			{
+				vector_op_oid = get_vector_distance_operator(opname);
+				if (OidIsValid(vector_op_oid))
+				{
+					opexpr->opno = vector_op_oid;
+					opexpr->opfuncid = InvalidOid;
+					opexpr->opresulttype = FLOAT8OID;
+				}
+				pfree(opname);
+			}
+			
+			new_const = convert_text_to_vector_const((Const *) right, relid, colname);
+			pfree(colname);
+			if (new_const)
+				lsecond(opexpr->args) = (Node *) new_const;
+		}
+	}
+	else if (IsA(right, Var) && IsA(left, Const))
+	{
+		Var	   *var = (Var *) right;
+		
+		if (is_embedding_var(var, query, &relid, &embedding_attnum, &colname))
+		{
+			new_var = make_embedding_var(var, embedding_attnum, relid);
+			lsecond(opexpr->args) = (Node *) new_var;
+			
+			opname = get_opname(opexpr->opno);
+			if (opname)
+			{
+				vector_op_oid = get_vector_distance_operator(opname);
+				if (OidIsValid(vector_op_oid))
+				{
+					opexpr->opno = vector_op_oid;
+					opexpr->opfuncid = InvalidOid;
+					opexpr->opresulttype = FLOAT8OID;
+				}
+				pfree(opname);
+			}
+			
+			new_const = convert_text_to_vector_const((Const *) left, relid, colname);
+			pfree(colname);
+			if (new_const)
+				linitial(opexpr->args) = (Node *) new_const;
+		}
+	}
+	else if (IsA(left, Var) && IsA(right, Var))
+	{
+		Var	   *left_var = (Var *) left;
+		Var	   *right_var = (Var *) right;
+		Oid		left_relid, right_relid;
+		int		left_attnum, right_attnum;
+		char   *left_colname = NULL, *right_colname = NULL;
+		bool	left_is_emb, right_is_emb;
+		
+		left_is_emb = is_embedding_var(left_var, query, &left_relid, &left_attnum, &left_colname);
+		right_is_emb = is_embedding_var(right_var, query, &right_relid, &right_attnum, &right_colname);
+		
+		if (left_is_emb)
+		{
+			new_var = make_embedding_var(left_var, left_attnum, left_relid);
+			linitial(opexpr->args) = (Node *) new_var;
+			if (left_colname) pfree(left_colname);
+		}
+		if (right_is_emb)
+		{
+			new_var = make_embedding_var(right_var, right_attnum, right_relid);
+			lsecond(opexpr->args) = (Node *) new_var;
+			if (right_colname) pfree(right_colname);
+		}
+		
+		if (left_is_emb || right_is_emb)
+		{
+			opname = get_opname(opexpr->opno);
+			if (opname)
+			{
+				vector_op_oid = get_vector_distance_operator(opname);
+				if (OidIsValid(vector_op_oid))
+				{
+					opexpr->opno = vector_op_oid;
+					opexpr->opfuncid = InvalidOid;
+					opexpr->opresulttype = FLOAT8OID;
+				}
+				pfree(opname);
+			}
+		}
+	}
+	
+	return (Node *) opexpr;
+}
+
+static Node *
+rewrite_embedding_funcexpr(FuncExpr *funcexpr, Query *query)
+{
+	Oid			vector_oid;
+	HeapTuple	proc_tuple;
+	Form_pg_proc proc_form;
+	int			nargs;
+	int			argno;
+	ListCell   *lc;
+	
+	vector_oid = TypenameGetTypid("vector");
+	if (!OidIsValid(vector_oid))
+		return (Node *) funcexpr;
+	
+	proc_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcexpr->funcid));
+	if (!HeapTupleIsValid(proc_tuple))
+		return (Node *) funcexpr;
+	
+	proc_form = (Form_pg_proc) GETSTRUCT(proc_tuple);
+	nargs = proc_form->pronargs;
+	
+	argno = 0;
+	foreach(lc, funcexpr->args)
+	{
+		Node	   *arg = (Node *) lfirst(lc);
+		Oid			expected_type;
+		
+		if (argno >= nargs)
+			break;
+		
+		expected_type = proc_form->proargtypes.values[argno];
+		
+		if (expected_type == vector_oid)
+		{
+			if (IsA(arg, Var))
+			{
+				Var	   *var = (Var *) arg;
+				Oid		relid;
+				int		embedding_attnum;
+				char   *colname;
+				
+				if (is_embedding_var(var, query, &relid, &embedding_attnum, &colname))
+				{
+					Var	   *new_var = make_embedding_var(var, embedding_attnum, relid);
+					lfirst(lc) = (Node *) new_var;
+					pfree(colname);
+				}
+			}
+			else if (IsA(arg, Const))
+			{
+				Const  *const_node = (Const *) arg;
+				
+				if (!const_node->constisnull && const_node->consttype == TEXTOID)
+				{
+					Oid		emb_relid = InvalidOid;
+					char   *emb_colname = NULL;
+					int		emb_attnum;
+					ListCell *lc2;
+					
+					foreach(lc2, funcexpr->args)
+					{
+						Node *other_arg = (Node *) lfirst(lc2);
+						if (IsA(other_arg, Var))
+						{
+							if (is_embedding_var((Var *) other_arg, query,
+												 &emb_relid, &emb_attnum, &emb_colname))
+								break;
+						}
+					}
+					
+					if (OidIsValid(emb_relid) && emb_colname)
+					{
+						Const  *new_const = convert_text_to_vector_const(const_node, emb_relid, emb_colname);
+						if (new_const)
+							lfirst(lc) = (Node *) new_const;
+						pfree(emb_colname);
+					}
+				}
+			}
+		}
+		
+		argno++;
+	}
+	
+	ReleaseSysCache(proc_tuple);
+	return (Node *) funcexpr;
+}
+
+static Node *
+rewrite_embedding_aggref(Aggref *aggref, Query *query)
+{
+	Oid			vector_oid;
+	HeapTuple	proc_tuple;
+	Form_pg_proc proc_form;
+	int			nargs;
+	ListCell   *lc;
+	
+	vector_oid = TypenameGetTypid("vector");
+	if (!OidIsValid(vector_oid))
+		return (Node *) aggref;
+	
+	proc_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(aggref->aggfnoid));
+	if (!HeapTupleIsValid(proc_tuple))
+		return (Node *) aggref;
+	
+	proc_form = (Form_pg_proc) GETSTRUCT(proc_tuple);
+	nargs = proc_form->pronargs;
+	ReleaseSysCache(proc_tuple);
+	
+	if (nargs < 1)
+		return (Node *) aggref;
+	
+	foreach(lc, aggref->args)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		
+		if (IsA(tle->expr, Var))
+		{
+			Var	   *var = (Var *) tle->expr;
+			Oid		relid;
+			int		embedding_attnum;
+			char   *colname;
+			
+			if (is_embedding_var(var, query, &relid, &embedding_attnum, &colname))
+			{
+				Var	   *new_var = make_embedding_var(var, embedding_attnum, relid);
+				tle->expr = (Expr *) new_var;
+				pfree(colname);
+			}
+		}
+	}
+	
+	return (Node *) aggref;
+}
+
+static Node *
+rewrite_embedding_walker(Node *node, Query *query)
 {
 	if (node == NULL)
 		return NULL;
@@ -5003,22 +5117,31 @@ rewrite_embedding_where_expr(Node *node, Query *query)
 	if (IsA(node, OpExpr))
 	{
 		OpExpr	   *opexpr = (OpExpr *) node;
-		Node	   *left;
-		Node	   *right;
 
 		if (is_vector_distance_operator(opexpr->opno) &&
 			list_length(opexpr->args) == 2)
 		{
-			return rewrite_embedding_expr(node, query);
+			return rewrite_embedding_opexpr(opexpr, query);
 		}
 
-		left = linitial(opexpr->args);
-		right = lsecond(opexpr->args);
-		left = rewrite_embedding_where_expr(left, query);
-		right = rewrite_embedding_where_expr(right, query);
-		linitial(opexpr->args) = left;
-		lsecond(opexpr->args) = right;
+		{
+			ListCell   *lc;
+			foreach(lc, opexpr->args)
+			{
+				lfirst(lc) = rewrite_embedding_walker((Node *) lfirst(lc), query);
+			}
+		}
 		return node;
+	}
+
+	if (IsA(node, FuncExpr))
+	{
+		return rewrite_embedding_funcexpr((FuncExpr *) node, query);
+	}
+
+	if (IsA(node, Aggref))
+	{
+		return rewrite_embedding_aggref((Aggref *) node, query);
 	}
 
 	if (IsA(node, BoolExpr))
@@ -5028,7 +5151,7 @@ rewrite_embedding_where_expr(Node *node, Query *query)
 
 		foreach(lc, boolexpr->args)
 		{
-			lfirst(lc) = rewrite_embedding_where_expr((Node *) lfirst(lc), query);
+			lfirst(lc) = rewrite_embedding_walker((Node *) lfirst(lc), query);
 		}
 		return node;
 	}
@@ -5040,19 +5163,7 @@ rewrite_embedding_where_expr(Node *node, Query *query)
 
 		foreach(lc, saop->args)
 		{
-			lfirst(lc) = rewrite_embedding_where_expr((Node *) lfirst(lc), query);
-		}
-		return node;
-	}
-
-	if (IsA(node, FuncExpr))
-	{
-		FuncExpr   *funcexpr = (FuncExpr *) node;
-		ListCell   *lc;
-
-		foreach(lc, funcexpr->args)
-		{
-			lfirst(lc) = rewrite_embedding_where_expr((Node *) lfirst(lc), query);
+			lfirst(lc) = rewrite_embedding_walker((Node *) lfirst(lc), query);
 		}
 		return node;
 	}
@@ -5060,14 +5171,14 @@ rewrite_embedding_where_expr(Node *node, Query *query)
 	if (IsA(node, RelabelType))
 	{
 		RelabelType *rt = (RelabelType *) node;
-		rt->arg = (Expr *) rewrite_embedding_where_expr((Node *) rt->arg, query);
+		rt->arg = (Expr *) rewrite_embedding_walker((Node *) rt->arg, query);
 		return node;
 	}
 
 	if (IsA(node, CoerceToDomain))
 	{
 		CoerceToDomain *cd = (CoerceToDomain *) node;
-		cd->arg = (Expr *) rewrite_embedding_where_expr((Node *) cd->arg, query);
+		cd->arg = (Expr *) rewrite_embedding_walker((Node *) cd->arg, query);
 		return node;
 	}
 
@@ -5076,28 +5187,65 @@ rewrite_embedding_where_expr(Node *node, Query *query)
 		CaseExpr   *caseexpr = (CaseExpr *) node;
 		ListCell   *lc;
 
-		caseexpr->arg = (Expr *) rewrite_embedding_where_expr((Node *) caseexpr->arg, query);
+		caseexpr->arg = (Expr *) rewrite_embedding_walker((Node *) caseexpr->arg, query);
 		foreach(lc, caseexpr->args)
 		{
 			CaseWhen   *casewhen = (CaseWhen *) lfirst(lc);
-			casewhen->expr = (Expr *) rewrite_embedding_where_expr((Node *) casewhen->expr, query);
-			casewhen->result = (Expr *) rewrite_embedding_where_expr((Node *) casewhen->result, query);
+			casewhen->expr = (Expr *) rewrite_embedding_walker((Node *) casewhen->expr, query);
+			casewhen->result = (Expr *) rewrite_embedding_walker((Node *) casewhen->result, query);
 		}
-		caseexpr->defresult = (Expr *) rewrite_embedding_where_expr((Node *) caseexpr->defresult, query);
+		caseexpr->defresult = (Expr *) rewrite_embedding_walker((Node *) caseexpr->defresult, query);
 		return node;
 	}
 
 	if (IsA(node, NullTest))
 	{
 		NullTest   *nt = (NullTest *) node;
-		nt->arg = (Expr *) rewrite_embedding_where_expr((Node *) nt->arg, query);
+		nt->arg = (Expr *) rewrite_embedding_walker((Node *) nt->arg, query);
 		return node;
 	}
 
 	if (IsA(node, BooleanTest))
 	{
 		BooleanTest *bt = (BooleanTest *) node;
-		bt->arg = (Expr *) rewrite_embedding_where_expr((Node *) bt->arg, query);
+		bt->arg = (Expr *) rewrite_embedding_walker((Node *) bt->arg, query);
+		return node;
+	}
+
+	if (IsA(node, TargetEntry))
+	{
+		TargetEntry *tle = (TargetEntry *) node;
+		tle->expr = (Expr *) rewrite_embedding_walker((Node *) tle->expr, query);
+		return node;
+	}
+
+	if (IsA(node, List))
+	{
+		ListCell   *lc;
+
+		foreach(lc, (List *) node)
+		{
+			lfirst(lc) = rewrite_embedding_walker((Node *) lfirst(lc), query);
+		}
+		return node;
+	}
+
+	if (IsA(node, SubLink))
+	{
+		SubLink    *sublink = (SubLink *) node;
+		
+		if (sublink->subselect)
+		{
+			Query	   *subquery = (Query *) sublink->subselect;
+			
+			rewrite_embedding_query(subquery);
+		}
+		
+		if (sublink->testexpr)
+		{
+			sublink->testexpr = (Node *) rewrite_embedding_walker(sublink->testexpr, query);
+		}
+		
 		return node;
 	}
 
@@ -5105,10 +5253,98 @@ rewrite_embedding_where_expr(Node *node, Query *query)
 }
 
 static void
-rewrite_embedding_where(Query *parsetree)
+rewrite_embedding_walk_jointree(Node *jtnode, Query *query)
 {
-	if (parsetree->jointree == NULL || parsetree->jointree->quals == NULL)
+	if (jtnode == NULL)
 		return;
 
-	parsetree->jointree->quals = rewrite_embedding_where_expr(parsetree->jointree->quals, parsetree);
+	if (IsA(jtnode, RangeTblRef))
+		return;
+
+	if (IsA(jtnode, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jtnode;
+		ListCell   *lc;
+
+		foreach(lc, f->fromlist)
+		{
+			rewrite_embedding_walk_jointree((Node *) lfirst(lc), query);
+		}
+		if (f->quals)
+		{
+			f->quals = rewrite_embedding_walker(f->quals, query);
+		}
+	}
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jtnode;
+
+		rewrite_embedding_walk_jointree(j->larg, query);
+		rewrite_embedding_walk_jointree(j->rarg, query);
+		if (j->quals)
+		{
+			j->quals = rewrite_embedding_walker(j->quals, query);
+		}
+	}
+}
+
+static void
+rewrite_embedding_query(Query *parsetree)
+{
+	ListCell   *lc;
+
+	if (parsetree->targetList)
+	{
+		foreach(lc, parsetree->targetList)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+			if (tle->expr)
+			{
+				tle->expr = (Expr *) rewrite_embedding_walker((Node *) tle->expr, parsetree);
+			}
+		}
+	}
+
+	if (parsetree->jointree)
+	{
+		rewrite_embedding_walk_jointree((Node *) parsetree->jointree, parsetree);
+	}
+
+	if (parsetree->havingQual)
+	{
+		parsetree->havingQual = rewrite_embedding_walker(parsetree->havingQual, parsetree);
+	}
+
+	if (parsetree->sortClause)
+	{
+		foreach(lc, parsetree->sortClause)
+		{
+			SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+			TargetEntry *tle;
+
+			tle = get_sortgroupclause_tle(sortcl, parsetree->targetList);
+
+			if (tle->expr)
+			{
+				tle->expr = (Expr *) rewrite_embedding_walker((Node *) tle->expr, parsetree);
+			}
+		}
+	}
+
+	if (parsetree->groupClause)
+	{
+		foreach(lc, parsetree->groupClause)
+		{
+			SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+			TargetEntry *tle;
+
+			tle = get_sortgroupclause_tle(sortcl, parsetree->targetList);
+
+			if (tle->expr)
+			{
+				tle->expr = (Expr *) rewrite_embedding_walker((Node *) tle->expr, parsetree);
+			}
+		}
+	}
 }

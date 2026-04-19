@@ -27,6 +27,12 @@ EMBEDDING列属性用于标记需要存储嵌入向量的列。当定义一个EM
 | get_embedding_function_oid | ✅ 已完成 | 获取嵌入函数OID |
 | embedding_trigger触发器 | ✅ 已完成 | 自动调用嵌入函数生成向量 |
 | 自动创建触发器 | ✅ 已完成 | 建表时自动创建embedding触发器 |
+| 自动创建向量索引 | ✅ 已完成 | 建表时通过vector_index/vector_distance参数自动创建 |
+| 索引参数自动传递 | ✅ 已完成 | lists/m/ef_construction参数传递到索引 |
+| 通用查询重写Walker | ✅ 已完成 | 全查询树EMBEDDING列自动替换为_embedding列 |
+| 向量函数重写 | ✅ 已完成 | l2_distance/cosine_distance等函数参数自动替换 |
+| 向量聚合重写 | ✅ 已完成 | avg/sum聚合参数自动替换 |
+| L1距离操作符<+> | ✅ 已完成 | 支持pgvector L1距离操作符 |
 
 ## 2. 设计原理
 
@@ -577,7 +583,234 @@ ORDER BY content_embedding <=> '[1,2,3,4,5,6,7,8,9,10]'::vector
 LIMIT 10;
 ```
 
-## 9. 代码修改文件清单
+## 12. 通用查询重写 Walker 设计
+
+### 12.1 设计目标
+
+EMBEDDING 列在 SQL 查询中是 text 类型，但向量操作（距离计算、向量函数等）需要操作 `_embedding` 列（vector 类型）。通用 Var 节点替换 Walker 自动遍历查询树，在需要 vector 类型的上下文中将 EMBEDDING 列替换为 `_embedding` 列。
+
+### 12.2 核心设计原则
+
+**只在期望 vector 类型的上下文中进行替换**。当 EMBEDDING 列用于普通 text 操作时（如 `LIKE`、`=`、`<>` 等），不进行替换，保持原始 text 语义。
+
+### 12.3 架构设计
+
+```mermaid
+graph TB
+    A[CMD_SELECT查询] --> B[rewrite_embedding_query]
+    B --> C[遍历targetList]
+    B --> D[遍历jointree含JOIN条件]
+    B --> E[遍历havingQual]
+    B --> F[遍历sortClause]
+    B --> G[遍历groupClause]
+    
+    C --> H[rewrite_embedding_walker]
+    D --> H
+    E --> H
+    F --> H
+    G --> H
+    
+    H --> I{节点类型?}
+    I -->|OpExpr + 距离操作符| J[rewrite_embedding_opexpr]
+    I -->|FuncExpr| K[rewrite_embedding_funcexpr]
+    I -->|Aggref| L[rewrite_embedding_aggref]
+    I -->|SubLink| M[递归处理子查询]
+    I -->|其他| N[递归遍历子节点]
+    
+    J --> O[is_embedding_var检测]
+    K --> P[检查函数参数类型是否为vector]
+    L --> Q[检查聚合参数是否为EMBEDDING列]
+```
+
+### 12.4 函数设计
+
+**文件**: `src/backend/rewrite/rewriteHandler.c`
+
+#### 12.4.1 入口函数
+
+```c
+static void rewrite_embedding_query(Query *parsetree);
+```
+
+遍历查询树的所有关键部分：
+- `targetList`：SELECT 目标列表
+- `jointree`：FROM/WHERE/JOIN 条件
+- `havingQual`：HAVING 子句
+- `sortClause`：ORDER BY 子句
+- `groupClause`：GROUP BY 子句
+
+#### 12.4.2 核心检测函数
+
+```c
+static bool is_embedding_var(Var *var, Query *query,
+                             Oid *out_relid, int *out_embedding_attnum,
+                             char **out_colname);
+```
+
+检测 Var 节点是否引用 EMBEDDING 列：
+1. 检查 Var 引用的 RTE 是否为普通关系表
+2. 打开关系表，检查列的 `attembedding` 标志
+3. 查找对应的 `_embedding` 隐藏列
+4. 返回关系 OID、_embedding 列属性号和列名
+
+#### 12.4.3 距离操作符重写
+
+```c
+static Node *rewrite_embedding_opexpr(OpExpr *opexpr, Query *query);
+```
+
+处理四种距离操作符：`<->`、`<=>`、`<#>`、`<+>`
+
+支持三种模式：
+| 模式 | 示例 | 处理方式 |
+|------|------|---------|
+| Var-Const | `content <-> 'text'` | 替换列 + 替换操作符 + 转换常量 |
+| Const-Var | `'text' <-> content` | 替换列 + 替换操作符 + 转换常量 |
+| Var-Var | `a.content <-> b.content` | 替换两侧列 + 替换操作符 |
+
+常量转换流程：
+1. 检查常量是否为 text 类型
+2. 获取 embedding 函数 OID
+3. 调用 embedding 函数将 text 转为 vector
+4. 创建 vector 类型的 Const 节点替换原常量
+
+#### 12.4.4 向量函数重写
+
+```c
+static Node *rewrite_embedding_funcexpr(FuncExpr *funcexpr, Query *query);
+```
+
+通过检查函数声明的参数类型，判断哪些参数期望 vector 类型：
+1. 查找函数的 `pg_proc` 系统表条目
+2. 遍历函数参数，检查 `proargtypes` 中对应位置是否为 vector OID
+3. 对期望 vector 类型的参数位置，如果传入的是 EMBEDDING 列（Var），替换为 `_embedding` 列
+4. 对期望 vector 类型的参数位置，如果传入的是 text 常量，通过 embedding 函数转换为 vector
+
+支持的函数包括：
+- 距离函数：`l2_distance`、`cosine_distance`、`inner_product`、`l1_distance`
+- 工具函数：`vector_dims`、`vector_norm`、`l2_normalize`、`subvector`、`binary_quantize`
+
+#### 12.4.5 向量聚合重写
+
+```c
+static Node *rewrite_embedding_aggref(Aggref *aggref, Query *query);
+```
+
+处理向量聚合函数（`avg`、`sum`）：
+1. 检查聚合函数的参数数量
+2. 遍历聚合参数（TargetEntry）
+3. 如果参数是 EMBEDDING 列的 Var，替换为 `_embedding` 列
+
+#### 12.4.6 通用 Walker
+
+```c
+static Node *rewrite_embedding_walker(Node *node, Query *query);
+```
+
+递归遍历查询表达式树，处理的节点类型：
+
+| 节点类型 | 处理方式 |
+|---------|---------|
+| OpExpr | 距离操作符走专门处理，其他递归子节点 |
+| FuncExpr | 走向量函数专门处理 |
+| Aggref | 走向量聚合专门处理 |
+| BoolExpr | 递归遍历参数列表 |
+| ScalarArrayOpExpr | 递归遍历参数列表 |
+| RelabelType | 递归处理 arg |
+| CoerceToDomain | 递归处理 arg |
+| CaseExpr/CaseWhen | 递归处理条件、结果 |
+| NullTest | 递归处理 arg |
+| BooleanTest | 递归处理 arg |
+| TargetEntry | 递归处理 expr |
+| List | 递归遍历元素 |
+| SubLink | 递归处理子查询 + testexpr |
+
+#### 12.4.7 JOIN 树遍历
+
+```c
+static void rewrite_embedding_walk_jointree(Node *jtnode, Query *query);
+```
+
+递归遍历 JOIN 树，处理：
+- `FromExpr`：遍历 fromlist + 重写 quals
+- `JoinExpr`：递归处理左右子树 + 重写 quals（JOIN 条件）
+- `RangeTblRef`：叶子节点，无需处理
+
+### 12.5 不替换的场景
+
+以下场景中 EMBEDDING 列保持原始 text 类型，不进行替换：
+
+| 场景 | 示例 | 原因 |
+|------|------|------|
+| 普通比较 | `content = 'hello'` | text 类型的等值比较 |
+| LIKE/ILIKE | `content LIKE '%test%'` | text 模式匹配 |
+| IS NULL | `content IS NULL` | NULL 检查 |
+| 非向量操作符 | `content > 'a'` | text 排序比较 |
+| IN 列表 | `content IN ('a', 'b')` | text 集合成员检查 |
+| text 函数 | `length(content)` | 期望 text 参数的函数 |
+| SELECT 显示 | `SELECT content FROM t` | 仅显示原始文本 |
+
+**判断逻辑**：
+- 距离操作符（`<->`/`<=>`/`<#>`/`<+>`）：总是替换，因为它们在 text 类型上的语义就是向量距离
+- 函数调用：仅当函数声明的参数类型为 vector 时替换
+- 聚合调用：仅当聚合参数为 EMBEDDING 列时替换
+- 其他操作符（`=`/`<>`/`LIKE` 等）：不替换
+
+### 12.6 调用时机
+
+在 `RewriteQuery` 函数中，仅对 `CMD_SELECT` 查询触发重写：
+
+```c
+if (parsetree->commandType == CMD_SELECT)
+{
+    rewrite_embedding_query(parsetree);
+}
+```
+
+### 12.7 向量索引自动创建
+
+**文件**: `src/backend/parser/parse_utilcmd.c`
+
+建表时自动为每个 EMBEDDING 列创建向量索引：
+
+```c
+if (cxt->vector_index != NULL && cxt->vector_distance != NULL)
+{
+    IndexStmt  *index;
+    List       *index_options = NIL;
+
+    index = makeNode(IndexStmt);
+    index->idxname = psprintf("%s_%s_embedding_idx",
+                              cxt->relation->relname, column->colname);
+    index->accessMethod = pstrdup(cxt->vector_index);
+    
+    /* 传递索引参数 */
+    if (cxt->vector_index_lists != -1)
+        index_options = lappend(index_options,
+            makeDefElem("lists", (Node *) makeInteger(cxt->vector_index_lists), -1));
+    if (cxt->vector_index_m != -1)
+        index_options = lappend(index_options,
+            makeDefElem("m", (Node *) makeInteger(cxt->vector_index_m), -1));
+    if (cxt->vector_index_ef_construction != -1)
+        index_options = lappend(index_options,
+            makeDefElem("ef_construction", (Node *) makeInteger(cxt->vector_index_ef_construction), -1));
+    
+    index->options = index_options;
+    /* ... 其他索引属性设置 ... */
+}
+```
+
+索引参数通过 `CreateStmtContext` 从 WITH 子句解析：
+
+| 参数 | CreateStmtContext 字段 | 默认值 | 说明 |
+|------|----------------------|--------|------|
+| `lists` | `vector_index_lists` | -1 | ivfflat 倒排列表数量 |
+| `m` | `vector_index_m` | -1 | hnsw 每层最大连接数 |
+| `ef_construction` | `vector_index_ef_construction` | -1 | hnsw 构建时候选列表大小 |
+
+-1 表示未指定，此时索引不包含 WITH 子句，使用 pgvector 自身默认值。
+
+## 13. 代码修改文件清单
 
 | 文件路径 | 功能说明 |
 |---------|----------|
@@ -596,6 +829,9 @@ LIMIT 10;
 | `src/include/utils/rel.h` | StdRdOptions结构体添加vector_len和embedding_function字段，添加RelationGetEmbeddingVectorLen宏 |
 | `src/backend/utils/adt/predict.c` | 添加get_embedding_function、get_embedding_function_oid和embedding_trigger函数 |
 | `src/include/utils/predict.h` | 添加get_embedding_function_oid函数声明 |
+| `src/backend/rewrite/rewriteHandler.c` | 通用Var节点替换Walker：rewrite_embedding_query/rewrite_embedding_walker/rewrite_embedding_opexpr/rewrite_embedding_funcexpr/rewrite_embedding_aggref等 |
+| `src/backend/access/common/reloptions.c` | 添加vector_index/vector_distance/lists/m/ef_construction表选项 |
+| `src/include/utils/rel.h` | StdRdOptions添加vector_index/vector_distance/lists/m/ef_construction字段 |
 
 ## 10. 与PREDICT列的对比
 
@@ -648,6 +884,6 @@ pg_ctl start -D /path/to/data
 
 ---
 
-**文档版本**: 1.3  
-**最后更新**: 2025-04-09  
+**文档版本**: 2.0  
+**最后更新**: 2026-04-18  
 **作者**: PostgreSQL开发团队
