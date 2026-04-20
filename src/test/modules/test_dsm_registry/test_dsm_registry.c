@@ -31,7 +31,7 @@ tdr_init_shmem(void *ptr)
 {
 	TestDSMRegistryStruct *state = (TestDSMRegistryStruct *) ptr;
 
-	LWLockInitialize(&state->lck, LWLockNewTrancheId());
+	LWLockInitialize(&state->lck, LWLockNewTrancheId("test_dsm_registry"));
 	state->val = 0;
 }
 
