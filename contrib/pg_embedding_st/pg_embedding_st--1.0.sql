@@ -40,3 +40,54 @@ LANGUAGE C;
 
 COMMENT ON FUNCTION st_embedding_list_models() IS
 'List available embedding models in the model directory.';
+
+-- Placeholder distance functions for text <-> text operator syntax
+-- These allow the parser to accept queries like: ORDER BY content <=> 'search text'
+-- The query rewriter will replace them with vector distance operators at execution time
+CREATE FUNCTION st_text_cosine_distance(left text, right text)
+RETURNS float8
+AS 'pg_embedding_st', 'st_text_placeholder_distance'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION st_text_l2_distance(left text, right text)
+RETURNS float8
+AS 'pg_embedding_st', 'st_text_placeholder_distance'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION st_text_inner_product_distance(left text, right text)
+RETURNS float8
+AS 'pg_embedding_st', 'st_text_placeholder_distance'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION st_text_l1_distance(left text, right text)
+RETURNS float8
+AS 'pg_embedding_st', 'st_text_placeholder_distance'
+LANGUAGE C IMMUTABLE;
+
+-- Placeholder distance operators for EMBEDDING columns
+-- These operators enable the syntax: EMBEDDING_column <=> 'search text'
+-- The query rewriter (rewrite_embedding) will automatically:
+--   1. Replace the EMBEDDING column Var with the _embedding column Var
+--   2. Convert the text constant to a vector using the embedding_function
+--   3. Replace the text operator with the corresponding vector operator
+-- If the rewriter does not activate (e.g., non-EMBEDDING column), these operators
+-- will raise an error at execution time.
+CREATE OPERATOR <=> (
+    LEFTARG = text, RIGHTARG = text, PROCEDURE = st_text_cosine_distance,
+    COMMUTATOR = '<=>'
+);
+
+CREATE OPERATOR <-> (
+    LEFTARG = text, RIGHTARG = text, PROCEDURE = st_text_l2_distance,
+    COMMUTATOR = '<->'
+);
+
+CREATE OPERATOR <#> (
+    LEFTARG = text, RIGHTARG = text, PROCEDURE = st_text_inner_product_distance,
+    COMMUTATOR = '<#>'
+);
+
+CREATE OPERATOR <+> (
+    LEFTARG = text, RIGHTARG = text, PROCEDURE = st_text_l1_distance,
+    COMMUTATOR = '<+>'
+);

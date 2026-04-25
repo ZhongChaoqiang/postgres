@@ -48,6 +48,16 @@ static char *pg_embedding_st_model_path = NULL;
 
 static Oid vector_type_oid = InvalidOid;
 
+Datum
+st_text_placeholder_distance(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("text distance operator cannot be used directly"),
+			 errhint("This operator is reserved for EMBEDDING columns. Use: ORDER BY embedding_column <=> 'search text'. The query rewriter will automatically convert it to a vector distance query.")));
+	PG_RETURN_NULL();
+}
+
 static void init_python(void);
 static void ensure_model_dir(const char *model_path);
 static PyObject *load_model(const char *model_name);
@@ -58,6 +68,7 @@ PG_FUNCTION_INFO_V1(sentence_transformers_embedding);
 PG_FUNCTION_INFO_V1(sentence_transformers_embedding_text);
 PG_FUNCTION_INFO_V1(sentence_transformers_embedding_with_model);
 PG_FUNCTION_INFO_V1(st_embedding_list_models);
+PG_FUNCTION_INFO_V1(st_text_placeholder_distance);
 
 static void
 ensure_vector_type(void)
