@@ -89,6 +89,12 @@ else
 ALWAYS_SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython pg_embedding_st
 endif
 
+ifeq ($(with_libcurl),yes)
+SUBDIRS += pg_predict
+else
+ALWAYS_SUBDIRS += pg_predict
+endif
+
 # Missing:
 #		start-scripts	\ (does not have a makefile)
 

@@ -704,6 +704,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 				{
 					FmgrInfo predict_func;
 					Datum row_datum;
+					Oid func_rettype;
 					
 					fmgr_info(predict_func_oid, &predict_func);
 					
@@ -714,6 +715,22 @@ predict_trigger(PG_FUNCTION_ARGS)
 					
 					predict_datum = FunctionCall1(&predict_func, row_datum);
 					predict_isnull = false;
+
+					func_rettype = get_func_rettype(predict_func_oid);
+					if (func_rettype != attr->atttypid && func_rettype == TEXTOID)
+					{
+						char *text_value = TextDatumGetCString(predict_datum);
+						Oid typinput;
+						Oid typioparam;
+
+						getTypeInputInfo(attr->atttypid, &typinput, &typioparam);
+						if (OidIsValid(typinput))
+						{
+							predict_datum = OidInputFunctionCall(typinput, text_value,
+																 typioparam, attr->atttypmod);
+						}
+						pfree(text_value);
+					}
 				}
 
 				pfree(predict_func_name);
