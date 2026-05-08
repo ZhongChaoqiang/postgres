@@ -7,11 +7,13 @@ pg_predict 是一个 PostgreSQL 扩展，提供大语言模型（LLM）推理功
 ### 1.1 核心功能
 
 1. **LLM 推理函数**：`llm_infer()` 和 `llm_predict()`，支持系统提示词、历史对话、模板填充
-2. **配置管理**：`set_predict_config()` 和 `get_predict_config()`，支持系统级和表级配置
-3. **模板填充**：支持 `{{column_name}}` 语法的 prompt_template（参考 MindsDB）
-4. **自动行格式化**：无模板时自动将整行格式化为键值对文本
-5. **类型转换**：predict_trigger 自动将 LLM 文本输出转换为目标列类型
-6. **历史对话**：自动从表中查询历史记录作为对话上下文
+2. **RAG 推理函数**：`llm_rag_infer()` 和 `llm_rag_predict()`，支持向量检索增强生成
+3. **配置管理**：`set_predict_config()` 和 `get_predict_config()`，支持系统级和表级配置
+4. **模板填充**：支持 `{{column_name}}` 语法的 prompt_template（参考 MindsDB）
+5. **自动行格式化**：无模板时自动将整行格式化为键值对文本
+6. **类型转换**：predict_trigger 自动将 LLM 文本输出转换为目标列类型
+7. **历史对话**：自动从表中查询历史记录作为对话上下文
+8. **RAG 检索**：基于 EMBEDDING 列的向量相似度检索，自动注入上下文
 
 ## 2. 架构设计
 
@@ -59,6 +61,9 @@ GUC 默认值 (pg_predict.* 参数)
 | system_prompt | text | '' | 系统提示词 |
 | prompt_template | text | NULL | 提示词模板（`{{column_name}}` 语法） |
 | history_count | integer | 0 | 历史对话条数 |
+| rag_table | oid | NULL | RAG 检索表 OID（需有 EMBEDDING 列） |
+| rag_similarity | float8 | 0.5 | RAG 最小相似度阈值（余弦距离） |
+| rag_topn | integer | 5 | RAG 检索返回的最大行数 |
 | created_at | timestamptz | now() | 创建时间 |
 | updated_at | timestamptz | now() | 更新时间 |
 
@@ -88,6 +93,9 @@ typedef struct LLMConfig
     char       *system_prompt;
     char       *prompt_template;
     int         history_count;
+    Oid         rag_table;
+    double      rag_similarity;
+    int         rag_topn;
 } LLMConfig;
 
 typedef struct ColValue
@@ -296,7 +304,89 @@ llm_predict(input_row record) returns text
 6. 调用 LLM API
 7. 返回文本结果（predict_trigger 负责类型转换）
 
-### 5.3 set_predict_config() - 配置函数
+### 5.3 llm_rag_infer() - RAG 增强推理函数
+
+**签名**：
+```sql
+llm_rag_infer(
+    system_prompt text,
+    history_count integer,
+    user_input text,
+    rag_table regclass,
+    rag_similarity float8,
+    rag_topn integer
+) returns text
+```
+
+**参数说明**：
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| system_prompt | text | 系统提示词，指导 LLM 的行为 |
+| history_count | integer | 历史对话条数（0 表示不使用历史） |
+| user_input | text | 最新用户输入 |
+| rag_table | regclass | RAG 检索表（必须有 EMBEDDING 列） |
+| rag_similarity | float8 | 最小相似度阈值（余弦距离，0.0-2.0，越小越相似） |
+| rag_topn | integer | RAG 检索返回的最大行数 |
+
+**行为**：
+1. 从 GUC 参数获取 API 配置
+2. 查找 RAG 表中的 EMBEDDING 列
+3. 使用 SPI 执行向量相似度查询：`SELECT * FROM rag_table ORDER BY embedding_col <=> user_input LIMIT rag_topn`
+4. 查询重写器自动将文本距离查询转换为向量距离查询
+5. 格式化 RAG 检索结果为上下文文本
+6. 将 RAG 上下文与用户输入组合：`{rag_context}\n\n{user_input}`
+7. 构建 Chat Completion 请求（含系统提示词、历史对话、组合后的用户输入）
+8. 调用 LLM API，返回文本结果
+
+**RAG 检索流程**：
+```
+user_input → EMBEDDING 列 <=> 'user_input' 查询
+                    │
+                    ▼
+        ┌─────────────────────────────┐
+        │  查询重写器自动处理：         │
+        │  1. 识别 EMBEDDING 列        │
+        │  2. 替换为 _embedding 列      │
+        │  3. 调用 embedding_function  │
+        │     将文本转为向量            │
+        │  4. 替换为 pgvector 距离操作符 │
+        └─────────────────────────────┘
+                    │
+                    ▼
+        向量相似度搜索 → Top-N 结果
+                    │
+                    ▼
+        格式化为上下文文本：
+        "Retrieved context:
+        --- Result 1 ---
+        col1: val1
+        col2: val2
+        --- Result 2 ---
+        ..."
+```
+
+### 5.4 llm_rag_predict() - RAG 增强 PREDICT 列推理函数
+
+**签名**：
+```sql
+llm_rag_predict(input_row record) returns text
+```
+
+**行为**：
+1. 从输入记录的类型 OID 获取表 OID
+2. 从 `pg_predict_config` 表读取配置（含 RAG 配置）
+3. 提取行中所有非 PREDICT/非隐藏列的值
+4. 构建 user_input（与 llm_predict 相同的逻辑）
+5. 如果配置了 `rag_table`，执行 RAG 检索：
+   - 在 RAG 表上执行向量相似度搜索
+   - 将检索结果格式化为上下文
+   - 将上下文与 user_input 组合
+6. 如果未配置 `rag_table`，退化为 llm_predict 行为
+7. 处理历史对话（与 llm_predict 相同的逻辑）
+8. 调用 LLM API，返回文本结果
+
+### 5.5 set_predict_config() - 配置函数
 
 **系统级配置**：
 ```sql
@@ -307,7 +397,10 @@ set_predict_config(
     p_temperature float8 DEFAULT 0.7,
     p_max_tokens integer DEFAULT 1024,
     p_system_prompt text DEFAULT '',
-    p_history_count integer DEFAULT 0
+    p_history_count integer DEFAULT 0,
+    p_rag_table regclass DEFAULT NULL,
+    p_rag_similarity float8 DEFAULT 0.5,
+    p_rag_topn integer DEFAULT 5
 ) returns void
 ```
 
@@ -322,11 +415,14 @@ set_predict_config(
     p_max_tokens integer DEFAULT 1024,
     p_system_prompt text DEFAULT '',
     p_prompt_template text DEFAULT NULL,
-    p_history_count integer DEFAULT 0
+    p_history_count integer DEFAULT 0,
+    p_rag_table regclass DEFAULT NULL,
+    p_rag_similarity float8 DEFAULT 0.5,
+    p_rag_topn integer DEFAULT 5
 ) returns void
 ```
 
-### 5.4 get_predict_config() - 查询函数
+### 5.6 get_predict_config() - 查询函数
 
 **系统级查询**：
 ```sql
@@ -337,7 +433,10 @@ get_predict_config(
     OUT temperature float8,
     OUT max_tokens integer,
     OUT system_prompt text,
-    OUT history_count integer
+    OUT history_count integer,
+    OUT rag_table oid,
+    OUT rag_similarity float8,
+    OUT rag_topn integer
 ) returns record
 ```
 
@@ -352,7 +451,10 @@ get_predict_config(
     OUT max_tokens integer,
     OUT system_prompt text,
     OUT prompt_template text,
-    OUT history_count integer
+    OUT history_count integer,
+    OUT rag_table oid,
+    OUT rag_similarity float8,
+    OUT rag_topn integer
 ) returns record
 ```
 
@@ -422,15 +524,56 @@ SELECT jsonb_extract_path_text(response::jsonb, 'choices', '0', 'message', 'cont
 5. assistant 消息为该行的 PREDICT 列值
 6. 按时间正序排列（查询使用 DESC，然后逆序遍历）
 
+### 6.9 RAG 检索
+
+RAG（Retrieval-Augmented Generation）检索增强生成功能：
+
+**查找 EMBEDDING 列**：
+`find_embedding_column_name()` 函数遍历表的所有属性，查找 `attembedding` 标志为 true 的列。
+
+**执行向量搜索**：
+`do_rag_retrieval()` 函数：
+1. 查找 RAG 表的 EMBEDDING 列名
+2. 构建 `_embedding` 隐藏列名（`{colname}_embedding`）
+3. 调用 `compute_embedding_for_text()` 将用户输入文本转为向量：
+   - 通过 `get_embedding_function_oid()` 获取 embedding 函数 OID
+   - 调用 embedding 函数（如 `sentence_transformers_embedding`）生成向量 Datum
+4. 通过 `vector_datum_to_string()` 将向量 Datum 转为字符串表示
+5. 构建 SQL 查询：`SELECT * FROM rag_table ORDER BY {colname}_embedding <=> $1::vector LIMIT rag_topn`
+6. 使用 `SPI_execute_with_args` 执行参数化查询（避免 SQL 注入）
+7. 格式化检索结果为上下文文本，跳过 EMBEDDING 列、隐藏列和 `_embedding` 后缀列
+
+**上下文注入**：
+RAG 检索结果以文本形式注入到用户输入之前：
+```
+Retrieved context:
+
+--- Result 1 ---
+question: What is PostgreSQL?
+answer: PostgreSQL is a powerful open source relational database system.
+
+--- Result 2 ---
+question: How to create a table?
+answer: Use CREATE TABLE statement to define a new table.
+
+用户原始输入
+```
+
+**类型转换**：
+当 `llm_rag_predict` 作为 PREDICT 列的 predict_function 使用时，`predict_trigger` 自动将 LLM 返回的文本结果转换为目标列类型（与 `llm_predict` 相同的类型转换逻辑）。
+
 ## 7. 错误处理
 
-| 场景 | llm_infer 行为 | llm_predict 行为 |
-|------|---------------|-----------------|
-| API URL 未配置 | ERROR | ERROR |
-| HTTP 请求失败 | ERROR | WARNING + 返回 NULL |
-| HTTP 状态码 >= 400 | ERROR | WARNING + 返回 NULL |
-| JSON 解析失败 | ERROR | WARNING + 返回 NULL |
-| 配置表不存在 | 使用 GUC 默认值 | 使用 GUC 默认值 |
+| 场景 | llm_infer 行为 | llm_predict 行为 | llm_rag_infer 行为 |
+|------|---------------|-----------------|-------------------|
+| API URL 未配置 | ERROR | ERROR | ERROR |
+| HTTP 请求失败 | ERROR | WARNING + 返回 NULL | WARNING + 返回 NULL |
+| HTTP 状态码 >= 400 | ERROR | WARNING + 返回 NULL | WARNING + 返回 NULL |
+| JSON 解析失败 | ERROR | WARNING + 返回 NULL | WARNING + 返回 NULL |
+| 配置表不存在 | 使用 GUC 默认值 | 使用 GUC 默认值 | 使用 GUC 默认值 |
+| RAG 表无 EMBEDDING 列 | - | - | ERROR |
+| RAG 表 OID 无效 | - | - | ERROR |
+| rag_table 未配置 | - | 退化为 llm_predict | 退化为 llm_predict |
 
 ## 8. 安全考虑
 

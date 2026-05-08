@@ -35,7 +35,10 @@ SELECT set_predict_config(
     0.7,                                              -- 温度
     1024,                                             -- 最大 token
     'You are a helpful assistant',                    -- 系统提示词
-    0                                                 -- 历史对话条数
+    0,                                                -- 历史对话条数
+    'knowledge_base'::regclass,                       -- RAG 检索表（可选）
+    0.5,                                              -- RAG 相似度阈值（可选）
+    5                                                 -- RAG Top-N（可选）
 );
 ```
 
@@ -284,9 +287,103 @@ INSERT INTO chat_logs (user_message) VALUES ('I need help with my order');
 INSERT INTO chat_logs (user_message) VALUES ('My order number is 12345');
 ```
 
-## 6. 兼容不同 LLM 服务
+## 6. 使用 llm_rag_infer RAG 增强推理
 
-### 6.1 OpenAI
+### 6.1 概述
+
+`llm_rag_infer` 是 RAG（Retrieval-Augmented Generation）增强的 LLM 推理函数。它在调用 LLM 之前，先从指定的知识库表（必须有 EMBEDDING 列）中检索与用户输入最相关的内容，然后将检索结果作为上下文注入到 LLM 的提示词中。
+
+### 6.2 函数签名
+
+```sql
+llm_rag_infer(
+    system_prompt text,      -- 系统提示词
+    history_count integer,   -- 历史对话条数
+    user_input text,         -- 最新用户输入
+    rag_table regclass,      -- RAG 检索表（必须有 EMBEDDING 列）
+    rag_similarity float8,   -- 最小相似度阈值（余弦距离，0.0-2.0）
+    rag_topn integer         -- 检索返回的最大行数
+) returns text
+```
+
+### 6.3 准备知识库表
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_embedding_st;
+
+CREATE TABLE knowledge_base (
+    id SERIAL PRIMARY KEY,
+    question TEXT,
+    answer TEXT,
+    content TEXT EMBEDDING
+) WITH (
+    embedding_function = 'sentence_transformers_embedding'
+);
+
+INSERT INTO knowledge_base (question, answer, content) VALUES
+('What is PostgreSQL?', 'PostgreSQL is a powerful open source relational database system.', 'What is PostgreSQL?'),
+('How to create a table?', 'Use CREATE TABLE statement to define a new table.', 'How to create a table?'),
+('What is SQL?', 'SQL is a standard language for managing relational databases.', 'What is SQL?');
+```
+
+### 6.4 使用 llm_rag_infer
+
+```sql
+SET pg_predict.api_url = 'https://api.openai.com/v1/chat/completions';
+SET pg_predict.api_key = 'sk-xxx';
+
+SELECT llm_rag_infer(
+    'You are a helpful database assistant. Answer based on the provided context.',
+    0,
+    'How do I create a new table?',
+    'knowledge_base'::regclass,
+    0.5,
+    3
+);
+```
+
+### 6.5 使用 llm_rag_predict 与 PREDICT 列集成
+
+```sql
+CREATE TABLE qa_table (
+    id SERIAL PRIMARY KEY,
+    question TEXT,
+    answer TEXT PREDICT
+) WITH (
+    predict_timing = immediate,
+    predict_function = 'llm_rag_predict'
+);
+
+SELECT set_predict_config(
+    'qa_table'::regclass,
+    'https://api.openai.com/v1/chat/completions',
+    'sk-xxx',
+    'gpt-3.5-turbo',
+    0.3, 1024,
+    'Answer the question based on the provided context. If the context does not contain the answer, say you do not know.',
+    '{{question}}',
+    2,
+    'knowledge_base'::regclass,
+    0.5,
+    3
+);
+
+INSERT INTO qa_table (question) VALUES ('How to create a table?');
+-- answer 自动填充，基于 RAG 检索的上下文
+```
+
+### 6.6 RAG 参数说明
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| rag_table | 知识库表，必须有 EMBEDDING 列 | - |
+| rag_similarity | 余弦距离阈值，越小越相似 | 0.3-0.7 |
+| rag_topn | 检索返回的最大行数 | 3-10 |
+
+## 7. 兼容不同 LLM 服务
+
+### 7.1 OpenAI
 
 ```sql
 SELECT set_predict_config(
@@ -295,7 +392,7 @@ SELECT set_predict_config(
 );
 ```
 
-### 6.2 本地 Ollama
+### 7.2 本地 Ollama
 
 ```sql
 SELECT set_predict_config(
@@ -304,7 +401,7 @@ SELECT set_predict_config(
 );
 ```
 
-### 6.3 本地 vLLM
+### 7.3 本地 vLLM
 
 ```sql
 SELECT set_predict_config(
@@ -313,7 +410,7 @@ SELECT set_predict_config(
 );
 ```
 
-### 6.4 LM Studio
+### 7.4 LM Studio
 
 ```sql
 SELECT set_predict_config(
@@ -322,7 +419,7 @@ SELECT set_predict_config(
 );
 ```
 
-## 7. GUC 参数参考
+## 8. GUC 参数参考
 
 | 参数 | 类型 | 默认值 | 范围 | 说明 |
 |------|------|--------|------|------|
@@ -333,45 +430,64 @@ SELECT set_predict_config(
 | pg_predict.max_tokens | integer | 1024 | 1-32768 | 最大 token |
 | pg_predict.timeout | integer | 60 | 1-600 | 超时秒数 |
 
-## 8. 故障排查
+## 9. 故障排查
 
-### 8.1 扩展创建失败
+### 9.1 扩展创建失败
 
 ```
 ERROR: could not open extension control file
 ```
 **解决**：确认 `pg_predict.control` 和 `pg_predict--1.0.sql` 已安装到 `$SHAREDIR/extension/`
 
-### 8.2 函数加载失败
+### 9.2 函数加载失败
 
 ```
 ERROR: could not load library "pg_predict.so": libcurl.so.4: cannot open shared object file
 ```
 **解决**：安装 libcurl 运行时库 `sudo apt install libcurl4`
 
-### 8.3 API 调用失败
+### 9.3 API 调用失败
 
 ```
 ERROR: LLM API request failed: Couldn't resolve host name
 ```
 **解决**：检查 API URL 是否正确，网络是否可达
 
-### 8.4 PREDICT 列返回 NULL
+### 9.4 PREDICT 列返回 NULL
 
 **可能原因**：
 - LLM API 调用失败（检查日志中的 WARNING）
 - 配置未设置（检查 `pg_predict_config` 表）
 - 输入列为 NULL
 
-### 8.5 类型转换失败
+### 9.5 类型转换失败
 
 ```
 ERROR: invalid input syntax for type integer: "five"
 ```
 **解决**：优化系统提示词，确保 LLM 输出符合目标类型的格式要求
 
-### 8.6 模板占位符未替换
+### 9.6 模板占位符未替换
 
 **可能原因**：
 - 列名拼写错误（区分大小写）
 - 列是 PREDICT 列或隐藏列（不会出现在模板数据中）
+
+### 9.7 RAG 检索失败
+
+```
+ERROR: RAG table "xxx" does not have an EMBEDDING column
+```
+**解决**：确保 RAG 表有 EMBEDDING 列，使用 `content TEXT EMBEDDING` 语法创建
+
+```
+ERROR: different vector dimensions
+```
+**解决**：确保 RAG 表的 embedding 函数与查询使用的维度一致
+
+### 9.8 llm_rag_predict 未使用 RAG
+
+**可能原因**：
+- `rag_table` 未在 `pg_predict_config` 中配置
+- `rag_table` 配置为 NULL
+- 此时 `llm_rag_predict` 退化为 `llm_predict` 行为
