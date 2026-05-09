@@ -838,6 +838,93 @@ predict_trigger(PG_FUNCTION_ARGS)
 	return PointerGetDatum(newtuple);
 }
 
+PG_FUNCTION_INFO_V1(llm_predict);
+PG_FUNCTION_INFO_V1(llm_rag_predict);
+
+static Oid
+find_extension_function_oid(const char *funcname, int nargs)
+{
+	Oid					funcoid = InvalidOid;
+	FuncCandidateList	clist;
+	int					fgc_flags;
+	char			   *short_name;
+
+	short_name = strrchr(funcname, '.');
+	if (short_name != NULL)
+		short_name++;
+	else
+		short_name = (char *) funcname;
+
+	clist = FuncnameGetCandidates(list_make1(makeString(short_name)),
+								  nargs, NIL, false, false, false, true, &fgc_flags);
+
+	if (clist != NULL)
+	{
+		for (; clist != NULL; clist = clist->next)
+		{
+			if (clist->nargs == nargs)
+			{
+				funcoid = clist->oid;
+				break;
+			}
+		}
+	}
+
+	return funcoid;
+}
+
+Datum
+llm_predict(PG_FUNCTION_ARGS)
+{
+	Oid			ext_func_oid;
+	FmgrInfo	ext_func;
+	Datum		row_datum;
+	Datum		result;
+
+	ext_func_oid = find_extension_function_oid("pg_predict.llm_predict_ext", 1);
+	if (!OidIsValid(ext_func_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("llm_predict requires the pg_predict extension"),
+				 errhint("Install pg_predict extension first: CREATE EXTENSION pg_predict;")));
+
+	fmgr_info(ext_func_oid, &ext_func);
+
+	row_datum = PG_GETARG_DATUM(0);
+	result = FunctionCall1(&ext_func, row_datum);
+
+	if (DatumGetPointer(result) == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_DATUM(result);
+}
+
+Datum
+llm_rag_predict(PG_FUNCTION_ARGS)
+{
+	Oid			ext_func_oid;
+	FmgrInfo	ext_func;
+	Datum		row_datum;
+	Datum		result;
+
+	ext_func_oid = find_extension_function_oid("pg_predict.llm_rag_predict_ext", 1);
+	if (!OidIsValid(ext_func_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("llm_rag_predict requires the pg_predict extension"),
+				 errhint("Install pg_predict extension first: CREATE EXTENSION pg_predict;")));
+
+	fmgr_info(ext_func_oid, &ext_func);
+
+	row_datum = PG_GETARG_DATUM(0);
+	result = FunctionCall1(&ext_func, row_datum);
+
+	if (DatumGetPointer(result) == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_DATUM(result);
+}
+
 PG_FUNCTION_INFO_V1(text_vector_l2_distance);
 
 Datum

@@ -208,14 +208,14 @@ LANGUAGE C VOLATILE;
 COMMENT ON FUNCTION llm_infer(text, integer, text) IS
 'Call LLM API with system prompt, history count, and user input. Uses GUC parameters (pg_predict.*) for API configuration.';
 
-CREATE FUNCTION llm_predict(
+CREATE FUNCTION llm_predict_ext(
     input_row record
 ) RETURNS text
-AS 'pg_predict', 'llm_predict'
+AS 'pg_predict', 'llm_predict_ext'
 LANGUAGE C VOLATILE;
 
-COMMENT ON FUNCTION llm_predict(record) IS
-'Default LLM predict function for PREDICT columns. Sends the entire row data to the LLM. Reads configuration from pg_predict_config table. Supports prompt_template with {{column_name}} syntax. If no template is set, the entire row is formatted as key-value pairs. Supports system prompt and history conversations.';
+COMMENT ON FUNCTION llm_predict_ext(record) IS
+'Default LLM predict function for PREDICT columns (extension implementation). Sends the entire row data to the LLM. Reads configuration from pg_predict_config table. Supports prompt_template with {{column_name}} syntax. If no template is set, the entire row is formatted as key-value pairs. Supports system prompt and history conversations.';
 
 CREATE FUNCTION llm_rag_infer(
     system_prompt text,
@@ -231,11 +231,11 @@ LANGUAGE C VOLATILE;
 COMMENT ON FUNCTION llm_rag_infer(text, integer, text, regclass, float8, integer) IS
 'RAG-enhanced LLM inference function. Performs vector similarity search on the specified RAG table (which must have an EMBEDDING column), retrieves relevant context, and combines it with the system prompt and user input before calling the LLM. Parameters: system_prompt - system instruction for the LLM; history_count - number of recent conversation turns to include; user_input - the latest user query; rag_table - table with EMBEDDING column for RAG retrieval; rag_similarity - minimum cosine similarity threshold (0.0-2.0, lower means more similar); rag_topn - maximum number of RAG results to retrieve.';
 
-CREATE FUNCTION llm_rag_predict(
+CREATE FUNCTION llm_rag_predict_ext(
     input_row record
 ) RETURNS text
-AS 'pg_predict', 'llm_rag_predict'
+AS 'pg_predict', 'llm_rag_predict_ext'
 LANGUAGE C VOLATILE;
 
-COMMENT ON FUNCTION llm_rag_predict(record) IS
-'RAG-enhanced default predict function for PREDICT columns. Reads configuration from pg_predict_config table including rag_table, rag_similarity, rag_topn. Performs vector similarity search on the RAG table to retrieve relevant context, then combines it with the row data and system prompt before calling the LLM. If rag_table is not configured, falls back to llm_predict behavior.';
+COMMENT ON FUNCTION llm_rag_predict_ext(record) IS
+'RAG-enhanced default predict function for PREDICT columns (extension implementation). Reads configuration from pg_predict_config table including rag_table, rag_similarity, rag_topn. Performs vector similarity search on the RAG table to retrieve relevant context, then combines it with the row data and system prompt before calling the LLM. If rag_table is not configured, falls back to llm_predict behavior.';

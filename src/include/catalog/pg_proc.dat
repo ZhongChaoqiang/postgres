@@ -12556,6 +12556,12 @@
   proname => 'is_predict_column', provolatile => 's', prorettype => 'bool',
   proargtypes => 'oid text', proargnames => '{relid,colname}',
   prosrc => 'is_predict_column' },
+{ oid => '6506', descr => 'default LLM predict function for PREDICT columns',
+  proname => 'llm_predict', provolatile => 'v', prorettype => 'text',
+  proargtypes => 'record', prosrc => 'llm_predict' },
+{ oid => '6507', descr => 'RAG-enhanced LLM predict function for PREDICT columns',
+  proname => 'llm_rag_predict', provolatile => 'v', prorettype => 'text',
+  proargtypes => 'record', prosrc => 'llm_rag_predict' },
 
 # EMBEDDING column support functions
 { oid => '6502', descr => 'trigger to call embedding function for EMBEDDING columns',

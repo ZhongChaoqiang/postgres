@@ -63,7 +63,7 @@ INSERT INTO rag_examples (question, answer, tables, content) VALUES
 
 ```sql
 SET pg_predict.api_url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
-SET pg_predict.api_key = 'acc96ba1-d743-45d7-9b0e-a415bd96a046';
+SET pg_predict.api_key = 'XXX-XXX';
 SET pg_predict.model = 'ep-20251128103853-pp9jw';
 SET pg_predict.temperature = 0.3;
 SET pg_predict.max_tokens = 512;
@@ -187,7 +187,7 @@ CREATE TABLE production_qa (
 SELECT set_predict_config(
     'production_qa'::regclass,
     'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-    'acc96ba1-d743-45d7-9b0e-a415bd96a046',
+    'XXX-XXX',
     'ep-20251128103853-pp9jw',
     0.3, 512,
     '你是一个数据分析SQL生成助手。根据检索到的示例，生成对应的MySQL查询SQL。只输出SQL，不要包含任何解释。',
@@ -236,7 +236,7 @@ CREATE TABLE sentiment_test (
 SELECT set_predict_config(
     'sentiment_test'::regclass,
     'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-    'acc96ba1-d743-45d7-9b0e-a415bd96a046',
+    'XXX-XXX',
     'ep-20251128103853-pp9jw',
     0.1, 64,
     'You are a sentiment analysis assistant. Given a review, output ONLY a single integer: 1 for positive, 0 for neutral, -1 for negative. No other text.',
@@ -289,7 +289,7 @@ CREATE TABLE score_test (
 SELECT set_predict_config(
     'score_test'::regclass,
     'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-    'acc96ba1-d743-45d7-9b0e-a415bd96a046',
+    'XXX-XXX',
     'ep-20251128103853-pp9jw',
     0.1, 64,
     'You are a score estimation assistant. Given a student description, output ONLY a single decimal number (0-100) representing the estimated math score. No other text.',
@@ -342,7 +342,7 @@ CREATE TABLE spam_test (
 SELECT set_predict_config(
     'spam_test'::regclass,
     'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-    'acc96ba1-d743-45d7-9b0e-a415bd96a046',
+    'XXX-XXX',
     'ep-20251128103853-pp9jw',
     0.1, 64,
     'You are a spam detection assistant. Given an email, output ONLY a single word: true if spam, false if not spam. No other text.',

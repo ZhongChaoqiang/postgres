@@ -123,9 +123,9 @@ spi_pstrdup(const char *str)
 }
 
 PG_FUNCTION_INFO_V1(llm_infer);
-PG_FUNCTION_INFO_V1(llm_predict);
+PG_FUNCTION_INFO_V1(llm_predict_ext);
 PG_FUNCTION_INFO_V1(llm_rag_infer);
-PG_FUNCTION_INFO_V1(llm_rag_predict);
+PG_FUNCTION_INFO_V1(llm_rag_predict_ext);
 
 void		_PG_init(void);
 
@@ -700,7 +700,7 @@ llm_infer(PG_FUNCTION_ARGS)
 }
 
 Datum
-llm_predict(PG_FUNCTION_ARGS)
+llm_predict_ext(PG_FUNCTION_ARGS)
 {
 	HeapTupleHeader rec_header = PG_GETARG_HEAPTUPLEHEADER(0);
 	Oid			tup_type;
@@ -1317,7 +1317,7 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 }
 
 Datum
-llm_rag_predict(PG_FUNCTION_ARGS)
+llm_rag_predict_ext(PG_FUNCTION_ARGS)
 {
 	HeapTupleHeader rec_header = PG_GETARG_HEAPTUPLEHEADER(0);
 	Oid			tup_type;
