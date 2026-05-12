@@ -645,9 +645,16 @@ predict_trigger(PG_FUNCTION_ARGS)
 
 		/*
 		 * For UPDATE: determine if the user explicitly modified the predict
-		 * column by comparing old and new values.  If they differ, the user
-		 * provided a new actual value.  If they're the same, the predict
-		 * column was not modified and we should recompute the prediction.
+		 * column by comparing old and new values.
+		 *
+		 * - If old was NULL and new is non-NULL: this is likely a prediction
+		 *   being filled in (by async worker or trigger). Check if _predict
+		 *   column already has the same value - if so, the async worker
+		 *   already set everything, skip processing. Otherwise, set _predict.
+		 * - If old was non-NULL and new differs: user explicitly changed it,
+		 *   save to _actual.
+		 * - If old and new are the same: predict column not modified,
+		 *   recompute prediction.
 		 */
 		if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event) && !isnull)
 		{
@@ -656,7 +663,32 @@ predict_trigger(PG_FUNCTION_ARGS)
 
 			olddatum = heap_getattr(trigdata->tg_trigtuple, attnum, tupdesc, &oldisnull);
 
-			if (!oldisnull && datumIsEqual(coldatum, olddatum, attr->attbyval, attr->attlen))
+			if (oldisnull)
+			{
+				Datum		predict_col_val;
+				bool		predict_col_isnull;
+				char	   *predict_colname_tmp;
+				AttrNumber	predict_col_attnum_tmp;
+
+				predict_colname_tmp = psprintf("%s_predict", NameStr(attr->attname));
+				predict_col_attnum_tmp = find_column_by_name(tupdesc, predict_colname_tmp);
+				pfree(predict_colname_tmp);
+
+				if (predict_col_attnum_tmp != InvalidAttrNumber)
+				{
+					predict_col_val = heap_getattr(newtuple, predict_col_attnum_tmp,
+												   tupdesc, &predict_col_isnull);
+					if (!predict_col_isnull &&
+						datumIsEqual(coldatum, predict_col_val,
+									attr->attbyval, attr->attlen))
+					{
+						continue;
+					}
+				}
+
+				isnull = true;
+			}
+			else if (datumIsEqual(coldatum, olddatum, attr->attbyval, attr->attlen))
 			{
 				isnull = true;
 			}

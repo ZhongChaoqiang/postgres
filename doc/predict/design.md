@@ -234,7 +234,10 @@ predict 列的内联表达式存储在 `pg_attrdef` 系统目录中，与 GENERA
 
 2. **判断用户是否提供了值**：
    - INSERT：检查 predict 列是否为 NULL
-   - UPDATE：比较新旧 tuple 中 predict 列的值，如果相同则视为未修改
+   - UPDATE：比较新旧 tuple 中 predict 列的值：
+     - 旧值为 NULL、新值非 NULL：可能是 async_predict worker 填充的预测值。检查 `_predict` 列是否已有相同值，如果有则跳过处理（worker 已设置完毕）；否则视为需要设置 `_predict`
+     - 旧值非 NULL、新值不同：用户明确修改了 predict 列，保存到 `_actual`
+     - 旧值和新值相同：predict 列未被修改，需要重新计算预测值
 
 3. **用户提供值（!isnull）**：
    - 保留 predict 列的用户值不变
@@ -254,9 +257,15 @@ predict 列的内联表达式存储在 `pg_attrdef` 系统目录中，与 GENERA
 异步预测后台 worker 支持 `PREDICT AS (expr) STORED` 语法的延迟计算：
 
 1. 检测 `attgenerated == ATTRIBUTE_GENERATED_PREDICT` 的列
-2. 使用 `build_column_default` 获取表达式
-3. 通过 `ExecPrepareExpr` + `ExecEvalExpr` 计算表达式值
-4. 使用 SPI UPDATE 语句将计算结果写回表中
+2. 通过 SPI 查询 `pg_attrdef` 获取表达式字符串
+3. 通过 SPI 执行 `SELECT <expr> FROM <table> WHERE ctid = ...` 计算表达式值
+4. 通过 SPI 执行 UPDATE 语句将计算结果写入 `_predict` 列和 predict 列
+5. UPDATE 语句使用 `quote_literal_cstr` 正确转义文本值
+
+**注意事项**：
+- Worker 是独立后台进程，GUC 参数（如 `pg_predict.api_url`）必须使用 `ALTER SYSTEM SET` 设置为全局级别，`SET` 命令只在当前会话有效
+- Worker 执行 UPDATE 时会触发 `predict_trigger`，触发器通过比较新旧值和 `_predict` 列来检测是否是 worker 的操作
+- Worker 使用 PG_TRY/PG_CATCH 捕获错误，防止 LLM 调用失败导致 worker 崩溃
 
 ## 6. 测试验证
 

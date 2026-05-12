@@ -46,6 +46,7 @@
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -384,8 +385,6 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 	AsyncPredictWorkerInfo *wi = &AsyncPredictShmem->workers[worker_slot];
 	int			ret;
 	StringInfoData query;
-	ExprState  *predict_exprstate = NULL;
-	EState	   *predict_estate = NULL;
 	bool		use_inline_expr = false;
 
 	cbcontext = AllocSetContextCreate(CurrentMemoryContext,
@@ -398,21 +397,9 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 		if (predict_attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
 		{
-			Expr	   *expr;
-
-			expr = (Expr *) build_column_default(rel, predict_attnum);
-			if (expr != NULL)
-			{
-				predict_estate = CreateExecutorState();
-				predict_exprstate = ExecPrepareExpr(expr, predict_estate);
-				use_inline_expr = true;
-			}
-			else
-			{
-				elog(DEBUG1, "async_predict: no inline expression for column %d of table %s",
-					 predict_attnum, relname);
-				return;
-			}
+			elog(DEBUG1, "async_predict: using SPI-based inline expression for column %d of table %s",
+				 predict_attnum, relname);
+			use_inline_expr = true;
 		}
 		else
 		{
@@ -459,23 +446,79 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 				if (use_inline_expr)
 				{
-					TupleTableSlot *slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
-					ExprContext *econtext;
-					Datum		val;
+					StringInfoData spi_query;
+					int			spi_ret;
 
-					ExecStoreHeapTuple(tuple, slot, false);
-					econtext = GetPerTupleExprContext(predict_estate);
-					econtext->ecxt_scantuple = slot;
+					initStringInfo(&spi_query);
+					appendStringInfo(&spi_query,
+									 "SELECT pg_get_expr(adbin, adrelid) "
+									 "FROM pg_attrdef "
+									 "WHERE adrelid = %u AND adnum = %d",
+									 reloid, predict_attnum);
 
-					val = ExecEvalExpr(predict_exprstate, econtext, &predict_datum_isnull);
+					spi_ret = SPI_execute(spi_query.data, true, 1);
+					pfree(spi_query.data);
 
-					if (!predict_datum_isnull)
+					if (spi_ret == SPI_OK_SELECT && SPI_processed > 0)
 					{
-						Form_pg_attribute predict_attr = TupleDescAttr(tupdesc, predict_attnum - 1);
-						predict_datum = datumCopy(val, predict_attr->attbyval, predict_attr->attlen);
-					}
+						Datum		val;
+						bool		val_isnull;
+						char	   *expr_str;
 
-					ExecDropSingleTupleTableSlot(slot);
+						val = SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1, &val_isnull);
+
+						if (!val_isnull)
+						{
+							expr_str = TextDatumGetCString(val);
+
+							initStringInfo(&spi_query);
+							appendStringInfo(&spi_query,
+											 "SELECT %s FROM %s WHERE ctid = '(%u,%u)'",
+											 expr_str,
+											 quote_identifier(relname),
+											 ItemPointerGetBlockNumber(&tuple->t_self),
+											 ItemPointerGetOffsetNumber(&tuple->t_self));
+
+							pfree(expr_str);
+
+							spi_ret = SPI_execute(spi_query.data, true, 1);
+							pfree(spi_query.data);
+
+							if (spi_ret == SPI_OK_SELECT && SPI_processed > 0)
+							{
+								Datum		result_val;
+								bool		result_isnull;
+
+								result_val = SPI_getbinval(SPI_tuptable->vals[0],
+														   SPI_tuptable->tupdesc, 1, &result_isnull);
+
+								if (!result_isnull)
+								{
+									Form_pg_attribute predict_attr = TupleDescAttr(tupdesc, predict_attnum - 1);
+									predict_datum = datumCopy(result_val, predict_attr->attbyval, predict_attr->attlen);
+								}
+								else
+								{
+									predict_datum_isnull = true;
+								}
+							}
+							else
+							{
+								predict_datum_isnull = true;
+							}
+						}
+						else
+						{
+							predict_datum_isnull = true;
+						}
+					}
+					else
+					{
+						elog(LOG, "async_predict: failed to get expression for column %d of table %s",
+							 predict_attnum, relname);
+						predict_datum_isnull = true;
+					}
 				}
 				else
 				{
@@ -507,9 +550,9 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 								 "UPDATE %s SET %s = %s, %s = %s WHERE ctid = '(%u,%u)'",
 								 rel_quoted,
 								 quote_identifier(result_colname),
-								 predict_str,
+								 quote_literal_cstr(predict_str),
 								 quote_identifier(predict_colname),
-								 predict_str,
+								 quote_literal_cstr(predict_str),
 								 ItemPointerGetBlockNumber(&tuple->t_self),
 								 ItemPointerGetOffsetNumber(&tuple->t_self));
 
@@ -538,9 +581,6 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 	MemoryContextDelete(cbcontext);
 
 	SPI_finish();
-
-	if (predict_estate != NULL)
-		FreeExecutorState(predict_estate);
 
 	LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
 	wi->processing = false;
@@ -713,18 +753,32 @@ async_predict_worker_main(Datum main_arg)
 	dboid = wi->dboid;
 	strlcpy(dbname, wi->dbname, MAX_DBNAME_LEN);
 
-	elog(DEBUG1, "async_predict: worker started for database '%s' (oid=%u)", dbname, dboid);
+	elog(LOG, "async_predict: worker started for database '%s' (oid=%u)", dbname, dboid);
 
 	BackgroundWorkerInitializeConnection(dbname, NULL, 0);
 
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 
-	async_predict_process_database(dboid, worker_slot);
+		async_predict_process_database(dboid, worker_slot);
 
-	PopActiveSnapshot();
-	CommitTransactionCommand();
-	pgstat_report_stat(false);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		pgstat_report_stat(false);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *errdata;
+
+		errdata = CopyErrorData();
+		elog(LOG, "async_predict: worker error in database '%s': %s",
+			 dbname, errdata->message);
+		FlushErrorState();
+		AbortOutOfAnyTransaction();
+	}
+	PG_END_TRY();
 
 	LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
 	wi->in_use = false;
