@@ -700,7 +700,6 @@ static void ATExecReplicaIdentity(Relation rel, ReplicaIdentityStmt *stmt, LOCKM
 static void ATExecGenericOptions(Relation rel, List *options);
 static void ATExecSetRowSecurity(Relation rel, bool rls);
 static void ATExecForceNoForceRowSecurity(Relation rel, bool force_rls);
-static void ATExecSetPredictFunction(Relation rel, List *funcname, LOCKMODE lockmode);
 static ObjectAddress ATExecSetCompression(Relation rel,
 										  const char *column, Node *newValue, LOCKMODE lockmode);
 
@@ -4848,9 +4847,6 @@ AlterTableGetLockLevel(List *cmds)
 										 * getTables() */
 				cmd_lockmode = AlterTableGetRelOptionsLockLevel((List *) cmd->def);
 				break;
-			case AT_SetPredictFunction:	/* SET PREDICT FUNCTION */
-				cmd_lockmode = AccessExclusiveLock;
-				break;
 
 			case AT_AttachPartition:
 				cmd_lockmode = ShareUpdateExclusiveLock;
@@ -5208,13 +5204,6 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			ATSimplePermissions(cmd->subtype, rel,
 								ATT_TABLE | ATT_PARTITIONED_TABLE | ATT_VIEW |
 								ATT_MATVIEW | ATT_INDEX);
-			/* This command never recurses */
-			/* No command-specific prep needed */
-			pass = AT_PASS_MISC;
-			break;
-		case AT_SetPredictFunction:	/* SET PREDICT FUNCTION */
-			ATSimplePermissions(cmd->subtype, rel,
-								ATT_TABLE | ATT_PARTITIONED_TABLE);
 			/* This command never recurses */
 			/* No command-specific prep needed */
 			pass = AT_PASS_MISC;
@@ -5585,14 +5574,6 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 		case AT_ReplaceRelOptions:	/* replace entire option list */
 			ATExecSetRelOptions(rel, (List *) cmd->def, cmd->subtype, lockmode);
 			break;
-		case AT_SetPredictFunction:	/* SET PREDICT FUNCTION */
-			{
-				/* Validate that cmd->def is a List */
-				if (!IsA(cmd->def, List))
-					elog(ERROR, "cmd->def is not a List for AT_SetPredictFunction");
-				ATExecSetPredictFunction(rel, (List *) cmd->def, lockmode);
-				break;
-			}
 		case AT_EnableTrig:		/* ENABLE TRIGGER name */
 			ATExecEnableDisableTrigger(rel, cmd->name,
 									   TRIGGER_FIRES_ON_ORIGIN, false,
@@ -6761,8 +6742,6 @@ alter_table_type_to_string(AlterTableType cmdtype)
 			return "ALTER COLUMN ... DROP IDENTITY";
 		case AT_ReAddStatistics:
 			return NULL;		/* not real grammar */
-		case AT_SetPredictFunction:
-			return "SET PREDICT FUNCTION";
 	}
 
 	return NULL;
@@ -17228,102 +17207,6 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 	}
 
 	table_close(pgclass, RowExclusiveLock);
-}
-
-/*
- * Execute ALTER TABLE SET PREDICT FUNCTION
- *
- * Stores the predict function name in reloptions
- */
-static void
-ATExecSetPredictFunction(Relation rel, List *funcname, LOCKMODE lockmode)
-{
-	Oid			relid;
-	Relation	pgclass;
-	HeapTuple	tuple;
-	HeapTuple	newtuple;
-	Datum		datum;
-	Datum		newOptions;
-	Datum		repl_val[Natts_pg_class];
-	bool		repl_null[Natts_pg_class];
-	bool		repl_repl[Natts_pg_class];
-	List	   *defList;
-	char	   *funcname_str;
-	bool		isnull;
-
-	/* Log the function call */
-	elog(LOG, "ATExecSetPredictFunction: setting predict function for relation '%s'",
-		RelationGetRelationName(rel));
-
-	/* Validate funcname parameter */
-	if (funcname == NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("predict function name cannot be empty")));
-
-	/* Only support for tables and partitioned tables */
-	if (rel->rd_rel->relkind != RELKIND_RELATION &&
-		rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("cannot set predict function for relation \"%s\"",
-						RelationGetRelationName(rel)),
-				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
-
-	/* Build function name from list */
-	funcname_str = NameListToString(funcname);
-	elog(LOG, "ATExecSetPredictFunction: function name: '%s'", funcname_str);
-
-	/* Create defList for predict_function option */
-	defList = list_make1(makeDefElem("predict_function",
-									 (Node *) makeString(funcname_str),
-									 -1));
-
-	pgclass = table_open(RelationRelationId, RowExclusiveLock);
-
-	/* Fetch heap tuple */
-	relid = RelationGetRelid(rel);
-	tuple = SearchSysCacheLocked1(RELOID, ObjectIdGetDatum(relid));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u", relid);
-
-	/* Get the old reloptions */
-	datum = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
-				   &isnull);
-	if (isnull)
-		datum = (Datum) 0;
-
-	/* Generate new proposed reloptions (text array) */
-	newOptions = transformRelOptions(datum, defList, NULL, NULL, false, false);
-	elog(LOG, "ATExecSetPredictFunction: newOptions generated successfully");
-
-	/* Update the catalog */
-	memset(repl_val, 0, sizeof(repl_val));
-	memset(repl_null, false, sizeof(repl_null));
-	memset(repl_repl, false, sizeof(repl_repl));
-
-	if (newOptions != (Datum) 0)
-		repl_val[Anum_pg_class_reloptions - 1] = newOptions;
-	else
-		repl_null[Anum_pg_class_reloptions - 1] = true;
-
-	repl_repl[Anum_pg_class_reloptions - 1] = true;
-
-	newtuple = heap_modify_tuple(tuple, RelationGetDescr(pgclass),
-								 repl_val, repl_null, repl_repl);
-
-	CatalogTupleUpdate(pgclass, &newtuple->t_self, newtuple);
-	UnlockTuple(pgclass, &tuple->t_self, InplaceUpdateTupleLock);
-
-	InvokeObjectPostAlterHook(RelationRelationId, RelationGetRelid(rel), 0);
-
-	heap_freetuple(newtuple);
-
-	ReleaseSysCache(tuple);
-
-	table_close(pgclass, RowExclusiveLock);
-
-	elog(LOG, "ATExecSetPredictFunction: completed successfully");
 }
 
 /*

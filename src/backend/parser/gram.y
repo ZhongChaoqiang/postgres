@@ -2772,15 +2772,6 @@ alter_table_cmd:
 					n->subtype = AT_SetUnLogged;
 					$$ = (Node *) n;
 				}
-			/* ALTER TABLE <name> SET PREDICT FUNCTION <funcname> */
-			| SET PREDICT FUNCTION type_function_name
-				{
-					AlterTableCmd *n = makeNode(AlterTableCmd);
-
-					n->subtype = AT_SetPredictFunction;
-					n->def = (Node *) list_make1(makeString($4));
-					$$ = (Node *) n;
-				}
 			/* ALTER TABLE <name> ENABLE TRIGGER <trig> */
 			| ENABLE_P TRIGGER name
 				{

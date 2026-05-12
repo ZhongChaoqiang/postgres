@@ -15,7 +15,6 @@
 
 #include "postgres.h"
 
-extern PGDLLIMPORT Oid get_predict_function_oid(Oid relid, const char *colname);
 extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid, const char *colname);
 
 #endif							/* PREDICT_H */

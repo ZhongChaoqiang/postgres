@@ -74,10 +74,9 @@ SELECT llm_infer('You are a helpful assistant. Reply in one word.', 'What is the
 CREATE TABLE test_llm_articles (
     id SERIAL PRIMARY KEY,
     content TEXT,
-    category TEXT PREDICT
+    category TEXT PREDICT AS (llm_predict()) STORED
 ) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
+    predict_timing = immediate
 );
 
 SELECT set_predict_config(
@@ -107,7 +106,7 @@ SELECT id, content, category FROM test_llm_articles;
   3 | New government policies on climate change were announced today | politics
 ```
 
-**验证点**：`predict_function = 'llm_predict'` 直接引用内置函数，无需指定 schema
+**验证点**：`PREDICT AS (llm_predict()) STORED` 直接引用内置函数，无需指定 schema
 
 ---
 
@@ -118,10 +117,9 @@ CREATE TABLE test_llm_reviews (
     id SERIAL PRIMARY KEY,
     review_text TEXT,
     product_name TEXT,
-    sentiment TEXT PREDICT
+    sentiment TEXT PREDICT AS (llm_predict()) STORED
 ) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
+    predict_timing = immediate
 );
 
 SELECT set_predict_config(
@@ -152,10 +150,9 @@ CREATE TABLE test_llm_tickets (
     id SERIAL PRIMARY KEY,
     subject TEXT,
     description TEXT,
-    priority TEXT PREDICT
+    priority TEXT PREDICT AS (llm_predict()) STORED
 ) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
+    predict_timing = immediate
 );
 
 SELECT set_predict_config(
@@ -178,17 +175,14 @@ INSERT INTO test_llm_tickets (subject, description) VALUES ('Font issue', 'The f
 
 ---
 
-### TC-06: PREDICT 列 + prompt_template + 历史对话 ✅
+### TC-06: PREDICT AS 列 + prompt_template + 历史对话 ✅
 
 ```sql
 CREATE TABLE test_llm_chat (
     id SERIAL PRIMARY KEY,
     user_message TEXT,
-    assistant_reply TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
-);
+    assistant_reply TEXT PREDICT AS (llm_predict()) STORED
+) WITH (predict_timing = immediate);
 
 SELECT set_predict_config(
     'test_llm_chat'::regclass, ...,
@@ -222,11 +216,8 @@ CREATE TABLE test_llm_price (
     id SERIAL PRIMARY KEY,
     product_name TEXT,
     description TEXT,
-    price INTEGER PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
-);
+    price INTEGER PREDICT AS (llm_predict()) STORED
+) WITH (predict_timing = immediate);
 
 INSERT INTO test_llm_price (product_name, description) VALUES ('Widget Pro', 'A high-end widget that costs 499 dollars');
 ```
@@ -307,17 +298,14 @@ WHERE YEARWEEK(wd.record_date) = YEARWEEK(CURDATE() - INTERVAL 1 WEEK);
 
 ---
 
-### TC-RAG2: llm_rag_predict PREDICT 列自动推理 ✅
+### TC-RAG2: PREDICT AS 列 + llm_rag_predict 自动推理 ✅
 
 ```sql
 CREATE TABLE production_qa (
     id SERIAL PRIMARY KEY,
     question TEXT,
-    sql_result TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_rag_predict'
-);
+    sql_result TEXT PREDICT AS (llm_rag_predict()) STORED
+) WITH (predict_timing = immediate);
 
 INSERT INTO production_qa (question) VALUES ('昨天生产情况');
 ```
@@ -329,7 +317,7 @@ INSERT INTO production_qa (question) VALUES ('昨天生产情况');
   1 | 昨天生产情况 | SELECT * FROM production WHERE DATE(create_time) = DATE_SUB(CURDATE(), INTERVAL 1 DAY);
 ```
 
-**验证点**：`predict_function = 'llm_rag_predict'` 直接引用内置函数
+**验证点**：`PREDICT AS (llm_rag_predict()) STORED` 直接引用内置函数
 
 ---
 
@@ -339,8 +327,8 @@ INSERT INTO production_qa (question) VALUES ('昨天生产情况');
 CREATE TABLE sentiment_test (
     id SERIAL PRIMARY KEY,
     review_text TEXT,
-    sentiment_score INTEGER PREDICT
-) WITH (predict_timing = immediate, predict_function = 'llm_rag_predict');
+    sentiment_score INTEGER PREDICT AS (llm_rag_predict()) STORED
+) WITH (predict_timing = immediate);
 ```
 
 **实际结果**：
@@ -405,7 +393,7 @@ AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog');
  llm_rag_predict | pg_catalog   | 6507
 ```
 
-**验证点**：`llm_predict` 和 `llm_rag_predict` 已注册为 `pg_catalog` 内置函数，可直接作为 `predict_function` 使用
+**验证点**：`llm_predict` 和 `llm_rag_predict` 已注册为 `pg_catalog` 内置函数，可在 `PREDICT AS` 表达式中直接使用
 
 ## 4. 测试结果汇总
 
@@ -464,23 +452,19 @@ AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog');
 
 **使用方式**：
 ```sql
--- 直接使用内置函数名，无需 schema 前缀
+-- 使用 PREDICT AS 语法，直接引用内置函数
 CREATE TABLE t (
     id SERIAL PRIMARY KEY,
     input TEXT,
-    output TEXT PREDICT
-) WITH (
-    predict_function = 'llm_predict'       -- 内置函数
-);
+    output TEXT PREDICT AS (llm_predict()) STORED
+) WITH (predict_timing = immediate);
 
 -- RAG 增强推理
 CREATE TABLE t (
     id SERIAL PRIMARY KEY,
     question TEXT,
-    answer TEXT PREDICT
-) WITH (
-    predict_function = 'llm_rag_predict'   -- 内置函数
-);
+    answer TEXT PREDICT AS (llm_rag_predict()) STORED
+) WITH (predict_timing = immediate);
 ```
 
 ## 6. 已知问题
@@ -504,7 +488,7 @@ CREATE TABLE t (
 
 pg_predict 扩展使用火山引擎豆包大模型真实 API 进行端到端测试，所有 17 项测试用例全部通过，包括：
 - `llm_predict` 和 `llm_rag_predict` 已注册为 `pg_catalog` 内置函数（OID 6506/6507）
-- 可直接作为 `predict_function` 使用，无需指定 schema
+- 可直接在 `PREDICT AS` 表达式中使用，无需指定 schema
 - `{{column_name}}` 模板语法正确替换（单列、多列）
 - 整行数据自动格式化为键值对（无模板模式）
 - 历史对话正确构建，LLM 能引用上下文

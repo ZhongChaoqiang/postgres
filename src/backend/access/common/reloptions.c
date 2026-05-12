@@ -653,19 +653,6 @@ static relopt_string stringRelOpts[] =
 {
 	{
 		{
-			"predict_function",
-			"Sets the prediction function for the table",
-			RELOPT_KIND_HEAP,
-			AccessExclusiveLock
-		},
-		0,
-		true,
-		NULL,
-		NULL,
-		NULL
-	},
-	{
-		{
 			"embedding_function",
 			"Sets the embedding function for the table (output type: vector)",
 			RELOPT_KIND_HEAP,
@@ -2034,8 +2021,6 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
 		{"predict_timing", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, predict_timing)},
-		{"predict_function", RELOPT_TYPE_STRING,
-		offsetof(StdRdOptions, predict_function)},
 		{"embedding_function", RELOPT_TYPE_STRING,
 		offsetof(StdRdOptions, embedding_function)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,

@@ -403,7 +403,7 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 		}
 		else
 		{
-			elog(DEBUG1, "async_predict: no predict function for table %s", relname);
+			elog(DEBUG1, "async_predict: no predict expression for table %s", relname);
 			return;
 		}
 	}
@@ -638,7 +638,6 @@ async_predict_process_database(Oid dboid, int worker_slot)
 		{
 			Form_pg_attribute attr_form = (Form_pg_attribute) GETSTRUCT(attr_tuple);
 			AttrNumber	predict_attnum;
-			Oid			funcoid;
 			Relation	rel;
 			char	   *predict_colname;
 			char	   *attrname;
@@ -664,8 +663,6 @@ async_predict_process_database(Oid dboid, int worker_slot)
 
 			pfree(predict_colname);
 
-			funcoid = InvalidOid;
-
 			if (attr_form->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
 			{
 				rel = try_relation_open(reloid, RowExclusiveLock);
@@ -688,30 +685,9 @@ async_predict_process_database(Oid dboid, int worker_slot)
 			}
 			else
 			{
-				funcoid = get_predict_function_oid(reloid, attrname);
-				if (!OidIsValid(funcoid))
-				{
-					elog(DEBUG1, "async_predict: no predict function for table %s", relname);
-					continue;
-				}
-
-				rel = try_relation_open(reloid, RowExclusiveLock);
-				if (!rel)
-				{
-					elog(DEBUG1, "async_predict: could not open table %s", relname);
-					continue;
-				}
-
-				LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
-				wi->relid = reloid;
-				wi->processing = true;
-				wi->last_scan = GetCurrentTimestamp();
-				LWLockRelease(AsyncPredictLock);
-
-				async_predict_process_table(rel, attr_form->attnum, predict_attnum,
-										   funcoid, worker_slot);
-
-				table_close(rel, RowExclusiveLock);
+				elog(DEBUG1, "async_predict: predict column %s on table %s does not use PREDICT AS syntax, skipping",
+					 attrname, relname);
+				continue;
 			}
 		}
 

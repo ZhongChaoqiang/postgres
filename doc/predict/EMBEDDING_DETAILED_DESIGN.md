@@ -149,7 +149,7 @@ typedef struct StdRdOptions
 ```c
 static relopt_string stringRelOpts[] =
 {
-    // ... predict_function 选项
+    // ... predict_timing 选项
     {
         {
             "embedding_function",
@@ -172,7 +172,7 @@ static relopt_string stringRelOpts[] =
 typedef struct StdRdOptions
 {
     // ... 现有字段
-    int     predict_function;    /* offset to predict function name string */
+    StdRdOptPredictTiming predict_timing;    /* controls prediction timing */
     int     embedding_function;  /* offset to embedding function name string */
 } StdRdOptions;
 ```
@@ -187,7 +187,7 @@ typedef struct StdRdOptions
 **文件**: `src/include/utils/predict.h`
 
 ```c
-extern PGDLLIMPORT Oid get_predict_function_oid(Oid relid);
+extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid);
 extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid, const char *colname);
 ```
 
@@ -548,11 +548,10 @@ SELECT id, title, title_embedding, body, body_embedding FROM articles;
 CREATE TABLE predictions (
     id SERIAL PRIMARY KEY,
     text_content TEXT EMBEDDING,
-    value INTEGER PREDICT
+    value INTEGER PREDICT AS (ml_predict(text_content)) STORED
 ) WITH (
     vector_len = 256,
     predict_timing = immediate,
-    predict_function = 'ml_predict',
     embedding_function = 'text_embedding_func'
 );
 
@@ -840,7 +839,7 @@ if (cxt->vector_index != NULL && cxt->vector_distance != NULL)
 | 标记字段 | attpredict | attembedding |
 | 自动创建列 | `_predict`, `_actual` | `_embedding` |
 | 自动创建列类型 | 与原列相同 | vector(N) |
-| 表级选项 | predict_timing, predict_function | vector_len, embedding_function |
+| 表级选项 | predict_timing | vector_len, embedding_function |
 | 触发器 | 自动创建预测触发器 | 自动创建嵌入触发器 |
 | 用途 | 存储预测值和实际值 | 存储嵌入向量 |
 

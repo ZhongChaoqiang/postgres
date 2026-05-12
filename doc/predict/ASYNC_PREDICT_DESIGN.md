@@ -374,11 +374,8 @@ CREATE TABLE predictions (
     id SERIAL PRIMARY KEY,
     feature1 float,
     feature2 float,
-    result float PREDICT
-) WITH (
-    predict_timing = deferred,
-    predict_function = 'my_predict'
-);
+    result float PREDICT AS (my_predict(feature1, feature2)) STORED
+) WITH (predict_timing = deferred);
 
 -- 插入数据（predict 列为 NULL）
 INSERT INTO predictions (feature1, feature2) VALUES (1.0, 2.0);
@@ -440,11 +437,8 @@ CREATE TABLE predictions (
     id SERIAL PRIMARY KEY,
     feature1 float,
     feature2 float,
-    result float PREDICT
-) WITH (
-    predict_timing = immediate,    -- 实时预测
-    predict_function = 'my_predict'
-);
+    result float PREDICT AS (my_predict(feature1, feature2)) STORED
+) WITH (predict_timing = immediate);
 
 -- 当 result 为 NULL 时，触发器立即调用预测函数
 INSERT INTO predictions (feature1, feature2) VALUES (1.0, 2.0);
@@ -458,11 +452,8 @@ CREATE TABLE predictions (
     id SERIAL PRIMARY KEY,
     feature1 float,
     feature2 float,
-    result float PREDICT
-) WITH (
-    predict_timing = deferred,     -- 异步预测
-    predict_function = 'my_predict'
-);
+    result float PREDICT AS (my_predict(feature1, feature2)) STORED
+) WITH (predict_timing = deferred);
 
 -- 数据插入后，result_predict 为 NULL
 INSERT INTO predictions (feature1, feature2) VALUES (1.0, 2.0);

@@ -178,11 +178,8 @@ ORDER BY 统计日期;
 CREATE TABLE production_qa (
     id SERIAL PRIMARY KEY,
     question TEXT,
-    sql_result TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_rag_predict'
-);
+    sql_result TEXT PREDICT AS (llm_rag_predict()) STORED
+) WITH (predict_timing = immediate);
 
 SELECT set_predict_config(
     'production_qa'::regclass,
@@ -227,11 +224,8 @@ INSERT INTO production_qa (question) VALUES ('昨天生产情况');
 CREATE TABLE sentiment_test (
     id SERIAL PRIMARY KEY,
     review_text TEXT,
-    sentiment_score INTEGER PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_rag_predict'
-);
+    sentiment_score INTEGER PREDICT AS (llm_rag_predict()) STORED
+) WITH (predict_timing = immediate);
 
 SELECT set_predict_config(
     'sentiment_test'::regclass,
@@ -280,11 +274,8 @@ INSERT INTO sentiment_test (review_text) VALUES ('It is okay, nothing special');
 CREATE TABLE score_test (
     id SERIAL PRIMARY KEY,
     student_name TEXT,
-    math_score FLOAT8 PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_rag_predict'
-);
+    math_score FLOAT8 PREDICT AS (llm_rag_predict()) STORED
+) WITH (predict_timing = immediate);
 
 SELECT set_predict_config(
     'score_test'::regclass,
@@ -333,11 +324,8 @@ INSERT INTO score_test (student_name) VALUES ('Charlie - average math student');
 CREATE TABLE spam_test (
     id SERIAL PRIMARY KEY,
     email_content TEXT,
-    is_spam BOOLEAN PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_rag_predict'
-);
+    is_spam BOOLEAN PREDICT AS (llm_rag_predict()) STORED
+) WITH (predict_timing = immediate);
 
 SELECT set_predict_config(
     'spam_test'::regclass,

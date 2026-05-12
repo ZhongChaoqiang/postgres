@@ -52,6 +52,8 @@ SET pg_predict.temperature = 0.7;
 SET pg_predict.max_tokens = 1024;
 ```
 
+> **注意**：deferred 模式下，GUC 参数必须使用 `ALTER SYSTEM SET` 设置为全局级别。
+
 ### 2.2 表级配置
 
 为特定表配置 LLM 参数，覆盖系统级配置：
@@ -142,103 +144,97 @@ FROM documents
 WHERE language = 'zh';
 ```
 
-## 5. 使用 llm_predict 与 PREDICT 列集成
+## 5. 使用 PREDICT AS 与 PREDICT 列集成
 
-### 5.1 文本分类（单列模板）
+> **重要**：`predict_function` 参数已被移除，所有 predict 列必须使用 `PREDICT AS (expr) STORED` 语法。
+
+### 5.1 文本分类（直接使用 llm_infer）
 
 ```sql
 CREATE TABLE articles (
     id SERIAL PRIMARY KEY,
     content TEXT,
-    category TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
-);
-
-SELECT set_predict_config(
-    'articles'::regclass,
-    'https://api.openai.com/v1/chat/completions',
-    'sk-xxx',
-    'gpt-3.5-turbo',
-    0.3, 1024,
-    'Classify into: technology, sports, politics, entertainment. Reply with only the category name.',
-    'Classify this text: {{content}}',
-    0
-);
+    category TEXT PREDICT AS (llm_infer(
+        'Classify into: technology, sports, politics, entertainment. Reply with only the category name.',
+        'Classify this text: ' || content
+    )) STORED
+) WITH (predict_timing = immediate);
 
 INSERT INTO articles (content) VALUES ('AI and machine learning are transforming software');
 -- category 自动填充为 'technology'
 ```
 
-### 5.2 情感分析（多列模板）
+### 5.2 使用自定义包装函数
 
 ```sql
+CREATE OR REPLACE FUNCTION classify_text(content TEXT) RETURNS TEXT
+AS $$
+    SELECT llm_infer(
+        'Classify into: technology, sports, politics, entertainment. Reply with only the category name.',
+        'Classify this text: ' || content
+    );
+$$ LANGUAGE SQL VOLATILE;
+
+CREATE TABLE articles (
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    category TEXT PREDICT AS (classify_text(content)) STORED
+) WITH (predict_timing = immediate);
+```
+
+### 5.3 情感分析（多列模板）
+
+```sql
+CREATE OR REPLACE FUNCTION analyze_sentiment(review_text TEXT, product_name TEXT) RETURNS TEXT
+AS $$
+    SELECT llm_infer(
+        'Analyze sentiment. Reply with only: positive, negative, or neutral.',
+        'Review of ' || product_name || ': ' || review_text
+    );
+$$ LANGUAGE SQL VOLATILE;
+
 CREATE TABLE reviews (
     id SERIAL PRIMARY KEY,
     review_text TEXT,
     product_name TEXT,
-    sentiment TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
-);
-
-SELECT set_predict_config(
-    'reviews'::regclass,
-    'https://api.openai.com/v1/chat/completions',
-    'sk-xxx',
-    'gpt-3.5-turbo',
-    0.1, 256,
-    'Analyze sentiment. Reply with only: positive, negative, or neutral.',
-    'Review of {{product_name}}: {{review_text}}',
-    0
-);
+    sentiment TEXT PREDICT AS (analyze_sentiment(review_text, product_name)) STORED
+) WITH (predict_timing = immediate);
 
 INSERT INTO reviews (review_text, product_name) VALUES ('This product is amazing!', 'Widget Pro');
 -- sentiment 自动填充为 'positive'
 ```
 
-### 5.3 数值预测（自动类型转换）
+### 5.4 数值预测（自动类型转换）
 
 ```sql
+CREATE OR REPLACE FUNCTION estimate_price(product_name TEXT, description TEXT) RETURNS INTEGER
+AS $$
+    SELECT llm_infer(
+        'Estimate the price in dollars. Reply with only the number.',
+        'Product: ' || product_name || ', Description: ' || description
+    )::integer;
+$$ LANGUAGE SQL VOLATILE;
+
 CREATE TABLE product_ratings (
     id SERIAL PRIMARY KEY,
     product_name TEXT,
     description TEXT,
-    price INTEGER PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
-);
-
-SELECT set_predict_config(
-    'product_ratings'::regclass,
-    'https://api.openai.com/v1/chat/completions',
-    'sk-xxx',
-    'gpt-3.5-turbo',
-    0.1, 16,
-    'Estimate the price in dollars. Reply with only the number.',
-    'Product: {{product_name}}, Description: {{description}}',
-    0
-);
+    price INTEGER PREDICT AS (estimate_price(product_name, description)) STORED
+) WITH (predict_timing = immediate);
 
 INSERT INTO product_ratings (product_name, description) VALUES ('Widget Pro', 'A high-end widget that costs 499 dollars');
 -- price 自动填充为 499 (INTEGER 类型自动转换)
 ```
 
-### 5.4 无模板（自动行格式化）
+### 5.5 无模板（自动行格式化）
 
 ```sql
 CREATE TABLE support_tickets (
     id SERIAL PRIMARY KEY,
     subject TEXT,
     description TEXT,
-    priority TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
-);
+    priority TEXT PREDICT AS (llm_predict()) STORED
+) WITH (predict_timing = immediate);
 
 SELECT set_predict_config(
     'support_tickets'::regclass,
@@ -259,17 +255,14 @@ INSERT INTO support_tickets (subject, description) VALUES ('System down', 'Produ
 --  priority: "
 ```
 
-### 5.5 带历史对话的推理
+### 5.6 带历史对话的推理
 
 ```sql
 CREATE TABLE chat_logs (
     id SERIAL PRIMARY KEY,
     user_message TEXT,
-    assistant_reply TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_predict'
-);
+    assistant_reply TEXT PREDICT AS (llm_predict()) STORED
+) WITH (predict_timing = immediate);
 
 SELECT set_predict_config(
     'chat_logs'::regclass,
@@ -343,31 +336,26 @@ SELECT llm_rag_infer(
 );
 ```
 
-### 6.5 使用 llm_rag_predict 与 PREDICT 列集成
+### 6.5 使用 PREDICT AS 与 RAG 推理集成
 
 ```sql
+CREATE OR REPLACE FUNCTION rag_answer(question TEXT) RETURNS TEXT
+AS $$
+    SELECT llm_rag_infer(
+        'Answer the question based on the provided context. If the context does not contain the answer, say you do not know.',
+        0,
+        question,
+        'knowledge_base'::regclass,
+        0.5,
+        3
+    );
+$$ LANGUAGE SQL VOLATILE;
+
 CREATE TABLE qa_table (
     id SERIAL PRIMARY KEY,
     question TEXT,
-    answer TEXT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'llm_rag_predict'
-);
-
-SELECT set_predict_config(
-    'qa_table'::regclass,
-    'https://api.openai.com/v1/chat/completions',
-    'sk-xxx',
-    'gpt-3.5-turbo',
-    0.3, 1024,
-    'Answer the question based on the provided context. If the context does not contain the answer, say you do not know.',
-    '{{question}}',
-    2,
-    'knowledge_base'::regclass,
-    0.5,
-    3
-);
+    answer TEXT PREDICT AS (rag_answer(question)) STORED
+) WITH (predict_timing = immediate);
 
 INSERT INTO qa_table (question) VALUES ('How to create a table?');
 -- answer 自动填充，基于 RAG 检索的上下文
@@ -485,7 +473,7 @@ ERROR: different vector dimensions
 ```
 **解决**：确保 RAG 表的 embedding 函数与查询使用的维度一致
 
-### 9.8 llm_rag_predict 未使用 RAG
+### 9.8 PREDICT AS 中 llm_rag_predict 未使用 RAG
 
 **可能原因**：
 - `rag_table` 未在 `pg_predict_config` 中配置

@@ -560,7 +560,7 @@ answer: Use CREATE TABLE statement to define a new table.
 ```
 
 **类型转换**：
-当 `llm_rag_predict` 作为 PREDICT 列的 predict_function 使用时，`predict_trigger` 自动将 LLM 返回的文本结果转换为目标列类型（与 `llm_predict` 相同的类型转换逻辑）。
+当 `llm_rag_predict` 作为 PREDICT AS 表达式使用时，`predict_trigger` 自动将 LLM 返回的文本结果转换为目标列类型（与 `llm_predict` 相同的类型转换逻辑）。
 
 ## 7. 错误处理
 

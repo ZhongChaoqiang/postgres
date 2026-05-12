@@ -2,24 +2,24 @@
 
 ## 1. 概述
 
-本报告分析 MindsDB 现有的功能算子（ML Handlers），识别哪些算子可以迁移到我们 PostgreSQL 自定义版本的 `predict_function` 和 `embedding_function` 框架中。
+本报告分析 MindsDB 现有的功能算子（ML Handlers），识别哪些算子可以迁移到我们 PostgreSQL 自定义版本的 `PREDICT AS (expr) STORED` 和 `embedding_function` 框架中。
 
 ### 1.1 我们的框架简介
 
 | 功能 | 接口 | 输入 | 输出 | 触发方式 |
 |------|------|------|------|---------|
-| `predict_function` | `func(record) → any` | 整行数据（record类型） | 任意类型（写入PREDICT列） | BEFORE INSERT/UPDATE触发器 或 异步后台进程 |
+| `PREDICT AS` | `col type PREDICT AS (expr) STORED` | 内联表达式 | 任意类型（写入PREDICT列） | BEFORE INSERT/UPDATE触发器 或 异步后台进程 |
 | `embedding_function` | `func(text) → vector` | 文本列值（text类型） | 向量（vector类型） | BEFORE INSERT/UPDATE触发器 + 查询重写 |
 
 ### 1.2 迁移评估标准
 
-- **predict_function 迁移条件**：算子的核心功能是对行数据进行推理/预测，输入可映射为 record，输出可映射为标量类型
+- **PREDICT AS 迁移条件**：算子的核心功能是对行数据进行推理/预测，输入可映射为表达式参数，输出可映射为标量类型
 - **embedding_function 迁移条件**：算子的核心功能是将文本转换为向量嵌入，输入为 text，输出为 vector
 - **优先级评估**：基于功能实用性、迁移可行性、用户需求频率
 
 ---
 
-## 2. 可迁移到 predict_function 的算子
+## 2. 可迁移到 PREDICT AS 的算子
 
 ### 2.1 OpenAI（文本生成/问答）
 
@@ -43,7 +43,7 @@ FROM openai_model
 WHERE question = 'Where is Stockholm located?';
 ```
 
-**迁移方案**：将 OpenAI 的文本生成/问答能力封装为 PostgreSQL 的 `predict_function`，通过触发器自动调用。
+**迁移方案**：将 OpenAI 的文本生成/问答能力封装为 PostgreSQL 的 `PREDICT AS`，通过触发器自动调用。
 
 **迁移后使用样例**：
 ```sql
@@ -72,7 +72,7 @@ CREATE TABLE qa_table (
     question text,
     answer text PREDICT
 ) WITH (
-    predict_function = 'openai_predict',
+    PREDICT AS ('openai_predict',
     predict_timing = 'immediate'
 );
 
@@ -105,7 +105,7 @@ USING
 SELECT answer FROM claude_model WHERE question = 'Explain quantum computing';
 ```
 
-**迁移方案**：与 OpenAI 类似，封装为 `predict_function`。
+**迁移方案**：与 OpenAI 类似，封装为 `PREDICT AS`。
 
 **迁移后使用样例**：
 ```sql
@@ -130,7 +130,7 @@ CREATE TABLE ai_responses (
     input_text text,
     response text PREDICT
 ) WITH (
-    predict_function = 'claude_predict',
+    PREDICT AS ('claude_predict',
     predict_timing = 'immediate'
 );
 ```
@@ -160,7 +160,7 @@ FROM llama3_model
 WHERE text = 'Hello';
 ```
 
-**迁移方案**：封装为 `predict_function`，通过 HTTP 调用本地 Ollama 服务。
+**迁移方案**：封装为 `PREDICT AS`，通过 HTTP 调用本地 Ollama 服务。
 
 **迁移后使用样例**：
 ```sql
@@ -184,7 +184,7 @@ CREATE TABLE local_ai (
     input_text text,
     completion text PREDICT
 ) WITH (
-    predict_function = 'ollama_predict',
+    PREDICT AS ('ollama_predict',
     predict_timing = 'immediate'
 );
 ```
@@ -213,7 +213,7 @@ USING
 SELECT * FROM chat_model WHERE question = "what is ai?";
 ```
 
-**迁移方案**：封装为 `predict_function`，利用 LiteLLM 的统一接口支持多种 LLM。
+**迁移方案**：封装为 `PREDICT AS`，利用 LiteLLM 的统一接口支持多种 LLM。
 
 **迁移后使用样例**：
 ```sql
@@ -238,7 +238,7 @@ CREATE TABLE multi_llm (
     model text DEFAULT 'gpt-3.5-turbo',
     answer text PREDICT
 ) WITH (
-    predict_function = 'litellm_predict',
+    PREDICT AS ('litellm_predict',
     predict_timing = 'immediate'
 );
 ```
@@ -268,7 +268,7 @@ AND number_of_rooms = 2
 AND location = 'good';
 ```
 
-**迁移方案**：将 Lightwood 训练好的模型封装为 `predict_function`，在触发器中调用已训练模型进行推理。这是最核心的迁移场景，因为 Lightwood 的 predict 接口与我们的 predict_function 语义完全匹配。
+**迁移方案**：将 Lightwood 训练好的模型封装为 `PREDICT AS`，在触发器中调用已训练模型进行推理。这是最核心的迁移场景，因为 Lightwood 的 predict 接口与我们的 PREDICT AS 语义完全匹配。
 
 **迁移后使用样例**：
 ```sql
@@ -302,7 +302,7 @@ CREATE TABLE home_rentals (
     days_on_market int,
     rental_price float PREDICT
 ) WITH (
-    predict_function = 'lightwood_predict',
+    PREDICT AS ('lightwood_predict',
     predict_timing = 'deferred'
 );
 
@@ -339,7 +339,7 @@ FROM irisdb.Iris as t
 JOIN my_pycaret_class_model AS m;
 ```
 
-**迁移方案**：将 PyCaret 训练好的模型封装为 `predict_function`，支持多种 ML 任务。
+**迁移方案**：将 PyCaret 训练好的模型封装为 `PREDICT AS`，支持多种 ML 任务。
 
 **迁移后使用样例**：
 ```sql
@@ -366,7 +366,7 @@ CREATE TABLE iris_predictions (
     petal_width float,
     species text PREDICT
 ) WITH (
-    predict_function = 'pycaret_predict',
+    PREDICT AS ('pycaret_predict',
     predict_timing = 'deferred'
 );
 ```
@@ -401,7 +401,7 @@ PREDICT class
 USING engine = 'anomaly_detection_engine', type = 'supervised';
 ```
 
-**迁移方案**：将异常检测模型封装为 `predict_function`，输出为布尔值或异常分数。
+**迁移方案**：将异常检测模型封装为 `PREDICT AS`，输出为布尔值或异常分数。
 
 **迁移后使用样例**：
 ```sql
@@ -427,7 +427,7 @@ CREATE TABLE sensor_data (
     vibration float,
     is_anomaly boolean PREDICT
 ) WITH (
-    predict_function = 'anomaly_predict',
+    PREDICT AS ('anomaly_predict',
     predict_timing = 'immediate'
 );
 
@@ -462,7 +462,7 @@ SELECT answer FROM cohere_model
 WHERE question = 'What is the capital of France?';
 ```
 
-**迁移方案**：封装为 `predict_function`，支持文本生成和摘要两种任务。
+**迁移方案**：封装为 `PREDICT AS`，支持文本生成和摘要两种任务。
 
 **迁移后使用样例**：
 ```sql
@@ -486,7 +486,7 @@ CREATE TABLE cohere_responses (
     question text,
     answer text PREDICT
 ) WITH (
-    predict_function = 'cohere_predict',
+    PREDICT AS ('cohere_predict',
     predict_timing = 'immediate'
 );
 ```
@@ -520,7 +520,7 @@ JOIN cryptocurrency_forecast_model AS m
 WHERE d.open_time > LATEST;
 ```
 
-**迁移方案**：将 TimeGPT 的预测能力封装为 `predict_function`，结合 `predict_timing = 'deferred'` 实现批量时序预测。
+**迁移方案**：将 TimeGPT 的预测能力封装为 `PREDICT AS`，结合 `predict_timing = 'deferred'` 实现批量时序预测。
 
 **迁移后使用样例**：
 ```sql
@@ -547,7 +547,7 @@ CREATE TABLE time_series_data (
     value float,
     predicted_value float PREDICT
 ) WITH (
-    predict_function = 'timegpt_predict',
+    PREDICT AS ('timegpt_predict',
     predict_timing = 'deferred'
 );
 ```
@@ -582,7 +582,7 @@ PREDICT target
 USING ENGINE = 'custom_model_engine';
 ```
 
-**迁移方案**：BYOM 的理念与我们的 `predict_function` 高度一致——用户自定义函数来处理数据。我们的框架天然支持 BYOM，用户可以直接编写 PostgreSQL 函数（plpython3u/plperl 等）来实现任意预测逻辑。
+**迁移方案**：BYOM 的理念与我们的 `PREDICT AS` 高度一致——用户自定义函数来处理数据。我们的框架天然支持 BYOM，用户可以直接编写 PostgreSQL 函数（plpython3u/plperl 等）来实现任意预测逻辑。
 
 **迁移后使用样例**：
 ```sql
@@ -606,7 +606,7 @@ CREATE TABLE custom_predictions (
     feature2 float,
     target float PREDICT
 ) WITH (
-    predict_function = 'my_custom_predict',
+    PREDICT AS ('my_custom_predict',
     predict_timing = 'immediate'
 );
 ```
@@ -633,7 +633,7 @@ USING
 SELECT sentiment FROM sentiment_model WHERE text = 'I love this product!';
 ```
 
-**迁移方案**：将 HuggingFace pipeline 封装为 `predict_function`，支持各种 NLP 任务的推理。
+**迁移方案**：将 HuggingFace pipeline 封装为 `PREDICT AS`，支持各种 NLP 任务的推理。
 
 **迁移后使用样例**：
 ```sql
@@ -658,7 +658,7 @@ CREATE TABLE reviews (
     review_text text,
     sentiment text PREDICT
 ) WITH (
-    predict_function = 'hf_classify_predict',
+    PREDICT AS ('hf_classify_predict',
     predict_timing = 'deferred'
 );
 ```
@@ -685,7 +685,7 @@ USING engine = 'gemini_engine', model_name = 'gemini-pro';
 SELECT answer FROM gemini_model WHERE question = 'Explain AI';
 ```
 
-**迁移方案**：封装为 `predict_function`，支持 Gemini 的文本生成和视觉理解能力。
+**迁移方案**：封装为 `PREDICT AS`，支持 Gemini 的文本生成和视觉理解能力。
 
 **迁移后使用样例**：
 ```sql
@@ -710,7 +710,7 @@ CREATE TABLE gemini_responses (
     question text,
     answer text PREDICT
 ) WITH (
-    predict_function = 'gemini_predict',
+    PREDICT AS ('gemini_predict',
     predict_timing = 'immediate'
 );
 ```
@@ -744,7 +744,7 @@ SELECT b.* FROM lightfm_demo AS b WHERE userId = 100
 USING recommender_type = 'user_item';
 ```
 
-**迁移方案**：将推荐模型封装为 `predict_function`，输入用户信息，输出推荐结果。
+**迁移方案**：将推荐模型封装为 `PREDICT AS`，输入用户信息，输出推荐结果。
 
 **迁移后使用样例**：
 ```sql
@@ -769,7 +769,7 @@ CREATE TABLE user_recommendations (
     user_id int,
     recommended_items text PREDICT
 ) WITH (
-    predict_function = 'lightfm_predict',
+    PREDICT AS ('lightfm_predict',
     predict_timing = 'deferred'
 );
 ```
@@ -796,7 +796,7 @@ USING
   model_name = 'xgboost';
 ```
 
-**迁移方案**：将 XGBoost 模型封装为 `predict_function`。
+**迁移方案**：将 XGBoost 模型封装为 `PREDICT AS`。
 
 **迁移后使用样例**：
 ```sql
@@ -823,7 +823,7 @@ CREATE TABLE xgb_predictions (
     feature2 float,
     target float PREDICT
 ) WITH (
-    predict_function = 'xgboost_predict',
+    PREDICT AS ('xgboost_predict',
     predict_timing = 'deferred'
 );
 ```
@@ -851,7 +851,7 @@ USING
 SELECT target FROM mlflow_model WHERE text = 'input data';
 ```
 
-**迁移方案**：将 MLflow 的 HTTP 推理接口封装为 `predict_function`。
+**迁移方案**：将 MLflow 的 HTTP 推理接口封装为 `PREDICT AS`。
 
 **迁移后使用样例**：
 ```sql
@@ -878,7 +878,7 @@ CREATE TABLE mlflow_predictions (
     feature2 float,
     target float PREDICT
 ) WITH (
-    predict_function = 'mlflow_predict',
+    PREDICT AS ('mlflow_predict',
     predict_timing = 'deferred'
 );
 ```
@@ -1187,7 +1187,7 @@ CREATE TABLE lc_documents (
 
 ## 4. 迁移优先级与可行性总结
 
-### 4.1 predict_function 迁移优先级
+### 4.1 PREDICT AS 迁移优先级
 
 | 优先级 | 算子 | 迁移难度 | 用户需求 | 说明 |
 |--------|------|---------|---------|------|
@@ -1258,7 +1258,7 @@ CREATE TABLE lc_documents (
 6. **PostgreSQL 生态**：完整的事务、并发、索引支持
 
 ### 5.4关键发现
-   1. BYOM 理念与我们的框架天然匹配 ：MindsDB 的 BYOM 允许用户自定义 Python 模型，我们的 predict_function 本质上就是"用户自定义预测函数"
+   1. BYOM 理念与我们的框架天然匹配 ：MindsDB 的 BYOM 允许用户自定义 Python 模型，我们的 PREDICT AS 本质上就是"用户自定义预测函数"
    2. 我们的框架在自动化方面更优 ：MindsDB 需要 JOIN 查询来触发预测，我们通过触发器自动完成
    3. 我们的向量搜索更原生 ：EMBEDDING 列自动生成向量 + 查询重写，而 MindsDB 需要额外的模型调用来获取嵌入
    4. MindsDB 在模型管理方面更完善 ：支持版本管理、微调、评估、描述等，这些是我们后续可以借鉴的方向
@@ -1269,32 +1269,32 @@ CREATE TABLE lc_documents (
 
 ### 6.1 第一阶段：核心算子迁移（P0）
 
-1. **OpenAI predict_function**：封装 OpenAI Chat API，支持文本生成和问答
+1. **OpenAI PREDICT AS**：封装 OpenAI Chat API，支持文本生成和问答
 2. **OpenAI embedding_function**：封装 OpenAI Embeddings API
 3. **Sentence Transformers embedding_function**：本地嵌入生成
-4. **BYOM predict_function**：完善自定义函数支持文档和示例
+4. **BYOM PREDICT AS**：完善自定义函数支持文档和示例
 
 ### 6.2 第二阶段：扩展算子迁移（P1）
 
 1. **Ollama predict/embedding_function**：本地 LLM 支持
-2. **Lightwood/PyCaret predict_function**：AutoML 推理
-3. **Anomaly Detection predict_function**：异常检测
-4. **HuggingFace predict_function**：NLP 任务推理
+2. **Lightwood/PyCaret PREDICT AS**：AutoML 推理
+3. **Anomaly Detection PREDICT AS**：异常检测
+4. **HuggingFace PREDICT AS**：NLP 任务推理
 
 ### 6.3 第三阶段：高级功能（P2-P3）
 
 1. **LiteLLM predict/embedding_function**：统一 LLM 接口
-2. **Anthropic/Cohere/Gemini predict_function**：多 LLM 提供商
-3. **TimeGPT predict_function**：时序预测
-4. **LightFM predict_function**：推荐系统
-5. **MLflow predict_function**：模型服务化
+2. **Anthropic/Cohere/Gemini PREDICT AS**：多 LLM 提供商
+3. **TimeGPT PREDICT AS**：时序预测
+4. **LightFM PREDICT AS**：推荐系统
+5. **MLflow PREDICT AS**：模型服务化
 
 ### 6.4 实现模式建议
 
 所有迁移的函数建议遵循统一的实现模式：
 
 ```sql
--- predict_function 统一模板
+-- PREDICT AS 统一模板
 CREATE OR REPLACE FUNCTION <engine>_predict(row_data record)
 RETURNS <target_type>
 LANGUAGE plpython3u

@@ -6,7 +6,7 @@
 PREDICT列和PREDICT函数是PostgreSQL的一个扩展功能，用于在插入数据时自动计算预测值。该功能通过以下组件实现：
 
 - **PREDICT列属性**：标记列为预测列，支持任意基础数据类型
-- **PREDICT函数**：用户自定义的预测计算函数
+- **PREDICT AS 语法**：使用 `PREDICT AS (expr) STORED` 内联指定预测表达式
 - **预测触发器**：自动处理预测逻辑的触发器函数
 - **关系选项**：控制预测行为的表级选项
 - **EMBEDDING列属性**：标记列为嵌入向量列，自动创建向量存储列
@@ -17,7 +17,7 @@ PREDICT功能的主要实现包括：
 - 自动创建预测结果列（`_predict`后缀列）
 - 自动创建实际值列（`_actual`后缀列）
 - 隐藏列机制（atthidden字段，SELECT *时不显示）
-- 预测函数查找机制（从reloptions获取）
+- 预测函数查找机制（从pg_attrdef获取内联表达式）
 - 预测触发器函数（predict_trigger）
 - PREDICT列验证函数（is_predict_column）
 - 预测时机控制选项（predict_timing表选项）
@@ -125,87 +125,61 @@ graph TB
 - 将用户输入值同步到`_actual`列
 - 当PREDICT列值为NULL且`predict_timing`为`immediate`时，调用预测函数并将结果存储到`_predict`列
 
-#### 2.2.5 预测函数机制
-- 通过表选项`predict_function`指定
+#### 2.2.5 预测表达式机制
+- 通过 `PREDICT AS (expr) STORED` 语法在列定义中内联指定
+- 表达式存储在 `pg_attrdef` 系统目录中
 - 支持自定义预测算法
-- 函数签名：`function_name(record) returns element_type`
-- 函数接收整行数据作为参数，返回预测结果
-- **支持两种格式**：
-  - **单个函数名**：`predict_function = 'func_name'` - 为所有PREDICT列设置相同的预测函数
-  - **列特定格式**：`predict_function = 'col_a:func_a;col_b:func_b'` - 为不同的PREDICT列设置不同的预测函数
+- 表达式可以引用同表其他列
+- 支持 VOLATILE 函数（如 LLM 推理）
 
-**预测函数样例代码：**
+**预测表达式样例代码：**
 
 ```sql
--- 示例1：简单的预测函数，基于其他列计算预测值
-CREATE OR REPLACE FUNCTION simple_predict(rec record) 
-RETURNS integer AS $$
-DECLARE
-    result integer;
-BEGIN
-    -- 从记录中提取列值进行计算
-    -- 假设表有 id, value 等列
-    result := (rec.id * 10) + 5;
-    RETURN result;
-END;
-$$ LANGUAGE plpgsql;
-
--- 示例2：使用机器学习模型的预测函数
-CREATE OR REPLACE FUNCTION ml_predict(rec record) 
-RETURNS float AS $$
-DECLARE
-    feature1 float;
-    feature2 float;
-    prediction float;
-BEGIN
-    -- 从记录中提取特征值
-    feature1 := rec.feature_col1;
-    feature2 := rec.feature_col2;
-    
-    -- 调用外部预测服务或模型
-    -- 这里使用简单的线性模型作为示例
-    prediction := 0.5 * feature1 + 0.3 * feature2 + 1.0;
-    
-    RETURN prediction;
-END;
-$$ LANGUAGE plpgsql;
-
--- 示例3：使用 Python 通过 PL/Python 调用机器学习模型
-CREATE OR REPLACE FUNCTION python_predict(rec record) 
-RETURNS float AS $$
-    import json
-    
-    # 将记录转换为字典
-    row_dict = dict(rec)
-    
-    # 提取特征
-    features = [
-        row_dict.get('feature1', 0),
-        row_dict.get('feature2', 0),
-        row_dict.get('feature3', 0)
-    ]
-    
-    # 调用模型进行预测（示例）
-    prediction = sum(features) / len(features)
-    
-    return prediction
-$$ LANGUAGE plpython3u;
-
--- 使用预测函数创建表
+-- 示例1：简单的预测表达式，基于其他列计算预测值
 CREATE TABLE predictions (
     id SERIAL PRIMARY KEY,
-    feature1 float,
-    feature2 float,
-    result float PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'ml_predict'
-);
+    value integer,
+    predicted integer PREDICT AS (value * 10 + 5) STORED
+) WITH (predict_timing = immediate);
 
--- 插入数据时自动预测
-INSERT INTO predictions (feature1, feature2) VALUES (10.0, 20.0);
--- 触发器会调用 ml_predict 函数，传入整行数据
--- result_predict = 0.5 * 10 + 0.3 * 20 + 1.0 = 12.0
+-- 示例2：使用自定义函数的预测表达式
+CREATE OR REPLACE FUNCTION ml_predict(feature float)
+RETURNS float AS $$
+BEGIN
+    RETURN 0.5 * feature + 1.0;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE TABLE ml_predictions (
+    id SERIAL PRIMARY KEY,
+    feature float,
+    result float PREDICT AS (ml_predict(feature)) STORED
+) WITH (predict_timing = immediate);
+
+-- 示例3：使用 Python 通过 PL/Python 调用机器学习模型
+CREATE OR REPLACE FUNCTION python_predict(feature float)
+RETURNS float AS $$
+    import pickle
+    import numpy as np
+    
+    model = pickle.loads(open('/tmp/model.pkl', 'rb').read())
+    result = model.predict(np.array([[feature]]))[0]
+    return float(result)
+$$ LANGUAGE plpython3u IMMUTABLE;
+
+CREATE TABLE py_predictions (
+    id SERIAL PRIMARY KEY,
+    feature1 float,
+    result float PREDICT AS (python_predict(feature1)) STORED
+) WITH (predict_timing = immediate);
+
+-- 示例4：多个 predict 列使用不同表达式
+CREATE TABLE multi_predict (
+    id SERIAL PRIMARY KEY,
+    price numeric,
+    price_with_tax numeric PREDICT AS (price * 1.1) STORED,
+    price_doubled numeric PREDICT AS (price * 2) STORED
+) WITH (predict_timing = immediate);
 ```
 
 #### 2.2.6 查询处理器
@@ -358,7 +332,6 @@ typedef struct StdRdOptions
 {
     // ... 现有字段
     StdRdOptPredictTiming predict_timing;    /* 控制预测时机 */
-    int predict_function;                    /* 预测函数名称字符串偏移量 */
 } StdRdOptions;
 
 /* 在enumRelOpts数组中添加选项定义 */
@@ -476,24 +449,14 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
             
             if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
             {
-                // 立即预测模式：调用预测函数
-                char *predict_func = get_predict_function(rel->rd_id);
-                
-                if (predict_func != NULL)
+                // 立即预测模式：计算预测表达式
+                if (attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
                 {
-                    Oid func_oid = find_predict_function_oid(predict_func, attr->atttypid);
-                    if (OidIsValid(func_oid))
+                    Expr *expr = build_column_default(rel, attnum);
+                    if (expr != NULL)
                     {
-                        resultdatum = call_predict_function(func_oid, coldatum);
+                        resultdatum = ExecEvalExpr(expr, econtext, &isnull);
                     }
-                    else
-                    {
-                        resultdatum = coldatum;
-                    }
-                }
-                else
-                {
-                    resultdatum = coldatum;
                 }
             }
             else
@@ -518,36 +481,28 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
 | immediate   | INSERT时立即调用 | 预测函数结果 | 插入时性能开销较大，但实时获得预测结果 |
 | deferred    | 不调用           | 用户原始数据 | 插入时性能开销最小 |
 
-### 3.4 预测函数调用机制
+### 3.4 预测表达式计算机制
 
-#### 3.4.1 函数查找逻辑
+#### 3.4.1 表达式获取与计算逻辑
 ```c
-char* get_predict_function(Oid relid)
+// PREDICT AS (expr) STORED 语法的表达式存储在 pg_attrdef 中
+// 通过 build_column_default 获取表达式并计算
+
+Expr* get_predict_expression(Relation rel, AttrNumber attnum)
 {
-    // 从表选项获取预测函数名
-    // 格式: predict_function=function_name
-    char *func_name = extract_from_reloptions(relid, "predict_function");
-    return func_name;
+    // 从 pg_attrdef 获取列的默认表达式
+    // 对于 PREDICT AS 列，表达式即为预测表达式
+    Expr *expr = build_column_default(rel, attnum);
+    return expr;
 }
 
-Oid find_predict_function_oid(char *func_name, Oid element_type)
+Datum evaluate_predict_expression(Expr *expr, EState *estate, ExprContext *econtext)
 {
-    // 查找匹配签名的函数
-    // 函数必须接受element_type参数并返回element_type
-    List *func_candidates = FuncnameGetCandidates(
-        list_make1(makeString(func_name)), 
-        1, NIL, false, false, false, true);
-    
-    // 筛选参数类型匹配的函数
-    foreach(lc, func_candidates)
-    {
-        FuncCandidateList candidate = lfirst(lc);
-        if (candidate->nargs == 1 && candidate->args[0] == element_type)
-        {
-            return candidate->oid;
-        }
-    }
-    return InvalidOid;
+    // 使用执行器计算表达式
+    ExprState *exprstate = ExecPrepareExpr(expr, estate);
+    bool isnull;
+    Datum result = ExecEvalExpr(exprstate, econtext, &isnull);
+    return result;
 }
 ```
 
@@ -558,24 +513,15 @@ PREDICT列在查询时直接返回原始数据，无需特殊处理：
 - 查询时直接返回列值，与普通列行为一致
 - 无需数组下标访问或类型转换
 
-#### 3.4.2 函数调用流程
+#### 3.4.2 表达式计算流程
 ```c
-Datum call_predict_function(Oid func_oid, Datum input, Oid element_type)
+Datum evaluate_predict_expression(Expr *expr, EState *estate, ExprContext *econtext)
 {
-    FmgrInfo flinfo;
-    fmgr_info(func_oid, &flinfo);
+    ExprState *exprstate;
+    bool isnull;
     
-    // 根据类型处理参数传递
-    if (get_typbyval(element_type))
-    {
-        return FunctionCall1(&flinfo, input);
-    }
-    else
-    {
-        // 处理传引用类型
-        return FunctionCall1(&flinfo, 
-            Int32GetDatum(*((int32 *) DatumGetPointer(input))));
-    }
+    exprstate = ExecPrepareExpr(expr, estate);
+    return ExecEvalExpr(exprstate, econtext, &isnull);
 }
 ```
 
@@ -651,15 +597,13 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
             
             if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
             {
-                // 立即预测模式：执行预测计算
-                char *predict_func = get_predict_function(rel->rd_id);
-                
-                if (predict_func != NULL)
+                // 立即预测模式：计算预测表达式
+                if (attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
                 {
-                    Oid func_oid = find_predict_function_oid(predict_func, attr->atttypid);
-                    if (OidIsValid(func_oid))
+                    Expr *expr = build_column_default(rel, attnum);
+                    if (expr != NULL)
                     {
-                        resultdatum = call_predict_function(func_oid, coldatum);
+                        resultdatum = ExecEvalExpr(expr, econtext, &isnull);
                     }
                 }
             }
@@ -674,23 +618,22 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
 }
 ```
 
-### 4.3 预测函数调用算法
+### 4.3 预测表达式计算算法
 
-#### 4.3.1 预测函数调用流程
+#### 4.3.1 预测表达式计算流程
 ```mermaid
 sequenceDiagram
     participant Trigger
     participant RelOptions
-    participant SysCache
-    participant PredictFunc
+    participant PgAttrdef
     participant Executor
     
-    Trigger->>RelOptions: 获取表选项
-    RelOptions->>Trigger: 返回predict_function值
-    Trigger->>SysCache: 查找预测函数OID
-    SysCache->>Trigger: 返回函数OID
-    Trigger->>PredictFunc: 调用预测函数(用户数据)
-    PredictFunc->>Trigger: 返回预测结果
+    Trigger->>RelOptions: 获取predict_timing
+    RelOptions->>Trigger: 返回timing值
+    Trigger->>PgAttrdef: 获取预测表达式
+    PgAttrdef->>Trigger: 返回表达式
+    Trigger->>Executor: 计算表达式(行数据)
+    Executor->>Trigger: 返回计算结果
     Trigger->>Trigger: 保存结果到列
     Trigger->>Executor: 返回修改后的元组
 ```
@@ -712,70 +655,40 @@ sequenceDiagram
 
 #### 5.1.1 SQL接口
 ```sql
--- 创建带PREDICT列的表（单个预测函数）
+-- 创建带PREDICT列的表
 CREATE TABLE sensor_data (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP,
-    temperature FLOAT PREDICT,  -- PREDICT列，保持原始基础类型
-    predict_function = 'temperature_predict'
-);
+    temperature FLOAT PREDICT AS (temperature * 1.05) STORED
+) WITH (predict_timing = immediate);
 
--- 创建带多个PREDICT列的表（每个列使用不同的预测函数）
+-- 创建带多个PREDICT列的表（每个列使用不同的表达式）
 CREATE TABLE multi_predict_table (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP,
-    temperature FLOAT PREDICT,
-    humidity FLOAT PREDICT,
-    pressure FLOAT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'temperature:temp_predict;humidity:humidity_predict;pressure:pressure_predict'
-);
+    temperature FLOAT,
+    humidity FLOAT,
+    pressure FLOAT,
+    temp_predicted FLOAT PREDICT AS (temperature * 1.05) STORED,
+    humidity_predicted FLOAT PREDICT AS (humidity * 0.95) STORED,
+    pressure_predicted FLOAT PREDICT AS (pressure * 1.02) STORED
+) WITH (predict_timing = immediate);
 
--- 创建预测函数（接受record类型参数）
-CREATE OR REPLACE FUNCTION temp_predict(rec record) 
-RETURNS FLOAT AS $$
-BEGIN
-    -- 从记录中提取特征值进行预测
-    RETURN rec.temperature * 1.05;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION humidity_predict(rec record) 
-RETURNS FLOAT AS $$
-BEGIN
-    RETURN rec.humidity * 0.95;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION pressure_predict(rec record) 
-RETURNS FLOAT AS $$
-BEGIN
-    RETURN rec.pressure * 1.02;
-END;
-$$ LANGUAGE plpgsql;
-
--- 插入数据，系统会自动调用对应的预测函数
+-- 插入数据，系统会自动计算预测表达式
 INSERT INTO multi_predict_table (timestamp, temperature, humidity, pressure) 
 VALUES ('2024-01-01 10:00:00', 25.5, 60.0, 1013.25);
 
 -- 查询预测结果
-SELECT id, timestamp, temperature, temperature_predict, 
-       humidity, humidity_predict, pressure, pressure_predict 
+SELECT id, timestamp, temperature, temp_predicted, temp_predicted_predict,
+       humidity, humidity_predicted, humidity_predicted_predict,
+       pressure, pressure_predicted, pressure_predicted_predict
 FROM multi_predict_table;
 
 -- 使用predict_timing选项控制预测时机
-CREATE TABLE sensor_data (
+CREATE TABLE sensor_data_deferred (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP,
-    temperature FLOAT PREDICT
-) WITH (predict_timing = immediate);  -- 立即执行预测
-
--- 或者使用默认的延迟预测
-CREATE TABLE sensor_data (
-    id SERIAL PRIMARY KEY,
-    timestamp TIMESTAMP,
-    temperature FLOAT PREDICT
+    temperature FLOAT PREDICT AS (temperature * 1.05) STORED
 ) WITH (predict_timing = deferred);  -- 延迟执行预测（默认值）
 
 -- 使用ALTER TABLE修改预测时机
@@ -787,22 +700,6 @@ ALTER TABLE sensor_data RESET (predict_timing);
 
 -- 同时设置多个选项
 ALTER TABLE sensor_data SET (predict_timing = immediate, fillfactor = 80);
-
--- 创建预测函数（接受基础类型参数）
-CREATE OR REPLACE FUNCTION temperature_predict(FLOAT) 
-RETURNS FLOAT AS $
-BEGIN
-    -- 自定义预测逻辑
-    RETURN $1 * 1.05; -- 示例：基于当前温度预测未来温度
-END;
-$ LANGUAGE plpgsql;
-
--- 插入数据（插入基础类型值）
-INSERT INTO sensor_data (timestamp, temperature) VALUES 
-('2024-01-01 10:00:00', 25.5);
-
--- 查询数据（显示为基础类型值）
-SELECT id, timestamp, temperature FROM sensor_data;
 
 -- 查询PREDICT列状态
 SELECT is_predict_column('sensor_data'::regclass, 'temperature');
@@ -825,145 +722,34 @@ Datum is_predict_column(PG_FUNCTION_ARGS)
 PREDICT功能的内部接口主要包括：
 - `is_predict_column()` - 检查列是否为PREDICT列
 - `predict_trigger()` - 预测触发器函数
-- `get_predict_function()` - 从表选项获取预测函数名称（内部函数）
 
 这些函数在predict.c文件中实现，用于支持PREDICT功能的核心逻辑。
 
 ## 6. 配置选项
 
 ### 6.1 表级选项
+
+PREDICT功能当前支持的表级选项只有 `predict_timing`：
+
 ```sql
--- 预测函数指定（已实现）
 CREATE TABLE example (
-    data INTEGER PREDICT
-) WITH (
-    predict_function = 'custom_predict_func'
-);
+    data INTEGER PREDICT AS (data * 2) STORED
+) WITH (predict_timing = immediate);
 ```
+
+> **注意**：原有的 `predict_function` 表级选项已被移除。所有 predict 列必须使用 `PREDICT AS (expr) STORED` 语法指定推理表达式。
 
 ### 6.2 当前配置选项
 
 根据当前代码，PREDICT功能支持的表级选项：
 
 ```sql
--- 预测函数指定（单个函数，应用于所有PREDICT列）
+-- 预测时机控制
 CREATE TABLE example (
-    data INTEGER PREDICT
+    data INTEGER PREDICT AS (data * 2) STORED
 ) WITH (
-    predict_function = 'custom_predict_func'
+    predict_timing = deferred      -- 延迟预测（默认）
 );
-
--- 预测函数指定（多个函数，每个PREDICT列使用不同的函数）
-CREATE TABLE multi_example (
-    id SERIAL PRIMARY KEY,
-    temp FLOAT PREDICT,
-    humidity FLOAT PREDICT,
-    pressure FLOAT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'temp:temp_predict_func;humidity:humidity_predict_func;pressure:pressure_predict_func'
-);
-
--- 预测时机控制（新增）
-CREATE TABLE example (
-    data INTEGER PREDICT
-) WITH (
-    predict_timing = deferred,      -- 延迟预测（默认）
-    predict_function = 'custom_predict_func'
-);
-```
-
-### 6.2.1 predict_function多列支持
-
-#### 功能概述
-`predict_function`选项支持两种格式，允许为不同的PREDICT列指定不同的预测函数：
-
-1. **单个函数名格式**：`predict_function = 'func_name'`
-   - 为表中所有PREDICT列设置相同的预测函数
-   - 适用于所有PREDICT列使用相同预测算法的场景
-
-2. **列特定格式**：`predict_function = 'col_a:func_a;col_b:func_b'`
-   - 为每个PREDICT列指定不同的预测函数
-   - 格式：`列名:函数名`，多个列用分号`;`分隔
-   - 适用于不同PREDICT列需要不同预测算法的场景
-
-#### 使用示例
-
-```sql
--- 场景1：所有PREDICT列使用相同的预测函数
-CREATE TABLE sensor_data (
-    id SERIAL PRIMARY KEY,
-    temperature FLOAT PREDICT,
-    humidity FLOAT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'general_predict'
-);
-
--- 场景2：每个PREDICT列使用不同的预测函数
-CREATE TABLE advanced_sensor_data (
-    id SERIAL PRIMARY KEY,
-    temperature FLOAT PREDICT,
-    humidity FLOAT PREDICT,
-    pressure FLOAT PREDICT
-) WITH (
-    predict_timing = immediate,
-    predict_function = 'temperature:temp_ml_predict;humidity:humidity_nn_predict;pressure:pressure_arima_predict'
-);
-
--- 创建对应的预测函数
-CREATE OR REPLACE FUNCTION temp_ml_predict(rec record) 
-RETURNS FLOAT AS $$
-BEGIN
-    -- 使用机器学习模型预测温度
-    RETURN rec.temperature * 1.05 + 0.3 * rec.humidity;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION humidity_nn_predict(rec record) 
-RETURNS FLOAT AS $$
-BEGIN
-    -- 使用神经网络模型预测湿度
-    RETURN rec.humidity * 0.95;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION pressure_arima_predict(rec record) 
-RETURNS FLOAT AS $$
-BEGIN
-    -- 使用ARIMA模型预测气压
-    RETURN rec.pressure * 1.02;
-END;
-$$ LANGUAGE plpgsql;
-```
-
-#### 实现原理
-
-当系统处理PREDICT列时，会按照以下逻辑查找对应的预测函数：
-
-1. 检查`predict_function`选项的格式
-2. 如果是单个函数名（不包含`:`），则为所有PREDICT列使用该函数
-3. 如果是列特定格式（包含`:`），则根据列名查找对应的函数
-4. 如果未找到对应的函数，则跳过预测
-
-```c
-// 伪代码示例
-char *get_predict_function(Oid relid, const char *colname)
-{
-    char *value = get_reloption_value(relid, "predict_function");
-    
-    if (strchr(value, ':') == NULL)
-    {
-        // 单个函数名格式：应用于所有列
-        return pstrdup(value);
-    }
-    else
-    {
-        // 列特定格式：查找对应列的函数
-        // 格式: "col_a:func_a;col_b:func_b"
-        return lookup_column_function(value, colname);
-    }
-}
 ```
 
 ### 6.3 predict_timing表选项详细设计
@@ -999,7 +785,6 @@ typedef struct StdRdOptions
 {
     // ... 现有字段
     StdRdOptPredictTiming predict_timing;        /* 预测时机控制 */
-    int predict_function;                        /* 预测函数名称偏移量 */
 } StdRdOptions;
 ```
 
@@ -1075,15 +860,13 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
             
             if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
             {
-                // 立即预测模式：执行预测计算
-                char *predict_func = get_predict_function(rel->rd_id);
-                
-                if (predict_func != NULL)
+                // 立即预测模式：计算预测表达式
+                if (attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
                 {
-                    Oid func_oid = find_predict_function_oid(predict_func, attr->atttypid);
-                    if (OidIsValid(func_oid))
+                    Expr *expr = build_column_default(rel, attnum);
+                    if (expr != NULL)
                     {
-                        resultdatum = call_predict_function(func_oid, coldatum);
+                        resultdatum = ExecEvalExpr(expr, econtext, &isnull);
                     }
                 }
             }
@@ -1109,7 +892,7 @@ Datum predict_trigger(PG_FUNCTION_ARGS)
 - 对事务性能要求较高的应用
 
 #### 6.3.7 兼容性考虑
-- `predict_timing`选项与现有的`predict_function`选项完全兼容
+- `predict_timing`选项与`PREDICT AS (expr) STORED`语法完全兼容
 - 支持CREATE TABLE和ALTER TABLE语法
 - 支持与PostgreSQL其他表选项同时使用
 - 默认值为`deferred`，确保向后兼容性
@@ -1172,7 +955,7 @@ if (attr->attpredict)
 
 ```c
 /* 简化后的触发器逻辑 */
-if (attr->attpredict)
+if (attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
 {
     Datum coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
     Datum resultdatum;
@@ -1183,8 +966,12 @@ if (attr->attpredict)
     }
     else
     {
-        // 调用预测函数，保存预测结果
-        resultdatum = call_predict_function(func_oid, coldatum);
+        // 计算预测表达式，保存预测结果
+        Expr *expr = build_column_default(rel, attnum);
+        if (expr != NULL)
+        {
+            resultdatum = ExecEvalExpr(expr, econtext, &isnull);
+        }
     }
     
     // 直接更新元组，无需构造数组
@@ -1198,14 +985,14 @@ if (attr->attpredict)
 
 - 使用标准的`ereport`函数报告错误
 - 使用PostgreSQL预定义的错误码
-- 在函数查找过程中处理函数不存在或签名不匹配的情况
+- 在表达式计算过程中处理表达式不存在或计算失败的情况
 
 ## 8. 自动创建预测结果列和实际值列
 
 ### 8.1 功能概述
 
 当用户定义一个PREDICT列时，系统会自动创建两个同类型的隐藏列：
-- **预测结果列**：存储预测函数的计算结果
+- **预测结果列**：存储预测表达式的计算结果
 - **实际值列**：存储实际值，用于与预测值进行对比分析
 
 ### 8.2 列命名规则
@@ -1460,7 +1247,7 @@ INSERT INTO predictions (id, value) VALUES (DEFAULT, NULL);
 -- 触发器自动执行：
 -- value = NULL (用户输入)
 -- value_actual = NULL (自动同步)
--- value_predict = 预测函数返回值 (如果设置了 predict_function)
+-- value_predict = 预测表达式计算值
 
 -- UPDATE 操作：同样会同步到 _actual 列
 UPDATE predictions SET value = 200 WHERE id = 1;

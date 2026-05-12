@@ -101,21 +101,9 @@ CREATE TABLE products (
 | 支持延迟计算 | 否 | 是（predict_timing=deferred） |
 | 支持异步后台计算 | 否 | 是（async_predict worker） |
 
-### 2.4 与原有 predict_function reloption 的关系
+### 2.4 废弃的 predict_function reloption
 
-`PREDICT AS (expr) STORED` 语法替代了原有的 `predict_function` reloption 方式：
-
-| 特性 | predict_function reloption | PREDICT AS (expr) STORED |
-|------|---------------------------|--------------------------|
-| 函数指定方式 | `WITH (predict_function='func_name')` | 内联表达式 `PREDICT AS (func(col)) STORED` |
-| 多列支持 | `WITH (predict_function='col_a:func_a;col_b:func_b')` | 每列独立指定 |
-| 表达式存储 | reloption 字符串 | pg_attrdef 系统目录 |
-| 计算方式 | predict_trigger 通过函数OID调用 | predict_trigger 通过 build_column_default 计算表达式 |
-| 允许直接写入 | 是 | 是 |
-
-两种方式在触发器中通过 `attgenerated` 字段区分：
-- `attgenerated == ATTRIBUTE_GENERATED_PREDICT ('p')`：使用内联表达式
-- `attgenerated != 'p'` 但 `attpredict == true`：使用 predict_function reloption
+原有的 `predict_function` reloption 方式已被移除，统一使用 `PREDICT AS (expr) STORED` 语法。`predict_function` 不再支持，所有 predict 列必须使用 `PREDICT AS` 语法指定推理表达式。
 
 ## 3. 实现架构
 
@@ -193,7 +181,7 @@ SQL: CREATE TABLE t (a int, b numeric PREDICT AS (add_tax(a)) STORED) WITH (pred
 
 3. **兼容性**：predict 列同时设置 `attpredict = true`，确保与现有 predict 基础设施（如 predict_trigger、async_predict worker）兼容。
 
-4. **创建伴随列**：使用 `PREDICT AS (expr) STORED` 语法的列仍然创建 `_predict` 和 `_actual` 伴随列，与原有 predict_function 方式保持一致。`_predict` 列存储预测值，`_actual` 列存储用户提供的实际值（用于后续比较预测准确性）。
+4. **创建伴随列**：使用 `PREDICT AS (expr) STORED` 语法的列创建 `_predict` 和 `_actual` 伴随列。`_predict` 列存储预测值，`_actual` 列存储用户提供的实际值（用于后续比较预测准确性）。
 
 5. **predict 列可写**：与 GENERATED ALWAYS AS 列不同，predict 列允许用户直接写入值。这是通过在 `rewriteHandler.c` 和 `nodeModifyTable.c` 中对 `attgenerated == ATTRIBUTE_GENERATED_PREDICT` 的列跳过写入限制实现的。
 
@@ -249,8 +237,7 @@ predict 列的内联表达式存储在 `pg_attrdef` 系统目录中，与 GENERA
      - `deferred`：不计算，等待 async_predict worker
 
 5. **计算方式**：
-   - `attgenerated == 'p'`：使用 `build_column_default` 获取表达式，通过 `ExecEvalExpr` 计算
-   - 其他：使用 `predict_function` reloption 指定的函数
+   - 使用 `build_column_default` 获取表达式，通过 `ExecEvalExpr` 计算
 
 ### 5.2 async_predict worker
 
