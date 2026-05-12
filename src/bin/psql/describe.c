@@ -2134,6 +2134,12 @@ describeOneTableDetails(const char *schemaname,
 									   PQgetvalue(res, i, attrdef_col));
 				mustfree = true;
 			}
+			else if (generated[0] == ATTRIBUTE_GENERATED_PREDICT)
+			{
+				default_str = psprintf("predict as (%s) stored",
+									   PQgetvalue(res, i, attrdef_col));
+				mustfree = true;
+			}
 			else
 				default_str = PQgetvalue(res, i, attrdef_col);
 

@@ -45,6 +45,7 @@ typedef struct TupleConstr
 	bool		has_not_null;	/* any not-null, including not valid ones */
 	bool		has_generated_stored;
 	bool		has_generated_virtual;
+	bool		has_generated_predict;
 } TupleConstr;
 
 /*

@@ -19,6 +19,7 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/predict.h"
@@ -41,6 +42,8 @@
 #include "nodes/makefuncs.h"
 #include "access/reloptions.h"
 #include "funcapi.h"
+#include "executor/executor.h"
+#include "rewrite/rewriteHandler.h"
 
 /*
  * is_predict_column - check if a column has PREDICT attribute
@@ -571,7 +574,6 @@ predict_trigger(PG_FUNCTION_ARGS)
 	Datum			actual_datum;
 	Datum			predict_datum;
 	bool			isnull;
-	bool			actual_isnull;
 	bool			predict_isnull;
 	StdRdOptions   *relopts;
 	StdRdOptPredictTiming predict_timing;
@@ -638,13 +640,27 @@ predict_trigger(PG_FUNCTION_ARGS)
 
 		/* This is a PREDICT column */
 
-		/* Get user input value from the new tuple */
-		if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			coldatum = heap_getattr(trigdata->tg_newtuple, attnum, tupdesc, &isnull);
-		else
-			coldatum = heap_getattr(trigdata->tg_trigtuple, attnum, tupdesc, &isnull);
-		actual_datum = coldatum;
-		actual_isnull = isnull;
+		/* Get the value of the predict column from the new tuple */
+		coldatum = heap_getattr(newtuple, attnum, tupdesc, &isnull);
+
+		/*
+		 * For UPDATE: determine if the user explicitly modified the predict
+		 * column by comparing old and new values.  If they differ, the user
+		 * provided a new actual value.  If they're the same, the predict
+		 * column was not modified and we should recompute the prediction.
+		 */
+		if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event) && !isnull)
+		{
+			Datum	olddatum;
+			bool	oldisnull;
+
+			olddatum = heap_getattr(trigdata->tg_trigtuple, attnum, tupdesc, &oldisnull);
+
+			if (!oldisnull && datumIsEqual(coldatum, olddatum, attr->attbyval, attr->attlen))
+			{
+				isnull = true;
+			}
+		}
 
 		/* Find _actual and _predict columns */
 		actual_colname = psprintf("%s_actual", NameStr(attr->attname));
@@ -656,13 +672,53 @@ predict_trigger(PG_FUNCTION_ARGS)
 		pfree(actual_colname);
 		pfree(predict_colname);
 
-		/* Determine if we need to call predict function */
 		predict_datum = (Datum) 0;
 		predict_isnull = true;
+		actual_datum = (Datum) 0;
 
-		if (isnull && predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
+		if (!isnull)
 		{
-			char *predict_func_name = get_predict_function(rel->rd_id, NameStr(attr->attname));
+			actual_datum = coldatum;
+		}
+		else if (predict_timing == STDRD_OPTION_PREDICT_TIMING_IMMEDIATE)
+		{
+			if (attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
+			{
+				Expr	   *expr;
+				EState	   *estate;
+				ExprState  *exprstate;
+				ExprContext *econtext;
+				TupleTableSlot *slot;
+				Datum		val;
+				bool		val_isnull;
+
+				expr = (Expr *) build_column_default(rel, attnum);
+				if (expr != NULL)
+				{
+					estate = CreateExecutorState();
+					exprstate = ExecPrepareExpr(expr, estate);
+
+					slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+					ExecStoreHeapTuple(newtuple, slot, false);
+
+					econtext = GetPerTupleExprContext(estate);
+					econtext->ecxt_scantuple = slot;
+
+					val = ExecEvalExpr(exprstate, econtext, &val_isnull);
+
+					if (!val_isnull)
+					{
+						predict_datum = datumCopy(val, attr->attbyval, attr->attlen);
+						predict_isnull = false;
+					}
+
+					ExecDropSingleTupleTableSlot(slot);
+					FreeExecutorState(estate);
+				}
+			}
+			else
+			{
+				char *predict_func_name = get_predict_function(rel->rd_id, NameStr(attr->attname));
 
 			if (predict_func_name != NULL)
 			{
@@ -735,103 +791,53 @@ predict_trigger(PG_FUNCTION_ARGS)
 
 				pfree(predict_func_name);
 			}
+			}
 		}
 
 		/* Modify tuple to set PREDICT column, _actual and _predict columns */
-		if (actual_attnum != InvalidAttrNumber && predict_attnum != InvalidAttrNumber)
 		{
 			int			modify_attnums[3];
 			Datum		modify_values[3];
 			bool		modify_nulls[3];
 			int			nmodify = 0;
 
-			/* Set _actual column */
-			modify_attnums[nmodify] = actual_attnum;
-			modify_values[nmodify] = actual_datum;
-			modify_nulls[nmodify] = actual_isnull;
-			nmodify++;
-
-			/* Set _predict column */
-			modify_attnums[nmodify] = predict_attnum;
-			modify_values[nmodify] = predict_datum;
-			modify_nulls[nmodify] = predict_isnull;
-			nmodify++;
-
-			/* Set PREDICT column if we have a prediction */
-			if (!predict_isnull)
+			if (!isnull)
 			{
-				modify_attnums[nmodify] = attnum;
-				modify_values[nmodify] = predict_datum;
-				modify_nulls[nmodify] = false;
-				nmodify++;
+				/* User provided a value: save to _actual column */
+				if (actual_attnum != InvalidAttrNumber)
+				{
+					modify_attnums[nmodify] = actual_attnum;
+					modify_values[nmodify] = actual_datum;
+					modify_nulls[nmodify] = false;
+					nmodify++;
+				}
+			}
+			else
+			{
+				/* No user value: set _predict column and predict column */
+				if (predict_attnum != InvalidAttrNumber)
+				{
+					modify_attnums[nmodify] = predict_attnum;
+					modify_values[nmodify] = predict_datum;
+					modify_nulls[nmodify] = predict_isnull;
+					nmodify++;
+				}
+
+				if (!predict_isnull)
+				{
+					modify_attnums[nmodify] = attnum;
+					modify_values[nmodify] = predict_datum;
+					modify_nulls[nmodify] = false;
+					nmodify++;
+				}
 			}
 
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, nmodify,
-												 modify_attnums, modify_values, modify_nulls);
-			newtuple = rettuple;
-		}
-		else if (actual_attnum != InvalidAttrNumber)
-		{
-			int			modify_attnums[2];
-			Datum		modify_values[2];
-			bool		modify_nulls[2];
-			int			nmodify = 0;
-
-			/* Set _actual column */
-			modify_attnums[nmodify] = actual_attnum;
-			modify_values[nmodify] = actual_datum;
-			modify_nulls[nmodify] = actual_isnull;
-			nmodify++;
-
-			/* Set PREDICT column if we have a prediction */
-			if (!predict_isnull)
+			if (nmodify > 0)
 			{
-				modify_attnums[nmodify] = attnum;
-				modify_values[nmodify] = predict_datum;
-				modify_nulls[nmodify] = false;
-				nmodify++;
+				rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, nmodify,
+													 modify_attnums, modify_values, modify_nulls);
+				newtuple = rettuple;
 			}
-
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, nmodify,
-												 modify_attnums, modify_values, modify_nulls);
-			newtuple = rettuple;
-		}
-		else if (predict_attnum != InvalidAttrNumber && !predict_isnull)
-		{
-			int			modify_attnums[2];
-			Datum		modify_values[2];
-			bool		modify_nulls[2];
-			int			nmodify = 0;
-
-			/* Set _predict column */
-			modify_attnums[nmodify] = predict_attnum;
-			modify_values[nmodify] = predict_datum;
-			modify_nulls[nmodify] = false;
-			nmodify++;
-
-			/* Set PREDICT column */
-			modify_attnums[nmodify] = attnum;
-			modify_values[nmodify] = predict_datum;
-			modify_nulls[nmodify] = false;
-			nmodify++;
-
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, nmodify,
-												 modify_attnums, modify_values, modify_nulls);
-			newtuple = rettuple;
-		}
-		else if (!predict_isnull)
-		{
-			int			modify_attnums[1];
-			Datum		modify_values[1];
-			bool		modify_nulls[1];
-
-			modify_attnums[0] = attnum;
-			modify_values[0] = predict_datum;
-			modify_nulls[0] = false;
-
-			rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
-												 modify_attnums, modify_values, modify_nulls);
-			newtuple = rettuple;
 		}
 	}
 

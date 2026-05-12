@@ -241,10 +241,12 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
 			 * of the column's base type (to avoid possibly failing on domain
 			 * not-null constraints).  It doesn't seem worth insisting on that
 			 * exact type though, since a null value is type-independent.  As
-			 * above, just insist on *some* NULL constant.
+			 * above, just insist on *some* NULL constant.  Exception: predict
+			 * columns accept user-provided values.
 			 */
-			if (!IsA(tle->expr, Const) ||
-				!((Const *) tle->expr)->constisnull)
+			if (attr->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+				(!IsA(tle->expr, Const) ||
+				 !((Const *) tle->expr)->constisnull))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
 						 errmsg("table row type and query-specified row type do not match"),
@@ -474,6 +476,9 @@ ExecInitGenerated(ResultRelInfo *resultRelInfo,
 		if (attgenerated)
 		{
 			Expr	   *expr;
+
+			if (attgenerated == ATTRIBUTE_GENERATED_PREDICT)
+				continue;
 
 			/* Fetch the GENERATED AS expression tree */
 			expr = (Expr *) build_column_default(rel, i + 1);

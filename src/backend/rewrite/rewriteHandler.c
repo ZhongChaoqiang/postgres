@@ -943,9 +943,11 @@ rewriteTargetListIU(List *targetList,
 
 			/*
 			 * Can only insert DEFAULT into generated columns, regardless of
-			 * any OVERRIDING clauses.
+			 * any OVERRIDING clauses.  Exception: predict columns allow
+			 * user-provided values (which become "actual" values).
 			 */
-			if (att_tup->attgenerated && !apply_default)
+			if (att_tup->attgenerated && !apply_default &&
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT)
 			{
 				/*
 				 * If this column's values come from a VALUES RTE, test
@@ -995,7 +997,8 @@ rewriteTargetListIU(List *targetList,
 						 errdetail("Column \"%s\" is an identity column defined as GENERATED ALWAYS.",
 								   NameStr(att_tup->attname))));
 
-			if (att_tup->attgenerated && new_tle && !apply_default)
+			if (att_tup->attgenerated && new_tle && !apply_default &&
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT)
 				ereport(ERROR,
 						(errcode(ERRCODE_GENERATED_ALWAYS),
 						 errmsg("column \"%s\" can only be updated to DEFAULT",
@@ -1006,11 +1009,25 @@ rewriteTargetListIU(List *targetList,
 
 		if (att_tup->attgenerated)
 		{
-			/*
-			 * virtual generated column stores a null value; stored generated
-			 * column will be fixed in executor
-			 */
-			new_tle = NULL;
+			if (att_tup->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
+			{
+				/*
+				 * Predict columns: if user provided a value, keep it (it
+				 * will be saved as the "actual" value by the trigger).  If
+				 * no value was provided, set to NULL so the trigger can
+				 * compute the prediction.
+				 */
+				if (apply_default || new_tle == NULL)
+					new_tle = NULL;
+			}
+			else
+			{
+				/*
+				 * virtual generated column stores a null value; stored generated
+				 * column will be fixed in executor
+				 */
+				new_tle = NULL;
+			}
 		}
 		else if (apply_default)
 		{

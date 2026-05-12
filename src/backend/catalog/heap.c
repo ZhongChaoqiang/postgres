@@ -3341,16 +3341,16 @@ cookDefault(ParseState *pstate,
 
 	if (attgenerated)
 	{
-		/* Disallow refs to other generated columns */
 		check_nested_generated(pstate, expr);
 
-		/* Disallow mutable functions */
-		if (contain_mutable_functions_after_planning((Expr *) expr))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("generation expression is not immutable")));
+		if (attgenerated != ATTRIBUTE_GENERATED_PREDICT)
+		{
+			if (contain_mutable_functions_after_planning((Expr *) expr))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("generation expression is not immutable")));
+		}
 
-		/* Check security of expressions for virtual generated column */
 		if (attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 			check_virtual_generated_security(pstate, expr);
 	}

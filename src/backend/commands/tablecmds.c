@@ -8895,7 +8895,8 @@ ATExecSetExpression(AlteredTableInfo *tab, Relation rel, const char *colName,
 				 errdetail("Column \"%s\" of relation \"%s\" is a virtual generated column.",
 						   colName, RelationGetRelationName(rel))));
 
-	rewrite = (attgenerated == ATTRIBUTE_GENERATED_STORED);
+	rewrite = (attgenerated == ATTRIBUTE_GENERATED_STORED ||
+			   attgenerated == ATTRIBUTE_GENERATED_PREDICT);
 
 	ReleaseSysCache(tuple);
 

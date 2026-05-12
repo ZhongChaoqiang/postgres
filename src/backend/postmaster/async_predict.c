@@ -55,6 +55,8 @@
 #include "utils/syscache.h"
 #include "utils/timeout.h"
 #include "utils/predict.h"
+#include "executor/executor.h"
+#include "nodes/execnodes.h"
 
 #define MAX_DBNAME_LEN NAMEDATALEN
 
@@ -382,10 +384,42 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 	AsyncPredictWorkerInfo *wi = &AsyncPredictShmem->workers[worker_slot];
 	int			ret;
 	StringInfoData query;
+	ExprState  *predict_exprstate = NULL;
+	EState	   *predict_estate = NULL;
+	bool		use_inline_expr = false;
 
 	cbcontext = AllocSetContextCreate(CurrentMemoryContext,
 									  "async_predict callback",
 									  ALLOCSET_DEFAULT_SIZES);
+
+	if (!OidIsValid(funcoid))
+	{
+		Form_pg_attribute predict_attr = TupleDescAttr(tupdesc, predict_attnum - 1);
+
+		if (predict_attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
+		{
+			Expr	   *expr;
+
+			expr = (Expr *) build_column_default(rel, predict_attnum);
+			if (expr != NULL)
+			{
+				predict_estate = CreateExecutorState();
+				predict_exprstate = ExecPrepareExpr(expr, predict_estate);
+				use_inline_expr = true;
+			}
+			else
+			{
+				elog(DEBUG1, "async_predict: no inline expression for column %d of table %s",
+					 predict_attnum, relname);
+				return;
+			}
+		}
+		else
+		{
+			elog(DEBUG1, "async_predict: no predict function for table %s", relname);
+			return;
+		}
+	}
 
 	SPI_connect();
 
@@ -414,8 +448,8 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 			}
 
 			{
-				Datum		row_datum;
 				Datum		predict_datum;
+				bool		predict_datum_isnull = false;
 				Oid			typoutput;
 				bool		typIsVarlena;
 				char	   *predict_str;
@@ -423,11 +457,44 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 				char	   *predict_colname;
 				char	   *rel_quoted;
 
-				row_datum = heap_copy_tuple_as_datum(tuple, tupdesc);
+				if (use_inline_expr)
+				{
+					TupleTableSlot *slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+					ExprContext *econtext;
+					Datum		val;
 
-				predict_datum = OidFunctionCall1(funcoid, row_datum);
+					ExecStoreHeapTuple(tuple, slot, false);
+					econtext = GetPerTupleExprContext(predict_estate);
+					econtext->ecxt_scantuple = slot;
 
-				getTypeOutputInfo(FLOAT8OID, &typoutput, &typIsVarlena);
+					val = ExecEvalExpr(predict_exprstate, econtext, &predict_datum_isnull);
+
+					if (!predict_datum_isnull)
+					{
+						Form_pg_attribute predict_attr = TupleDescAttr(tupdesc, predict_attnum - 1);
+						predict_datum = datumCopy(val, predict_attr->attbyval, predict_attr->attlen);
+					}
+
+					ExecDropSingleTupleTableSlot(slot);
+				}
+				else
+				{
+					Datum		row_datum;
+
+					row_datum = heap_copy_tuple_as_datum(tuple, tupdesc);
+					predict_datum = OidFunctionCall1(funcoid, row_datum);
+				}
+
+				if (predict_datum_isnull)
+				{
+					MemoryContextReset(cbcontext);
+					continue;
+				}
+
+				{
+					Form_pg_attribute predict_attr = TupleDescAttr(tupdesc, predict_attnum - 1);
+					getTypeOutputInfo(predict_attr->atttypid, &typoutput, &typIsVarlena);
+				}
 				predict_str = OidOutputFunctionCall(typoutput, predict_datum);
 
 				result_colname = get_attname(reloid, result_attnum, false);
@@ -471,6 +538,9 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 	MemoryContextDelete(cbcontext);
 
 	SPI_finish();
+
+	if (predict_estate != NULL)
+		FreeExecutorState(predict_estate);
 
 	LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
 	wi->processing = false;
@@ -554,30 +624,55 @@ async_predict_process_database(Oid dboid, int worker_slot)
 
 			pfree(predict_colname);
 
-			funcoid = get_predict_function_oid(reloid, attrname);
-			if (!OidIsValid(funcoid))
+			funcoid = InvalidOid;
+
+			if (attr_form->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
 			{
-				elog(DEBUG1, "async_predict: no predict function for table %s", relname);
-				continue;
-			}
+				rel = try_relation_open(reloid, RowExclusiveLock);
+				if (!rel)
+				{
+					elog(DEBUG1, "async_predict: could not open table %s", relname);
+					continue;
+				}
 
-			rel = try_relation_open(reloid, RowExclusiveLock);
-			if (!rel)
+				LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
+				wi->relid = reloid;
+				wi->processing = true;
+				wi->last_scan = GetCurrentTimestamp();
+				LWLockRelease(AsyncPredictLock);
+
+				async_predict_process_table(rel, attr_form->attnum, predict_attnum,
+										   InvalidOid, worker_slot);
+
+				table_close(rel, RowExclusiveLock);
+			}
+			else
 			{
-				elog(DEBUG1, "async_predict: could not open table %s", relname);
-				continue;
+				funcoid = get_predict_function_oid(reloid, attrname);
+				if (!OidIsValid(funcoid))
+				{
+					elog(DEBUG1, "async_predict: no predict function for table %s", relname);
+					continue;
+				}
+
+				rel = try_relation_open(reloid, RowExclusiveLock);
+				if (!rel)
+				{
+					elog(DEBUG1, "async_predict: could not open table %s", relname);
+					continue;
+				}
+
+				LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
+				wi->relid = reloid;
+				wi->processing = true;
+				wi->last_scan = GetCurrentTimestamp();
+				LWLockRelease(AsyncPredictLock);
+
+				async_predict_process_table(rel, attr_form->attnum, predict_attnum,
+										   funcoid, worker_slot);
+
+				table_close(rel, RowExclusiveLock);
 			}
-
-			LWLockAcquire(AsyncPredictLock, LW_EXCLUSIVE);
-			wi->relid = reloid;
-			wi->processing = true;
-			wi->last_scan = GetCurrentTimestamp();
-			LWLockRelease(AsyncPredictLock);
-
-			async_predict_process_table(rel, attr_form->attnum, predict_attnum,
-									   funcoid, worker_slot);
-
-			table_close(rel, RowExclusiveLock);
 		}
 
 		systable_endscan(attr_scan);

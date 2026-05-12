@@ -592,7 +592,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	DomainConstraint TableConstraint TableLikeClause
 %type <ival>	TableLikeOptionList TableLikeOption
 %type <str>		column_compression opt_column_compression column_storage opt_column_storage
-%type <boolean>	opt_predict opt_embedding
+%type <boolean>	opt_embedding
+%type <node>	opt_predict_clause
 %type <list>	ColQualList
 %type <node>	ColConstraint ColConstraintElem ConstraintAttr
 %type <ival>	key_match
@@ -3821,7 +3822,7 @@ TypedTableElement:
 			| TableConstraint					{ $$ = $1; }
 		;
 
-columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList opt_predict opt_embedding
+columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList opt_predict_clause opt_embedding
 				{
 					ColumnDef *n = makeNode(ColumnDef);
 
@@ -3838,7 +3839,24 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 					n->cooked_default = NULL;
 					n->collOid = InvalidOid;
 					n->fdwoptions = $5;
-					n->is_predict = $7;
+					if ($7 != NULL)
+					{
+						if (IsA($7, Constraint))
+						{
+							Constraint *c = (Constraint *) $7;
+							n->is_predict = true;
+							n->generated = c->generated_kind;
+							n->raw_default = c->raw_expr;
+						}
+						else
+						{
+							n->is_predict = true;
+						}
+					}
+					else
+					{
+						n->is_predict = false;
+					}
 					n->is_embedding = $8;
 					n->is_hidden = false;
 					SplitColQualList($6, &n->constraints, &n->collClause,
@@ -3858,9 +3876,26 @@ opt_column_compression:
 			| /*EMPTY*/								{ $$ = NULL; }
 		;
 
-opt_predict:
-			PREDICT									{ $$ = true; }
-			| /*EMPTY*/								{ $$ = false; }
+opt_predict_clause:
+			PREDICT AS '(' a_expr ')' STORED
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_PREDICT;
+					n->generated_when = ATTRIBUTE_IDENTITY_ALWAYS;
+					n->raw_expr = $4;
+					n->cooked_expr = NULL;
+					n->generated_kind = ATTRIBUTE_GENERATED_PREDICT;
+					n->location = @1;
+
+					$$ = (Node *) n;
+				}
+			| PREDICT
+				{
+					$$ = makeInteger(1);
+				}
+			| /*EMPTY*/
+				{ $$ = NULL; }
 		;
 
 opt_embedding:

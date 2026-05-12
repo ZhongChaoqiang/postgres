@@ -237,6 +237,7 @@ MAKE_SYSCACHE(ATTNUM, pg_attribute_relid_attnum_index, 128);
 
 #define		  ATTRIBUTE_GENERATED_STORED	's'
 #define		  ATTRIBUTE_GENERATED_VIRTUAL	'v'
+#define		  ATTRIBUTE_GENERATED_PREDICT	'p'
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

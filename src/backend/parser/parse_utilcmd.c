@@ -945,6 +945,32 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 				saw_generated = true;
 				break;
 
+			case CONSTR_PREDICT:
+				if (cxt->ofType)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("predict columns are not supported on typed tables")));
+				if (constraint->generated_kind == ATTRIBUTE_GENERATED_PREDICT)
+				{
+					if (saw_generated)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("multiple generation clauses specified for column \"%s\" of table \"%s\"",
+										column->colname, cxt->relation->relname),
+								 parser_errposition(cxt->pstate,
+													constraint->location)));
+					column->generated = constraint->generated_kind;
+					column->raw_default = constraint->raw_expr;
+					column->is_predict = true;
+					Assert(constraint->cooked_expr == NULL);
+					saw_generated = true;
+				}
+				else
+				{
+					column->is_predict = true;
+				}
+				break;
+
 			case CONSTR_CHECK:
 				cxt->ckconstraints = lappend(cxt->ckconstraints, constraint);
 				break;
