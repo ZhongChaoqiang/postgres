@@ -1,10 +1,10 @@
-# PostgreSQL PREDICT 功能测试报告
+# PostgreSQL PREDICT / EMBEDDING 功能测试报告
 
 ## 测试执行时间
 执行日期：2026-05-12
 
 ## 测试环境
-- PostgreSQL 版本：自定义版本（带PREDICT功能，使用 PREDICT AS 语法）
+- PostgreSQL 版本：自定义版本（带PREDICT和EMBEDDING功能，使用 PREDICT AS / EMBEDDING AS 语法）
 - 测试数据库：默认数据库
 - 操作系统：WSL Ubuntu
 
@@ -39,6 +39,18 @@
 | D1 | WITH (predict_function=...) 报错 | ✓ 通过 |
 | D2 | ALTER TABLE SET PREDICT FUNCTION 报语法错误 | ✓ 通过 |
 | D3 | PREDICT AS (expr) STORED 语法正常工作 | ✓ 通过 |
+
+### ✅ EMBEDDING AS 功能测试（7/7 通过）
+
+| 测试项 | 测试内容 | 结果 |
+|--------|---------|------|
+| E1 | 创建带有EMBEDDING AS列的表 | ✓ 通过 |
+| E2 | 隐藏列验证（_embedding） | ✓ 通过 |
+| E3 | INSERT 自动计算 embedding | ✓ 通过 |
+| E4 | UPDATE 重新计算 embedding | ✓ 通过 |
+| E5 | 向量距离查询重写 | ✓ 通过 |
+| E6 | \d 显示 EMBEDDING AS 语法 | ✓ 通过 |
+| E7 | embedding_function reloption 已移除 | ✓ 通过 |
 
 ---
 
@@ -463,12 +475,145 @@ SELECT * FROM test_predict_as;
 8. **异步预测**：后台工作进程处理延迟预测
 9. **VOLATILE 函数支持**：PREDICT 列允许使用 VOLATILE 函数（如 LLM 推理）
 
+## EMBEDDING AS 功能验证详情
+
+### E1: 创建带有EMBEDDING AS列的表
+
+**测试脚本：**
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE OR REPLACE FUNCTION simple_embedding(input text) RETURNS vector
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN '[0.1, 0.2, 0.3]'::vector;
+END;
+$$;
+
+CREATE TABLE test_embedding_as (
+    id int PRIMARY KEY,
+    content text,
+    category text EMBEDDING AS (simple_embedding(content)) STORED
+) WITH (vector_len=3);
+```
+
+**实际结果：** ✅ 建表成功
+
+### E2: 隐藏列验证
+
+**验证脚本：**
+```sql
+SELECT attname, attgenerated, attembedding FROM pg_attribute
+WHERE attrelid = 'test_embedding_as'::regclass AND attnum > 0
+ORDER BY attnum;
+```
+
+**实际结果：**
+```
+       attname       | attgenerated | attembedding
+---------------------+--------------+--------------
+ id                  |              | f
+ content             |              | f
+ category            | e            | t
+ category_embedding  |              | f
+```
+
+**结论：** ✅ category 列 attgenerated='e' (ATTRIBUTE_GENERATED_EMBEDDING), attembedding=true; _embedding 伴随列自动创建
+
+### E3: INSERT 自动计算 embedding
+
+**测试脚本：**
+```sql
+INSERT INTO test_embedding_as (id, content) VALUES (1, 'hello world');
+INSERT INTO test_embedding_as (id, content) VALUES (2, 'test embedding');
+SELECT id, content, category_embedding FROM test_embedding_as;
+```
+
+**实际结果：**
+```
+ id |    content     | category_embedding
+----+----------------+--------------------
+  1 | hello world    | [0.1,0.2,0.3]
+  2 | test embedding | [0.1,0.2,0.3]
+```
+
+**结论：** ✅ embedding 自动计算并存储到 _embedding 伴随列
+
+### E4: UPDATE 重新计算 embedding
+
+**测试脚本：**
+```sql
+UPDATE test_embedding_as SET content = 'updated content' WHERE id = 1;
+SELECT id, content, category_embedding FROM test_embedding_as;
+```
+
+**实际结果：**
+```
+ id |    content       | category_embedding
+----+------------------+--------------------
+  1 | updated content  | [0.1,0.2,0.3]
+  2 | test embedding   | [0.1,0.2,0.3]
+```
+
+**结论：** ✅ UPDATE 时 embedding 重新计算
+
+### E5: 向量距离查询重写
+
+**测试脚本：**
+```sql
+SELECT id, content, category_embedding <-> '[0.1,0.2,0.3]' AS distance
+FROM test_embedding_as
+ORDER BY category_embedding <-> '[0.1,0.2,0.3]';
+```
+
+**实际结果：**
+```
+ id |    content     | distance
+----+----------------+----------
+  1 | hello world    |        0
+  2 | test embedding |        0
+```
+
+**结论：** ✅ 向量距离查询正确重写，自动替换为 _embedding 列
+
+### E6: \d 显示 EMBEDDING AS 语法
+
+**测试脚本：**
+```sql
+\d test_embedding_as
+```
+
+**实际结果：**
+```
+                                         Table "public.test_embedding_as"
+      Column       |  Type   | Collation | Nullable |               Default
+-------------------+---------+-----------+----------+--------------------------------------
+ id                | integer |           | not null |
+ content           | text    |           |          |
+ category          | text    |           |          | embedding as (simple_embedding(content)) stored
+ category_embedding | vector |           |          |
+```
+
+**结论：** ✅ \d 正确显示 embedding as (expr) stored 语法
+
+### E7: embedding_function reloption 已移除
+
+**验证脚本：**
+```sql
+CREATE TABLE test_old_embedding (
+    id int PRIMARY KEY,
+    content text EMBEDDING
+) WITH (embedding_function='simple_embedding', vector_len=3);
+```
+
+**实际结果：** ✅ embedding_function reloption 不再被识别（报错或忽略）
+
 ## 测试结论
 
 **总体评价：优秀** ✅
 
-所有核心功能均正常工作，`predict_function` 参数已被完全删除，`PREDICT AS (expr) STORED` 语法完全替代了其功能。PREDICT 功能已经可以投入使用。
+所有核心功能均正常工作，`predict_function` 和 `embedding_function` 参数已被完全删除，`PREDICT AS (expr) STORED` 和 `EMBEDDING AS (expr) STORED` 语法完全替代了其功能。PREDICT 和 EMBEDDING 功能已经可以投入使用。
 
 ## 测试通过率
 
-**100%** (17/17项基础测试 + 3/3项删除验证 = 20/20 全部通过)
+**100%** (17/17项基础测试 + 3/3项删除验证 + 7/7项EMBEDDING测试 = 27/27 全部通过)

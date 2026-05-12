@@ -3343,7 +3343,8 @@ cookDefault(ParseState *pstate,
 	{
 		check_nested_generated(pstate, expr);
 
-		if (attgenerated != ATTRIBUTE_GENERATED_PREDICT)
+		if (attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+			attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
 		{
 			if (contain_mutable_functions_after_planning((Expr *) expr))
 				ereport(ERROR,

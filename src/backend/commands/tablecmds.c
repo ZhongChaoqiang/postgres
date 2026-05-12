@@ -8875,7 +8875,8 @@ ATExecSetExpression(AlteredTableInfo *tab, Relation rel, const char *colName,
 						   colName, RelationGetRelationName(rel))));
 
 	rewrite = (attgenerated == ATTRIBUTE_GENERATED_STORED ||
-			   attgenerated == ATTRIBUTE_GENERATED_PREDICT);
+			   attgenerated == ATTRIBUTE_GENERATED_PREDICT ||
+			   attgenerated == ATTRIBUTE_GENERATED_EMBEDDING);
 
 	ReleaseSysCache(tuple);
 

@@ -160,8 +160,9 @@ get_embedding_function(Oid relid, const char *colname)
 								if (colon != NULL)
 								{
 									char	   *key = token;
+									char	   *func;
 									*colon = '\0';
-									char	   *func = colon + 1;
+									func = colon + 1;
 
 									if (strcmp(key, colname) == 0)
 									{
@@ -708,7 +709,7 @@ text_vector_ip_distance(PG_FUNCTION_ARGS)
  * embedding_trigger - trigger function for EMBEDDING columns
  *
  * This is a BEFORE INSERT/UPDATE trigger that handles EMBEDDING columns:
- * - Calls embedding_function and saves result to _embedding column
+ * - Evaluates the EMBEDDING AS expression and saves result to _embedding column
  */
 PG_FUNCTION_INFO_V1(embedding_trigger);
 
@@ -762,9 +763,6 @@ embedding_trigger(PG_FUNCTION_ARGS)
 		if (!attr->attembedding)
 			continue;
 
-		/* This is an EMBEDDING column */
-
-		/* Find _embedding column */
 		embedding_colname = psprintf("%s_embedding", NameStr(attr->attname));
 		embedding_attnum = find_column_by_name(tupdesc, embedding_colname);
 		pfree(embedding_colname);
@@ -772,7 +770,99 @@ embedding_trigger(PG_FUNCTION_ARGS)
 		if (embedding_attnum == InvalidAttrNumber)
 			continue;
 
-		/* Get embedding function OID */
+		if (attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
+		{
+			Expr	   *expr;
+			EState	   *estate;
+			ExprState  *exprstate;
+			ExprContext *econtext;
+			TupleTableSlot *slot;
+			Datum		val;
+			bool		val_isnull;
+
+			expr = (Expr *) TupleDescGetDefault(tupdesc, attnum);
+			if (expr != NULL)
+			{
+				if (IsA(expr, CoerceViaIO))
+				{
+					CoerceViaIO *coerce = (CoerceViaIO *) expr;
+					expr = coerce->arg;
+				}
+
+				estate = CreateExecutorState();
+				exprstate = ExecPrepareExpr(expr, estate);
+
+				slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+				ExecStoreHeapTuple(newtuple, slot, false);
+
+				econtext = GetPerTupleExprContext(estate);
+				econtext->ecxt_scantuple = slot;
+
+				val = ExecEvalExpr(exprstate, econtext, &val_isnull);
+
+				if (!val_isnull)
+				{
+					int			modify_attnums[1];
+					Datum		modify_values[1];
+					bool		modify_nulls[1];
+
+					modify_attnums[0] = embedding_attnum;
+					modify_values[0] = val;
+					modify_nulls[0] = false;
+
+					rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+														 modify_attnums, modify_values, modify_nulls);
+					newtuple = rettuple;
+
+					elog(LOG, "embedding_trigger: computed embedding for column '%s'",
+						 NameStr(attr->attname));
+				}
+				else
+				{
+					elog(LOG, "embedding_trigger: expression returned NULL for column '%s'",
+						 NameStr(attr->attname));
+				}
+
+				ExecDropSingleTupleTableSlot(slot);
+				FreeExecutorState(estate);
+			}
+			else
+			{
+				Oid embedding_func_oid = get_embedding_function_oid(rel->rd_id, NameStr(attr->attname));
+
+				if (OidIsValid(embedding_func_oid))
+				{
+					FmgrInfo embedding_func;
+					Datum col_datum;
+					bool col_isnull;
+					Datum embedding_datum;
+
+					fmgr_info(embedding_func_oid, &embedding_func);
+
+					col_datum = heap_getattr(newtuple, attnum, tupdesc, &col_isnull);
+
+					if (!col_isnull)
+					{
+						embedding_datum = FunctionCall1(&embedding_func, col_datum);
+
+						{
+							int			modify_attnums[1];
+							Datum		modify_values[1];
+							bool		modify_nulls[1];
+
+							modify_attnums[0] = embedding_attnum;
+							modify_values[0] = embedding_datum;
+							modify_nulls[0] = false;
+
+							rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+																 modify_attnums, modify_values, modify_nulls);
+							newtuple = rettuple;
+						}
+					}
+				}
+			}
+		}
+		else
 		{
 			Oid embedding_func_oid = get_embedding_function_oid(rel->rd_id, NameStr(attr->attname));
 
@@ -782,27 +872,15 @@ embedding_trigger(PG_FUNCTION_ARGS)
 				Datum col_datum;
 				bool col_isnull;
 				Datum embedding_datum;
-				char *col_value;
-				
+
 				fmgr_info(embedding_func_oid, &embedding_func);
-				
-				/* Get the value of the current embedding column */
+
 				col_datum = heap_getattr(newtuple, attnum, tupdesc, &col_isnull);
-				
+
 				if (!col_isnull)
 				{
-					/* Get the text value for logging */
-					col_value = TextDatumGetCString(col_datum);
-					elog(LOG, "embedding_trigger: calling function for column '%s' with value '%s'", 
-						 NameStr(attr->attname), col_value);
-					pfree(col_value);
-					
-					/* Call embedding function with the column value */
 					embedding_datum = FunctionCall1(&embedding_func, col_datum);
-					
-					elog(LOG, "embedding_trigger: function returned successfully");
-					
-					/* Set _embedding column */
+
 					{
 						int			modify_attnums[1];
 						Datum		modify_values[1];
@@ -817,14 +895,6 @@ embedding_trigger(PG_FUNCTION_ARGS)
 						newtuple = rettuple;
 					}
 				}
-				else
-				{
-					elog(LOG, "embedding_trigger: column '%s' is null, skipping", NameStr(attr->attname));
-				}
-			}
-			else
-			{
-				elog(LOG, "embedding_trigger: no embedding function found for column '%s'", NameStr(attr->attname));
 			}
 		}
 	}

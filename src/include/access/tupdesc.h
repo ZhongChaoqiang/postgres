@@ -46,6 +46,7 @@ typedef struct TupleConstr
 	bool		has_generated_stored;
 	bool		has_generated_virtual;
 	bool		has_generated_predict;
+	bool		has_generated_embedding;
 } TupleConstr;
 
 /*

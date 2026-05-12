@@ -599,6 +599,8 @@ RelationBuildTupleDesc(Relation relation)
 			constr->has_generated_virtual = true;
 		if (attp->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
 			constr->has_generated_predict = true;
+		if (attp->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
+			constr->has_generated_embedding = true;
 		if (attp->atthasdef)
 			ndef++;
 

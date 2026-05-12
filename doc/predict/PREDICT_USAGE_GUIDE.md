@@ -1,8 +1,9 @@
-# PostgreSQL PREDICT 功能完整使用指南
+# PostgreSQL PREDICT / EMBEDDING 功能完整使用指南
 
 ## 环境要求
 
-- PostgreSQL 自定义版本（支持PREDICT功能）
+- PostgreSQL 自定义版本（支持PREDICT和EMBEDDING功能）
+- pgvector 扩展（如使用EMBEDDING功能）
 - PL/Python3 扩展（如使用Python预测函数）
 - pg_predict 扩展（如使用LLM推理功能）
 
@@ -370,18 +371,117 @@ SELECT pg_reload_conf();
 
 **解决**：确保使用最新编译版本
 
+## EMBEDDING AS 语法
+
+### 概述
+
+`EMBEDDING AS (expr) STORED` 语法用于创建向量嵌入列，替代原有的 `embedding_function` reloption 方式。表达式返回 `vector` 类型，结果自动存储在 `_embedding` 伴随列中。
+
+### 基本用法
+
+```sql
+-- 1. 安装 pgvector 扩展
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 2. 创建嵌入函数
+CREATE OR REPLACE FUNCTION my_embedding(input text) RETURNS vector
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN '[0.1, 0.2, 0.3]'::vector;
+END;
+$$;
+
+-- 3. 创建表
+CREATE TABLE articles (
+    id int PRIMARY KEY,
+    content text,
+    category text EMBEDDING AS (my_embedding(content)) STORED
+) WITH (vector_len=3);
+```
+
+建表时自动创建：
+- **隐藏列** `{column}_embedding`：存储向量嵌入值，类型为 `vector(vector_len)`
+- **触发器** `pg_embedding_{column}_{oid}`：BEFORE INSERT OR UPDATE，自动调用嵌入函数
+- **向量索引** `{table}_{column}_embedding_idx`：在 `_embedding` 列上创建向量索引（如配置了 `vector_index`）
+
+### 插入和查询
+
+```sql
+-- 插入数据，自动计算 embedding
+INSERT INTO articles (id, content) VALUES (1, 'hello world');
+
+-- 查看嵌入向量
+SELECT id, content, category_embedding FROM articles;
+
+-- 向量距离查询（自动重写）
+SELECT id, content FROM articles
+WHERE category <-> '[0.1,0.2,0.3]' < 1.0
+ORDER BY category <-> '[0.1,0.2,0.3]';
+```
+
+### 向量距离查询重写
+
+当 EMBEDDING 列出现在向量距离操作符（`<->`, `<=>`, `<#>`, `<+>`）中时，查询会自动重写：
+
+- `category <-> '[0.1,0.2,0.3]'` → `category_embedding <-> my_embedding('[0.1,0.2,0.3]')`
+- 文本常量自动通过嵌入函数转换为向量
+- EMBEDDING 列引用自动替换为 `_embedding` 伴随列
+
+### WITH 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `vector_len` | int | 1536 | 嵌入向量维度 |
+| `vector_index` | enum | ivfflat | 向量索引类型：ivfflat 或 hnsw |
+| `vector_distance` | enum | vector_l2_ops | 向量距离类型：vector_l2_ops, vector_cosine_ops, vector_ip_ops |
+| `lists` | int | - | ivfflat 索引的 lists 参数 |
+| `m` | int | - | hnsw 索引的 m 参数 |
+| `ef_construction` | int | - | hnsw 索引的 ef_construction 参数 |
+
+### 多个 EMBEDDING 列
+
+每个 EMBEDDING 列使用独立的嵌入表达式：
+
+```sql
+CREATE TABLE documents (
+    id int PRIMARY KEY,
+    title text,
+    content text,
+    title_vec text EMBEDDING AS (title_embedding(title)) STORED,
+    content_vec text EMBEDDING AS (content_embedding(content)) STORED
+) WITH (vector_len=3);
+```
+
+### 配合向量索引
+
+```sql
+CREATE TABLE articles_indexed (
+    id int PRIMARY KEY,
+    content text,
+    category text EMBEDDING AS (my_embedding(content)) STORED
+) WITH (vector_len=3, vector_index=hnsw, vector_distance=vector_cosine_ops, m=16, ef_construction=64);
+```
+
+### ALTER TABLE 操作
+
+```sql
+-- 添加 EMBEDDING 列
+ALTER TABLE my_table ADD COLUMN embedding_col text EMBEDDING AS (my_embedding(content)) STORED;
+```
+
 ## 总结
 
-PostgreSQL PREDICT 功能提供了：
+PostgreSQL PREDICT / EMBEDDING 功能提供了：
 
 - ✅ 自动预测（触发器 + 异步工作进程）
 - ✅ 灵活的预测时机（immediate/deferred）
 - ✅ 内联表达式语法 `PREDICT AS (expr) STORED`
-- ✅ 多个 predict 列使用不同表达式
-- ✅ 隐藏列机制（_predict/_actual）
+- ✅ 内联表达式语法 `EMBEDDING AS (expr) STORED`
+- ✅ 多个 predict/embedding 列使用不同表达式
+- ✅ 隐藏列机制（_predict/_actual/_embedding）
+- ✅ 向量距离查询自动重写
+- ✅ 向量索引自动创建
 - ✅ ALTER TABLE 支持
 - ✅ 异步预测后台处理
 - ✅ 支持 VOLATILE 函数（LLM 推理）
 - ✅ 简单易用的SQL接口
-
-让预测像普通SQL操作一样简单！

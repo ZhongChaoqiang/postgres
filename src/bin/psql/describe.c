@@ -2140,6 +2140,12 @@ describeOneTableDetails(const char *schemaname,
 									   PQgetvalue(res, i, attrdef_col));
 				mustfree = true;
 			}
+			else if (generated[0] == ATTRIBUTE_GENERATED_EMBEDDING)
+			{
+				default_str = psprintf("embedding as (%s) stored",
+									   PQgetvalue(res, i, attrdef_col));
+				mustfree = true;
+			}
 			else
 				default_str = PQgetvalue(res, i, attrdef_col);
 

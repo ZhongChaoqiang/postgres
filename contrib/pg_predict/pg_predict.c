@@ -1002,7 +1002,7 @@ compute_embedding_for_text(Oid rag_table, const char *embedding_colname,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("no embedding function configured for column \"%s\" of table \"%s\"",
 						embedding_colname, get_rel_name(rag_table)),
-				 errhint("Set the embedding_function table option.")));
+				 errhint("Use EMBEDDING AS (function_name(column)) STORED syntax or set the embedding_function table option.")));
 
 	fmgr_info(func_oid, &flinfo);
 

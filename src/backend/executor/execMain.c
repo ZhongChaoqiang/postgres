@@ -2480,6 +2480,8 @@ ExecBuildSlotValueDescription(Oid reloid,
 				val = "virtual";
 			else if (att->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
 				val = "predict";
+			else if (att->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
+				val = "embedding";
 			else if (slot->tts_isnull[i])
 				val = "null";
 			else

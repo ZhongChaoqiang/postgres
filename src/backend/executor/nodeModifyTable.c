@@ -242,9 +242,10 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
 			 * not-null constraints).  It doesn't seem worth insisting on that
 			 * exact type though, since a null value is type-independent.  As
 			 * above, just insist on *some* NULL constant.  Exception: predict
-			 * columns accept user-provided values.
+			 * and embedding columns accept user-provided values.
 			 */
 			if (attr->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+				attr->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING &&
 				(!IsA(tle->expr, Const) ||
 				 !((Const *) tle->expr)->constisnull))
 				ereport(ERROR,
@@ -477,7 +478,8 @@ ExecInitGenerated(ResultRelInfo *resultRelInfo,
 		{
 			Expr	   *expr;
 
-			if (attgenerated == ATTRIBUTE_GENERATED_PREDICT)
+			if (attgenerated == ATTRIBUTE_GENERATED_PREDICT ||
+				attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
 				continue;
 
 			/* Fetch the GENERATED AS expression tree */

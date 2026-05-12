@@ -1,20 +1,34 @@
-# PREDICT AS 语法设计文档
+# PREDICT AS / EMBEDDING AS 语法设计文档
 
 ## 1. 概述
 
-本文档描述了 PostgreSQL 中 `PREDICT AS (expr) STORED` 语法的实现设计。该语法允许用户在列定义中内联指定预测函数表达式，类似于 `GENERATED ALWAYS AS (expr) STORED`，但使用 `PREDICT` 关键字标记为预测列。该语法替代了原有的 `predict_function` reloption 方式，支持 `predict_timing` 参数和多个 predict 列使用不同的函数。
+本文档描述了 PostgreSQL 中 `PREDICT AS (expr) STORED` 和 `EMBEDDING AS (expr) STORED` 语法的实现设计。这两种语法允许用户在列定义中内联指定预测/嵌入函数表达式，类似于 `GENERATED ALWAYS AS (expr) STORED`，但分别使用 `PREDICT` 和 `EMBEDDING` 关键字标记。
+
+### PREDICT AS
+
+`PREDICT AS (expr) STORED` 语法替代了原有的 `predict_function` reloption 方式，支持 `predict_timing` 参数和多个 predict 列使用不同的函数。
 
 与 GENERATED ALWAYS AS 的关键区别是：predict 列允许用户直接写入值。当用户提供了值时，该值保存到 predict 列本身和 `_actual` 伴随列；当用户没有提供值时，通过推理函数计算的结果保存到 predict 列本身和 `_predict` 伴随列。
+
+### EMBEDDING AS
+
+`EMBEDDING AS (expr) STORED` 语法替代了原有的 `embedding_function` reloption 方式，支持多个 embedding 列使用不同的函数。
+
+与 PREDICT AS 的关键区别是：embedding 列的表达式返回 `vector` 类型，结果存储在 `_embedding` 伴随列中。embedding 列本身存储原始文本值，用于查询重写时自动替换为向量距离计算。
 
 ## 2. 语法
 
 ### 2.1 新增语法
 
 ```sql
+-- PREDICT AS 语法
 column_name data_type PREDICT AS (expression) STORED
+
+-- EMBEDDING AS 语法
+column_name data_type EMBEDDING AS (expression) STORED
 ```
 
-### 2.2 示例
+### 2.2 PREDICT AS 示例
 
 #### 基本用法
 
@@ -84,26 +98,96 @@ CREATE TABLE products (
 ) WITH (predict_timing=deferred);
 ```
 
-### 2.3 与 GENERATED ALWAYS AS 的对比
+### 2.3 EMBEDDING AS 示例
 
-| 特性 | GENERATED ALWAYS AS (expr) STORED | PREDICT AS (expr) STORED |
-|------|-----------------------------------|--------------------------|
-| 语法 | `col type GENERATED ALWAYS AS (expr) STORED` | `col type PREDICT AS (expr) STORED` |
-| attgenerated 值 | 's' | 'p' |
-| attpredict 值 | false | true |
-| INSERT 时自动计算 | 是 | 是（immediate模式，用户未提供值时） |
-| UPDATE 时自动重算 | 是 | 是（immediate模式，用户未修改predict列时） |
-| 允许直接写入 | 否 | 是（写入值保存到_actual列） |
-| 表达式必须 IMMUTABLE | 是 | 是 |
-| 不能引用其他生成列 | 是 | 是 |
-| 伴随列 | 无 | _predict, _actual |
-| 计算方式 | ExecComputeStoredGenerated | predict_trigger |
-| 支持延迟计算 | 否 | 是（predict_timing=deferred） |
+#### 基本用法
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE OR REPLACE FUNCTION simple_embedding(input text) RETURNS vector
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN '[0.1, 0.2, 0.3]'::vector;
+END;
+$$;
+
+CREATE TABLE articles (
+    id int PRIMARY KEY,
+    content text,
+    category text EMBEDDING AS (simple_embedding(content)) STORED
+) WITH (vector_len=3);
+```
+
+#### INSERT 自动计算 embedding
+
+```sql
+INSERT INTO articles (id, content) VALUES (1, 'hello world');
+-- 结果: category = NULL, category_embedding = [0.1,0.2,0.3]
+```
+
+#### 向量距离查询（自动重写）
+
+```sql
+SELECT id, content FROM articles
+WHERE category <-> '[0.1,0.2,0.3]' < 1.0
+ORDER BY category <-> '[0.1,0.2,0.3]';
+-- 自动重写为: WHERE category_embedding <-> simple_embedding('[0.1,0.2,0.3]') < 1.0
+```
+
+#### 多个 embedding 列使用不同函数
+
+```sql
+CREATE OR REPLACE FUNCTION title_embedding(input text) RETURNS vector
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN '[0.4, 0.5, 0.6]'::vector;
+END;
+$$;
+
+CREATE TABLE documents (
+    id int PRIMARY KEY,
+    title text,
+    content text,
+    title_vec text EMBEDDING AS (title_embedding(title)) STORED,
+    content_vec text EMBEDDING AS (simple_embedding(content)) STORED
+) WITH (vector_len=3);
+```
+
+#### 配合向量索引
+
+```sql
+CREATE TABLE articles_indexed (
+    id int PRIMARY KEY,
+    content text,
+    category text EMBEDDING AS (simple_embedding(content)) STORED
+) WITH (vector_len=3, vector_index=ivfflat, vector_distance=vector_l2_ops);
+-- 自动在 category_embedding 列上创建 ivfflat 索引
+```
+
+### 2.4 三种生成列对比
+
+| 特性 | GENERATED ALWAYS AS STORED | PREDICT AS STORED | EMBEDDING AS STORED |
+|------|---------------------------|-------------------|---------------------|
+| 语法 | `col type GENERATED ALWAYS AS (expr) STORED` | `col type PREDICT AS (expr) STORED` | `col type EMBEDDING AS (expr) STORED` |
+| attgenerated 值 | 's' | 'p' | 'e' |
+| attpredict 值 | false | true | false |
+| attembedding 值 | false | false | true |
+| 表达式返回类型 | 与列类型相同 | 与列类型相同 | vector（与列类型不同） |
+| INSERT 时自动计算 | 是 | 是（immediate模式） | 是 |
+| UPDATE 时自动重算 | 是 | 是（immediate模式） | 是 |
+| 允许直接写入 | 否 | 是 | 是 |
+| 表达式必须 IMMUTABLE | 是 | 否（允许VOLATILE） | 否（允许VOLATILE） |
+| 伴随列 | 无 | _predict, _actual | _embedding |
+| 计算方式 | ExecComputeStoredGenerated | predict_trigger | embedding_trigger |
+| 查询重写 | 无 | 无 | 向量距离操作符重写 |
+| 支持延迟计算 | 否 | 是（predict_timing=deferred） | 否 |
+| 支持异步后台计算 | 否 | 是（async_predict worker） | 否 |
 | 支持异步后台计算 | 否 | 是（async_predict worker） |
 
-### 2.4 废弃的 predict_function reloption
+### 2.5 废弃的 reloption
 
-原有的 `predict_function` reloption 方式已被移除，统一使用 `PREDICT AS (expr) STORED` 语法。`predict_function` 不再支持，所有 predict 列必须使用 `PREDICT AS` 语法指定推理表达式。
+原有的 `predict_function` 和 `embedding_function` reloption 方式已被移除，统一使用 `PREDICT AS (expr) STORED` 和 `EMBEDDING AS (expr) STORED` 语法。这些 reloption 不再支持，所有 predict/embedding 列必须使用新语法指定表达式。
 
 ## 3. 实现架构
 
@@ -111,22 +195,23 @@ CREATE TABLE products (
 
 | 文件 | 修改内容 |
 |------|----------|
-| `src/include/catalog/pg_attribute.h` | 添加 `ATTRIBUTE_GENERATED_PREDICT` ('p') 常量 |
-| `src/include/catalog/pg_attribute_d.h` | 添加 `ATTRIBUTE_GENERATED_PREDICT` ('p') 常量 |
-| `src/include/nodes/parsenodes.h` | 添加 `CONSTR_PREDICT` 枚举值和 `generated_kind` 字段 |
-| `src/include/access/tupdesc.h` | 添加 `has_generated_predict` 标志 |
-| `src/backend/parser/gram.y` | 添加 `opt_predict_clause` 语法规则 |
-| `src/backend/parser/parse_utilcmd.c` | 处理 `CONSTR_PREDICT` 约束，创建伴随列 |
-| `src/backend/access/common/tupdesc.c` | 复制和比较 `has_generated_predict` |
-| `src/backend/utils/cache/relcache.c` | 设置 `has_generated_predict` 标志 |
-| `src/backend/executor/nodeModifyTable.c` | 跳过 predict 列的 ExecComputeStoredGenerated；允许 predict 列接受用户值 |
-| `src/backend/executor/execMain.c` | 显示 predict 列类型 |
-| `src/backend/commands/tablecmds.c` | 处理 predict 列建表/修改逻辑，创建触发器 |
-| `src/backend/rewrite/rewriteHandler.c` | 允许 predict 列接受 INSERT/UPDATE 的用户值 |
-| `src/backend/utils/adt/predict.c` | predict_trigger 支持内联表达式计算，区分用户值和预测值 |
+| `src/include/catalog/pg_attribute.h` | 添加 `ATTRIBUTE_GENERATED_PREDICT` ('p') 和 `ATTRIBUTE_GENERATED_EMBEDDING` ('e') 常量 |
+| `src/include/nodes/parsenodes.h` | 添加 `CONSTR_PREDICT` 和 `CONSTR_EMBEDDING` 枚举值和 `generated_kind` 字段 |
+| `src/include/access/tupdesc.h` | 添加 `has_generated_predict` 和 `has_generated_embedding` 标志 |
+| `src/backend/parser/gram.y` | 添加 `opt_predict_clause` 和 `opt_embedding_clause` 语法规则 |
+| `src/backend/parser/parse_utilcmd.c` | 处理 `CONSTR_PREDICT` 和 `CONSTR_EMBEDDING` 约束，创建伴随列 |
+| `src/backend/access/common/tupdesc.c` | 复制和比较 `has_generated_predict` 和 `has_generated_embedding` |
+| `src/backend/utils/cache/relcache.c` | 设置 `has_generated_predict` 和 `has_generated_embedding` 标志 |
+| `src/backend/executor/nodeModifyTable.c` | 跳过 predict/embedding 列的 ExecComputeStoredGenerated；允许接受用户值 |
+| `src/backend/executor/execMain.c` | 显示 predict/embedding 列类型 |
+| `src/backend/commands/tablecmds.c` | 处理 predict/embedding 列建表/修改逻辑，创建触发器 |
+| `src/backend/rewrite/rewriteHandler.c` | 允许 predict/embedding 列接受 INSERT/UPDATE 的用户值；embedding 查询重写 |
+| `src/backend/utils/adt/predict.c` | predict_trigger/embedding_trigger 支持内联表达式计算 |
 | `src/backend/postmaster/async_predict.c` | async_predict worker 支持内联表达式 |
-| `src/bin/pg_dump/pg_dump.c` | 导出 predict 列语法 |
-| `src/bin/psql/describe.c` | \d 命令显示 predict 列信息 |
+| `src/backend/access/common/reloptions.c` | 移除 `embedding_function` reloption |
+| `src/include/utils/rel.h` | 移除 `embedding_function` 字段 |
+| `src/bin/pg_dump/pg_dump.c` | 导出 predict/embedding 列语法 |
+| `src/bin/psql/describe.c` | \d 命令显示 predict/embedding 列信息 |
 
 ### 3.2 语法解析流程
 
@@ -199,18 +284,22 @@ SQL: CREATE TABLE t (a int, b numeric PREDICT AS (add_tax(a)) STORED) WITH (pred
 
 | 字段 | 新值 | 说明 |
 |------|------|------|
-| attgenerated | 'p' | ATTRIBUTE_GENERATED_PREDICT |
-| attpredict | true | 兼容现有 predict 基础设施 |
+| attgenerated | 'p' 或 'e' | ATTRIBUTE_GENERATED_PREDICT 或 ATTRIBUTE_GENERATED_EMBEDDING |
+| attpredict | true | predict 列设置，兼容现有 predict 基础设施 |
+| attembedding | true | embedding 列设置，兼容现有 embedding 基础设施 |
 
 ### 4.2 pg_attrdef
 
-predict 列的内联表达式存储在 `pg_attrdef` 系统目录中，与 GENERATED 列共享相同的存储机制。
+predict/embedding 列的内联表达式存储在 `pg_attrdef` 系统目录中，与 GENERATED 列共享相同的存储机制。
+
+注意：对于 EMBEDDING AS 列，表达式返回 `vector` 类型，但列本身是 `text` 类型。PostgreSQL 会在存储时自动添加 `CoerceViaIO` 节点将 vector 转换为 text。在触发器评估表达式时，需要剥离这个 `CoerceViaIO` 节点，直接评估内部的函数表达式，以获得正确的 vector 结果。
 
 ### 4.3 TupleConstr
 
 | 字段 | 说明 |
 |------|------|
 | has_generated_predict | true 表示关系包含 predict 列 |
+| has_generated_embedding | true 表示关系包含 embedding 列 |
 
 ## 5. 触发器行为
 
@@ -253,6 +342,31 @@ predict 列的内联表达式存储在 `pg_attrdef` 系统目录中，与 GENERA
 - Worker 是独立后台进程，GUC 参数（如 `pg_predict.api_url`）必须使用 `ALTER SYSTEM SET` 设置为全局级别，`SET` 命令只在当前会话有效
 - Worker 执行 UPDATE 时会触发 `predict_trigger`，触发器通过比较新旧值和 `_predict` 列来检测是否是 worker 的操作
 - Worker 使用 PG_TRY/PG_CATCH 捕获错误，防止 LLM 调用失败导致 worker 崩溃
+
+### 5.3 embedding_trigger
+
+`embedding_trigger` 是一个 BEFORE INSERT OR UPDATE 触发器，处理所有 embedding 列的计算：
+
+1. **遍历所有 embedding 列**：通过 `attembedding` 标志识别
+
+2. **计算 embedding 值**：
+   - 检查 `attgenerated == ATTRIBUTE_GENERATED_EMBEDDING`
+   - 使用 `TupleDescGetDefault` 获取原始表达式
+   - 如果表达式被 `CoerceViaIO` 包裹（因为列类型是 text 但表达式返回 vector），剥离外层强制转换
+   - 使用 `ExecPrepareExpr` + `ExecEvalExpr` 计算表达式
+   - 将 vector 结果存储到 `_embedding` 伴随列
+
+3. **向后兼容**：
+   - 如果 `attgenerated` 不是 `ATTRIBUTE_GENERATED_EMBEDDING`（旧的 `EMBEDDING` 关键字方式），回退到 `get_embedding_function_oid` 获取函数 OID
+   - 直接调用函数并将结果存储到 `_embedding` 伴随列
+
+### 5.4 查询重写中的 embedding 函数查找
+
+在 `rewriteHandler.c` 的 `convert_text_to_vector_const` 函数中，当需要将文本常量转换为向量时：
+
+1. 优先从 `pg_attrdef` 获取表达式（`TupleDescGetDefault`）
+2. 剥离 `CoerceViaIO` 节点后，提取 `FuncExpr` 的 `funcid`
+3. 如果无法从表达式获取函数 OID，回退到 `get_embedding_function_oid`
 
 ## 6. 测试验证
 
@@ -348,14 +462,27 @@ CREATE TABLE test_llm_articles (
 | LLM 自动分类 politics | category=politics, category_predict=politics | ✅ 通过 |
 | 用户提供 category | category=entertainment, category_actual=entertainment | ✅ 通过 |
 
+### 6.3 EMBEDDING AS 测试用例
+
+| 测试场景 | 预期结果 | 状态 |
+|----------|----------|------|
+| CREATE TABLE with EMBEDDING AS | 自动创建 _embedding 伴随列和向量索引 | ✅ 通过 |
+| INSERT 自动计算 embedding | _embedding 列存储向量值 | ✅ 通过 |
+| UPDATE 重新计算 embedding | _embedding 列更新向量值 | ✅ 通过 |
+| 向量距离查询重写 | 自动替换为 _embedding 列和向量操作 | ✅ 通过 |
+| 多个 embedding 列不同函数 | 每列独立计算 | ✅ 通过 |
+| \d 显示 EMBEDDING AS 语法 | 正确显示 embedding as (expr) stored | ✅ 通过 |
+| pg_dump 导出 EMBEDDING AS 语法 | 正确导出 | ✅ 通过 |
+
 ## 7. 关键代码修改说明
 
-### 7.1 允许 predict 列使用 VOLATILE 表达式
+### 7.1 允许 predict/embedding 列使用 VOLATILE 表达式
 
-在 `src/backend/catalog/heap.c` 中，predict 列跳过了 IMMUTABLE 检查：
+在 `src/backend/catalog/heap.c` 中，predict 和 embedding 列跳过了 IMMUTABLE 检查：
 
 ```c
-if (attgenerated != ATTRIBUTE_GENERATED_PREDICT)
+if (attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+    attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
 {
     if (contain_mutable_functions_after_planning((Expr *) expr))
         ereport(ERROR,
@@ -364,24 +491,26 @@ if (attgenerated != ATTRIBUTE_GENERATED_PREDICT)
 }
 ```
 
-这是因为 predict 列可能调用 LLM API 等外部服务，这些函数必须是 VOLATILE 的。
+这是因为 predict/embedding 列可能调用 LLM API 等外部服务，这些函数必须是 VOLATILE 的。
 
-### 7.2 允许 predict 列接受用户写入
+### 7.2 允许 predict/embedding 列接受用户写入
 
-在 `src/backend/rewrite/rewriteHandler.c` 中，predict 列跳过了 generated 列的写入限制：
+在 `src/backend/rewrite/rewriteHandler.c` 中，predict 和 embedding 列跳过了 generated 列的写入限制：
 
 ```c
 if (att_tup->attgenerated && !apply_default &&
-    att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT)
+    att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+    att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
 {
     /* ... 报错：不能写入 generated 列 ... */
 }
 ```
 
-在 `src/backend/executor/nodeModifyTable.c` 中，predict 列跳过了类型检查限制：
+在 `src/backend/executor/nodeModifyTable.c` 中，predict 和 embedding 列跳过了类型检查限制：
 
 ```c
 if (attr->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+    attr->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING &&
     (!IsA(tle->expr, Const) || !((Const *) tle->expr)->constisnull))
     ereport(ERROR, ...);
 ```

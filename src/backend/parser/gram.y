@@ -592,7 +592,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	DomainConstraint TableConstraint TableLikeClause
 %type <ival>	TableLikeOptionList TableLikeOption
 %type <str>		column_compression opt_column_compression column_storage opt_column_storage
-%type <boolean>	opt_embedding
+%type <node>	opt_embedding_clause
 %type <node>	opt_predict_clause
 %type <list>	ColQualList
 %type <node>	ColConstraint ColConstraintElem ConstraintAttr
@@ -3813,7 +3813,7 @@ TypedTableElement:
 			| TableConstraint					{ $$ = $1; }
 		;
 
-columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList opt_predict_clause opt_embedding
+columnDef:	ColId Typename opt_column_storage opt_column_compression create_generic_options ColQualList opt_predict_clause opt_embedding_clause
 				{
 					ColumnDef *n = makeNode(ColumnDef);
 
@@ -3848,7 +3848,24 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 					{
 						n->is_predict = false;
 					}
-					n->is_embedding = $8;
+					if ($8 != NULL)
+					{
+						if (IsA($8, Constraint))
+						{
+							Constraint *c = (Constraint *) $8;
+							n->is_embedding = true;
+							n->generated = c->generated_kind;
+							n->raw_default = c->raw_expr;
+						}
+						else
+						{
+							n->is_embedding = true;
+						}
+					}
+					else
+					{
+						n->is_embedding = false;
+					}
 					n->is_hidden = false;
 					SplitColQualList($6, &n->constraints, &n->collClause,
 									 yyscanner);
@@ -3889,9 +3906,26 @@ opt_predict_clause:
 				{ $$ = NULL; }
 		;
 
-opt_embedding:
-			EMBEDDING								{ $$ = true; }
-			| /*EMPTY*/								{ $$ = false; }
+opt_embedding_clause:
+			EMBEDDING AS '(' a_expr ')' STORED
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_EMBEDDING;
+					n->generated_when = ATTRIBUTE_IDENTITY_ALWAYS;
+					n->raw_expr = $4;
+					n->cooked_expr = NULL;
+					n->generated_kind = ATTRIBUTE_GENERATED_EMBEDDING;
+					n->location = @1;
+
+					$$ = (Node *) n;
+				}
+			| EMBEDDING
+				{
+					$$ = makeInteger(1);
+				}
+			| /*EMPTY*/
+				{ $$ = NULL; }
 		;
 
 column_storage:

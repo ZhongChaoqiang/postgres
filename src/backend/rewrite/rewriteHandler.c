@@ -943,11 +943,12 @@ rewriteTargetListIU(List *targetList,
 
 			/*
 			 * Can only insert DEFAULT into generated columns, regardless of
-			 * any OVERRIDING clauses.  Exception: predict columns allow
-			 * user-provided values (which become "actual" values).
+			 * any OVERRIDING clauses.  Exception: predict and embedding
+			 * columns allow user-provided values.
 			 */
 			if (att_tup->attgenerated && !apply_default &&
-				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT)
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
 			{
 				/*
 				 * If this column's values come from a VALUES RTE, test
@@ -998,7 +999,8 @@ rewriteTargetListIU(List *targetList,
 								   NameStr(att_tup->attname))));
 
 			if (att_tup->attgenerated && new_tle && !apply_default &&
-				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT)
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
 				ereport(ERROR,
 						(errcode(ERRCODE_GENERATED_ALWAYS),
 						 errmsg("column \"%s\" can only be updated to DEFAULT",
@@ -1009,13 +1011,13 @@ rewriteTargetListIU(List *targetList,
 
 		if (att_tup->attgenerated)
 		{
-			if (att_tup->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
+			if (att_tup->attgenerated == ATTRIBUTE_GENERATED_PREDICT ||
+				att_tup->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
 			{
 				/*
-				 * Predict columns: if user provided a value, keep it (it
-				 * will be saved as the "actual" value by the trigger).  If
-				 * no value was provided, set to NULL so the trigger can
-				 * compute the prediction.
+				 * Predict/embedding columns: if user provided a value, keep
+				 * it.  If no value was provided, set to NULL so the trigger
+				 * can compute the prediction/embedding.
 				 */
 				if (apply_default || new_tle == NULL)
 					new_tle = NULL;
@@ -4816,10 +4818,12 @@ convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname)
 	Oid			embedding_func_oid;
 	FmgrInfo	flinfo;
 	Datum		embedding_result;
-	HeapTuple	proc_tuple;
-	Form_pg_proc proc_form;
 	Datum		text_datum;
-	
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			attnum;
+	Form_pg_attribute attr;
+
 	vector_oid = TypenameGetTypid("vector");
 	if (!OidIsValid(vector_oid))
 		return NULL;
@@ -4827,30 +4831,54 @@ convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname)
 		return NULL;
 	if (text_const->consttype == vector_oid)
 		return NULL;
-	
-	embedding_func_oid = get_embedding_function_oid(relid, colname);
+
+	rel = try_relation_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return NULL;
+
+	tupdesc = RelationGetDescr(rel);
+	embedding_func_oid = InvalidOid;
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		attr = TupleDescAttr(tupdesc, attnum - 1);
+		if (!attr->attisdropped && attr->attembedding &&
+			strcmp(NameStr(attr->attname), colname) == 0)
+		{
+			if (attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
+			{
+				Expr	   *expr;
+
+				expr = (Expr *) TupleDescGetDefault(tupdesc, attnum);
+				if (expr != NULL)
+				{
+					if (IsA(expr, CoerceViaIO))
+						expr = ((CoerceViaIO *) expr)->arg;
+
+					if (IsA(expr, FuncExpr))
+						embedding_func_oid = ((FuncExpr *) expr)->funcid;
+				}
+			}
+			break;
+		}
+	}
+
+	relation_close(rel, AccessShareLock);
+
+	if (!OidIsValid(embedding_func_oid))
+	{
+		embedding_func_oid = get_embedding_function_oid(relid, colname);
+	}
+
 	if (!OidIsValid(embedding_func_oid))
 	{
 		elog(LOG, "rewrite_embedding: no embedding function found for column %s", colname);
 		return NULL;
 	}
-	
-	proc_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(embedding_func_oid));
-	if (!HeapTupleIsValid(proc_tuple))
-		elog(ERROR, "cache lookup failed for function %u", embedding_func_oid);
-	
-	proc_form = (Form_pg_proc) GETSTRUCT(proc_tuple);
-	if (proc_form->pronargs != 1 || proc_form->proargtypes.values[0] != TEXTOID)
-	{
-		ReleaseSysCache(proc_tuple);
-		elog(LOG, "rewrite_embedding: embedding function must accept a single text argument");
-		return NULL;
-	}
-	ReleaseSysCache(proc_tuple);
-	
+
 	text_datum = text_const->constvalue;
 	fmgr_info(embedding_func_oid, &flinfo);
-	
+
 	PG_TRY();
 	{
 		embedding_result = FunctionCall1(&flinfo, text_datum);
@@ -4861,7 +4889,7 @@ convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	
+
 	elog(LOG, "rewrite_embedding: successfully transformed text to vector");
 	return makeConst(vector_oid, -1, InvalidOid, -1,
 					 embedding_result, false, false);
