@@ -1,11 +1,11 @@
-# contrib/pg_predict/Makefile
+# contrib/jolix_predict/Makefile
 
-MODULE_big = pg_predict
-OBJS = pg_predict.o
+MODULE_big = jolix_predict
+OBJS = jolix_predict.o
 
-EXTENSION = pg_predict
-DATA = pg_predict--1.0.sql
-PGFILEDESC = "pg_predict - LLM inference functions for PostgreSQL"
+EXTENSION = jolix_predict
+DATA = jolix_predict--1.0.sql
+PGFILEDESC = "jolix_predict - LLM inference functions for PostgreSQL"
 
 override CPPFLAGS := $(LIBCURL_CPPFLAGS) $(CPPFLAGS)
 
@@ -14,7 +14,7 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = contrib/pg_predict
+subdir = contrib/jolix_predict
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

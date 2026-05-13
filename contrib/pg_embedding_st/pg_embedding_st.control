@@ -1,5 +1,0 @@
-# pg_embedding_st extension
-comment = 'Sentence Transformers embedding functions for PostgreSQL'
-default_version = '1.0'
-module_pathname = '$libdir/pg_embedding_st'
-relocatable = true

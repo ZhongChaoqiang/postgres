@@ -1,6 +1,6 @@
-\echo Use "CREATE EXTENSION pg_predict" to load this file. \quit
+\echo Use "CREATE EXTENSION jolix_predict" to load this file. \quit
 
-CREATE TABLE pg_predict_config (
+CREATE TABLE jolix_predict_config (
     id serial PRIMARY KEY,
     scope text NOT NULL DEFAULT 'system',
     relid oid DEFAULT NULL,
@@ -20,8 +20,8 @@ CREATE TABLE pg_predict_config (
     UNIQUE(scope, relid)
 );
 
-REVOKE ALL ON pg_predict_config FROM PUBLIC;
-GRANT SELECT, INSERT, UPDATE, DELETE ON pg_predict_config TO CURRENT_USER;
+REVOKE ALL ON jolix_predict_config FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON jolix_predict_config TO CURRENT_USER;
 
 CREATE FUNCTION set_predict_config(
     p_api_url text,
@@ -38,7 +38,7 @@ CREATE FUNCTION set_predict_config(
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO pg_predict_config (scope, relid, api_url, api_key, model_name, temperature, max_tokens, system_prompt, history_count, rag_table, rag_similarity, rag_topn)
+    INSERT INTO jolix_predict_config (scope, relid, api_url, api_key, model_name, temperature, max_tokens, system_prompt, history_count, rag_table, rag_similarity, rag_topn)
     VALUES ('system', NULL, p_api_url, p_api_key, p_model_name, p_temperature, p_max_tokens, p_system_prompt, p_history_count, p_rag_table, p_rag_similarity, p_rag_topn)
     ON CONFLICT (scope, relid) WHERE scope = 'system'
     DO UPDATE SET
@@ -76,7 +76,7 @@ CREATE FUNCTION set_predict_config(
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO pg_predict_config (scope, relid, api_url, api_key, model_name, temperature, max_tokens, system_prompt, prompt_template, history_count, rag_table, rag_similarity, rag_topn)
+    INSERT INTO jolix_predict_config (scope, relid, api_url, api_key, model_name, temperature, max_tokens, system_prompt, prompt_template, history_count, rag_table, rag_similarity, rag_topn)
     VALUES ('table', p_table_name, p_api_url, p_api_key, p_model_name, p_temperature, p_max_tokens, p_system_prompt, p_prompt_template, p_history_count, p_rag_table, p_rag_similarity, p_rag_topn)
     ON CONFLICT (scope, relid) WHERE scope = 'table'
     DO UPDATE SET
@@ -117,7 +117,7 @@ DECLARE
 BEGIN
     SELECT l.api_url, l.api_key, l.model_name, l.temperature, l.max_tokens, l.system_prompt, l.history_count, l.rag_table, l.rag_similarity, l.rag_topn
     INTO rec
-    FROM pg_predict_config l
+    FROM jolix_predict_config l
     WHERE l.scope = 'system'
     LIMIT 1;
 
@@ -158,14 +158,14 @@ DECLARE
 BEGIN
     SELECT l.api_url, l.api_key, l.model_name, l.temperature, l.max_tokens, l.system_prompt, l.prompt_template, l.history_count, l.rag_table, l.rag_similarity, l.rag_topn
     INTO rec
-    FROM pg_predict_config l
+    FROM jolix_predict_config l
     WHERE l.scope = 'table' AND l.relid = p_table_name
     LIMIT 1;
 
     IF NOT FOUND THEN
         SELECT l.api_url, l.api_key, l.model_name, l.temperature, l.max_tokens, l.system_prompt, NULL::text, l.history_count, l.rag_table, l.rag_similarity, l.rag_topn
         INTO rec
-        FROM pg_predict_config l
+        FROM jolix_predict_config l
         WHERE l.scope = 'system'
         LIMIT 1;
     END IF;
@@ -191,31 +191,31 @@ CREATE FUNCTION llm_infer(
     system_prompt text,
     user_input text
 ) RETURNS text
-AS 'pg_predict', 'llm_infer'
+AS 'jolix_predict', 'llm_infer'
 LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION llm_infer(text, text) IS
-'Call LLM API with system prompt and user input. Uses GUC parameters (pg_predict.*) for API configuration.';
+'Call LLM API with system prompt and user input. Uses GUC parameters (jolix_predict.*) for API configuration.';
 
 CREATE FUNCTION llm_infer(
     system_prompt text,
     history_count integer,
     user_input text
 ) RETURNS text
-AS 'pg_predict', 'llm_infer'
+AS 'jolix_predict', 'llm_infer'
 LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION llm_infer(text, integer, text) IS
-'Call LLM API with system prompt, history count, and user input. Uses GUC parameters (pg_predict.*) for API configuration.';
+'Call LLM API with system prompt, history count, and user input. Uses GUC parameters (jolix_predict.*) for API configuration.';
 
 CREATE FUNCTION llm_predict_ext(
     input_row record
 ) RETURNS text
-AS 'pg_predict', 'llm_predict_ext'
+AS 'jolix_predict', 'llm_predict_ext'
 LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION llm_predict_ext(record) IS
-'Default LLM predict function for PREDICT columns (extension implementation). Sends the entire row data to the LLM. Reads configuration from pg_predict_config table. Supports prompt_template with {{column_name}} syntax. If no template is set, the entire row is formatted as key-value pairs. Supports system prompt and history conversations.';
+'Default LLM predict function for PREDICT columns (extension implementation). Sends the entire row data to the LLM. Reads configuration from jolix_predict_config table. Supports prompt_template with {{column_name}} syntax. If no template is set, the entire row is formatted as key-value pairs. Supports system prompt and history conversations.';
 
 CREATE FUNCTION llm_rag_infer(
     system_prompt text,
@@ -225,7 +225,7 @@ CREATE FUNCTION llm_rag_infer(
     rag_similarity float8,
     rag_topn integer
 ) RETURNS text
-AS 'pg_predict', 'llm_rag_infer'
+AS 'jolix_predict', 'llm_rag_infer'
 LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION llm_rag_infer(text, integer, text, regclass, float8, integer) IS
@@ -234,8 +234,8 @@ COMMENT ON FUNCTION llm_rag_infer(text, integer, text, regclass, float8, integer
 CREATE FUNCTION llm_rag_predict_ext(
     input_row record
 ) RETURNS text
-AS 'pg_predict', 'llm_rag_predict_ext'
+AS 'jolix_predict', 'llm_rag_predict_ext'
 LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION llm_rag_predict_ext(record) IS
-'RAG-enhanced default predict function for PREDICT columns (extension implementation). Reads configuration from pg_predict_config table including rag_table, rag_similarity, rag_topn. Performs vector similarity search on the RAG table to retrieve relevant context, then combines it with the row data and system prompt before calling the LLM. If rag_table is not configured, falls back to llm_predict behavior.';
+'RAG-enhanced default predict function for PREDICT columns (extension implementation). Reads configuration from jolix_predict_config table including rag_table, rag_similarity, rag_topn. Performs vector similarity search on the RAG table to retrieve relevant context, then combines it with the row data and system prompt before calling the LLM. If rag_table is not configured, falls back to llm_predict behavior.';

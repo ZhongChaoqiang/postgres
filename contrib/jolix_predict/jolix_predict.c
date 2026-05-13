@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * pg_predict.c
+ * jolix_predict.c
  *    LLM inference functions for PostgreSQL
  *
  * This module provides:
@@ -8,7 +8,7 @@
  * - llm_predict(): Default predict function for PREDICT columns
  * - llm_rag_infer(): RAG-enhanced LLM inference function
  * - llm_rag_predict(): RAG-enhanced predict function for PREDICT columns
- * - Configuration via pg_predict_config table and GUC parameters
+ * - Configuration via jolix_predict_config table and GUC parameters
  *
  * The llm_predict function sends the entire row data to the LLM,
  * inspired by MindsDB's approach. It supports:
@@ -20,7 +20,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *    contrib/pg_predict/pg_predict.c
+ *    contrib/jolix_predict/jolix_predict.c
  *
  *-------------------------------------------------------------------------
  */
@@ -53,12 +53,12 @@
 
 PG_MODULE_MAGIC;
 
-static char *pg_predict_api_url = NULL;
-static char *pg_predict_api_key = NULL;
-static char *pg_predict_model = NULL;
-static double pg_predict_temperature = 0.7;
-static int pg_predict_max_tokens = 1024;
-static int pg_predict_timeout = 60;
+static char *jolix_predict_api_url = NULL;
+static char *jolix_predict_api_key = NULL;
+static char *jolix_predict_model = NULL;
+static double jolix_predict_temperature = 0.7;
+static int jolix_predict_max_tokens = 1024;
+static int jolix_predict_timeout = 60;
 
 typedef struct LLMHttpResponse
 {
@@ -132,55 +132,55 @@ void		_PG_init(void);
 void
 _PG_init(void)
 {
-	DefineCustomStringVariable("pg_predict.api_url",
+	DefineCustomStringVariable("jolix_predict.api_url",
 							   "Default LLM API URL",
 							   NULL,
-							   &pg_predict_api_url,
+							   &jolix_predict_api_url,
 							   "",
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomStringVariable("pg_predict.api_key",
+	DefineCustomStringVariable("jolix_predict.api_key",
 							   "Default LLM API key",
 							   NULL,
-							   &pg_predict_api_key,
+							   &jolix_predict_api_key,
 							   "",
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomStringVariable("pg_predict.model",
+	DefineCustomStringVariable("jolix_predict.model",
 							   "Default LLM model name",
 							   NULL,
-							   &pg_predict_model,
+							   &jolix_predict_model,
 							   "gpt-3.5-turbo",
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomRealVariable("pg_predict.temperature",
+	DefineCustomRealVariable("jolix_predict.temperature",
 							 "Default LLM temperature",
 							 NULL,
-							 &pg_predict_temperature,
+							 &jolix_predict_temperature,
 							 0.7, 0.0, 2.0,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("pg_predict.max_tokens",
+	DefineCustomIntVariable("jolix_predict.max_tokens",
 							"Default LLM max tokens",
 							NULL,
-							&pg_predict_max_tokens,
+							&jolix_predict_max_tokens,
 							1024, 1, 32768,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("pg_predict.timeout",
+	DefineCustomIntVariable("jolix_predict.timeout",
 							"LLM API request timeout in seconds",
 							NULL,
-							&pg_predict_timeout,
+							&jolix_predict_timeout,
 							60, 1, 600,
 							PGC_USERSET,
 							0,
@@ -243,7 +243,7 @@ llm_http_post(const char *url, const char *api_key, const char *json_body)
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, llm_http_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) pg_predict_timeout);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) jolix_predict_timeout);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
@@ -406,11 +406,11 @@ static void
 fill_config_defaults(LLMConfig *config)
 {
 	if (config->api_url == NULL)
-		config->api_url = pg_predict_api_url ? pstrdup(pg_predict_api_url) : pstrdup("");
+		config->api_url = jolix_predict_api_url ? pstrdup(jolix_predict_api_url) : pstrdup("");
 	if (config->api_key == NULL)
-		config->api_key = pg_predict_api_key ? pstrdup(pg_predict_api_key) : pstrdup("");
+		config->api_key = jolix_predict_api_key ? pstrdup(jolix_predict_api_key) : pstrdup("");
 	if (config->model == NULL)
-		config->model = pg_predict_model ? pstrdup(pg_predict_model) : pstrdup("gpt-3.5-turbo");
+		config->model = jolix_predict_model ? pstrdup(jolix_predict_model) : pstrdup("gpt-3.5-turbo");
 	if (config->system_prompt == NULL)
 		config->system_prompt = pstrdup("");
 	if (config->prompt_template == NULL)
@@ -439,25 +439,27 @@ read_llm_config(Oid relid, LLMConfig *config)
 		return false;
 	}
 
-	snprintf(query, sizeof(query),
-			 "SELECT api_url, api_key, model_name, temperature, max_tokens, "
-			 "system_prompt, prompt_template, history_count, "
-			 "rag_table, rag_similarity, rag_topn "
-			 "FROM pg_predict_config WHERE scope = 'table' AND relid = %u",
-			 relid);
-
-	ret = SPI_execute(query, true, 1);
-	if (ret == SPI_OK_SELECT && SPI_processed > 0)
-	{
-		found = true;
-	}
-	else
+	if (OidIsValid(relid))
 	{
 		snprintf(query, sizeof(query),
 				 "SELECT api_url, api_key, model_name, temperature, max_tokens, "
 				 "system_prompt, prompt_template, history_count, "
 				 "rag_table, rag_similarity, rag_topn "
-				 "FROM pg_predict_config WHERE scope = 'system' LIMIT 1");
+				 "FROM jolix_predict_config WHERE scope = 'table' AND relid = %u",
+				 relid);
+
+		ret = SPI_execute(query, true, 1);
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			found = true;
+	}
+
+	if (!found)
+	{
+		snprintf(query, sizeof(query),
+				 "SELECT api_url, api_key, model_name, temperature, max_tokens, "
+				 "system_prompt, prompt_template, history_count, "
+				 "rag_table, rag_similarity, rag_topn "
+				 "FROM jolix_predict_config WHERE scope = 'system' LIMIT 1");
 
 		ret = SPI_execute(query, true, 1);
 		if (ret == SPI_OK_SELECT && SPI_processed > 0)
@@ -481,10 +483,10 @@ read_llm_config(Oid relid, LLMConfig *config)
 		config->model = isnull ? NULL : spi_pstrdup(TextDatumGetCString(val));
 
 		val = SPI_getbinval(tuple, tupdesc, 4, &isnull);
-		config->temperature = isnull ? pg_predict_temperature : DatumGetFloat8(val);
+		config->temperature = isnull ? jolix_predict_temperature : DatumGetFloat8(val);
 
 		val = SPI_getbinval(tuple, tupdesc, 5, &isnull);
-		config->max_tokens = isnull ? pg_predict_max_tokens : DatumGetInt32(val);
+		config->max_tokens = isnull ? jolix_predict_max_tokens : DatumGetInt32(val);
 
 		val = SPI_getbinval(tuple, tupdesc, 6, &isnull);
 		config->system_prompt = isnull ? NULL : spi_pstrdup(TextDatumGetCString(val));
@@ -674,13 +676,13 @@ llm_infer(PG_FUNCTION_ARGS)
 
 	user_input = text_to_cstring(user_input_text);
 
-	fill_config_defaults(&config);
+	read_llm_config(InvalidOid, &config);
 
 	if (strlen(config.api_url) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_predict.api_url is not configured"),
-				 errhint("Set pg_predict.api_url or use set_predict_config() to configure the API endpoint.")));
+				 errmsg("jolix_predict.api_url is not configured"),
+				 errhint("Set jolix_predict.api_url or use set_predict_config() to configure the API endpoint.")));
 
 	json_body = build_chat_request(config.model, system_prompt,
 								   history_count, history_roles, history_contents,
@@ -1177,13 +1179,13 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 	system_prompt = text_to_cstring(system_prompt_text);
 	user_input = text_to_cstring(user_input_text);
 
-	fill_config_defaults(&config);
+	read_llm_config(InvalidOid, &config);
 
 	if (strlen(config.api_url) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_predict.api_url is not configured"),
-				 errhint("Set pg_predict.api_url or use set_predict_config() to configure the API endpoint.")));
+				 errmsg("jolix_predict.api_url is not configured"),
+				 errhint("Set jolix_predict.api_url or use set_predict_config() to configure the API endpoint.")));
 
 	if (!OidIsValid(rag_table))
 		ereport(ERROR,

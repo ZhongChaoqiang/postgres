@@ -1,5 +1,0 @@
-# pg_predict extension
-comment = 'LLM inference functions for PostgreSQL'
-default_version = '1.0'
-module_pathname = '$libdir/pg_predict'
-relocatable = true

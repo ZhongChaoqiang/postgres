@@ -1,0 +1,6 @@
+# jolix_embedding extension
+comment = 'Sentence Transformers embedding functions for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/jolix_embedding'
+schema = public
+relocatable = false

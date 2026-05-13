@@ -84,15 +84,15 @@ ALWAYS_SUBDIRS += bool_plperl hstore_plperl jsonb_plperl
 endif
 
 ifeq ($(with_python),yes)
-SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython pg_embedding_st
+SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython jolix_embedding
 else
-ALWAYS_SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython pg_embedding_st
+ALWAYS_SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython jolix_embedding
 endif
 
 ifeq ($(with_libcurl),yes)
-SUBDIRS += pg_predict
+SUBDIRS += jolix_predict
 else
-ALWAYS_SUBDIRS += pg_predict
+ALWAYS_SUBDIRS += jolix_predict
 endif
 
 # Missing:

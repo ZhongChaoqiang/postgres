@@ -1,11 +1,11 @@
-# contrib/pg_embedding_st/Makefile
+# contrib/jolix_embedding/Makefile
 
-MODULE_big = pg_embedding_st
-OBJS = pg_embedding_st.o
+MODULE_big = jolix_embedding
+OBJS = jolix_embedding.o
 
-EXTENSION = pg_embedding_st
-DATA = pg_embedding_st--1.0.sql
-PGFILEDESC = "pg_embedding_st - Sentence Transformers embedding functions"
+EXTENSION = jolix_embedding
+DATA = jolix_embedding--1.0.sql
+PGFILEDESC = "jolix_embedding - Sentence Transformers embedding functions"
 
 PYTHON_CONFIG = python3-config
 PYTHON_INCLUDES = $(shell $(PYTHON_CONFIG) --includes)
@@ -18,7 +18,7 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = contrib/pg_embedding_st
+subdir = contrib/jolix_embedding
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

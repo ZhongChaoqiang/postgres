@@ -289,6 +289,7 @@ static void setup_privileges(FILE *cmdfd);
 static void set_info_version(void);
 static void setup_schema(FILE *cmdfd);
 static void load_plpgsql(FILE *cmdfd);
+static void load_jolix_extensions(FILE *cmdfd);
 static void vacuum_db(FILE *cmdfd);
 static void make_template0(FILE *cmdfd);
 static void make_postgres(FILE *cmdfd);
@@ -1994,6 +1995,14 @@ load_plpgsql(FILE *cmdfd)
 	PG_CMD_PUTS("CREATE EXTENSION plpgsql;\n\n");
 }
 
+static void
+load_jolix_extensions(FILE *cmdfd)
+{
+	PG_CMD_PUTS("CREATE EXTENSION IF NOT EXISTS vector SCHEMA public;\n\n");
+	PG_CMD_PUTS("CREATE EXTENSION IF NOT EXISTS jolix_predict;\n\n");
+	PG_CMD_PUTS("CREATE EXTENSION IF NOT EXISTS jolix_embedding;\n\n");
+}
+
 /*
  * clean everything up in template1
  */
@@ -3140,6 +3149,8 @@ initialize_data_directory(void)
 	setup_schema(cmdfd);
 
 	load_plpgsql(cmdfd);
+
+	load_jolix_extensions(cmdfd);
 
 	vacuum_db(cmdfd);
 

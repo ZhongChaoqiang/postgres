@@ -1,0 +1,6 @@
+# jolix_predict extension
+comment = 'LLM inference functions for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/jolix_predict'
+schema = public
+relocatable = false

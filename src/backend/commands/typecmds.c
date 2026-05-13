@@ -1036,6 +1036,20 @@ DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 						 parser_errposition(pstate, constr->location)));
 				break;
 
+			case CONSTR_PREDICT:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("specifying PREDICT not supported for domains"),
+						 parser_errposition(pstate, constr->location)));
+				break;
+
+			case CONSTR_EMBEDDING:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("specifying EMBEDDING not supported for domains"),
+						 parser_errposition(pstate, constr->location)));
+				break;
+
 			case CONSTR_ATTR_ENFORCED:
 			case CONSTR_ATTR_NOT_ENFORCED:
 				ereport(ERROR,

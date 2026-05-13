@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * pg_embedding_st.c
+ * jolix_embedding.c
  *    Sentence Transformers embedding functions for PostgreSQL
  *
  * This module provides built-in embedding functions using sentence-transformers
@@ -10,7 +10,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *    contrib/pg_embedding_st/pg_embedding_st.c
+ *    contrib/jolix_embedding/jolix_embedding.c
  *
  *-------------------------------------------------------------------------
  */
@@ -43,8 +43,8 @@ PG_MODULE_MAGIC;
 static bool python_initialized = false;
 static PyObject *model_cache_dict = NULL;
 
-static char *pg_embedding_st_model_name = NULL;
-static char *pg_embedding_st_model_path = NULL;
+static char *jolix_embedding_model_name = NULL;
+static char *jolix_embedding_model_path = NULL;
 
 static Oid vector_type_oid = InvalidOid;
 
@@ -139,7 +139,7 @@ load_model(const char *model_name)
 	PyObject *cached_model = NULL;
 	const char *model_path;
 
-	model_path = pg_embedding_st_model_path ? pg_embedding_st_model_path : DEFAULT_MODEL_PATH;
+	model_path = jolix_embedding_model_path ? jolix_embedding_model_path : DEFAULT_MODEL_PATH;
 
 	cache_key = PyUnicode_FromString(model_name);
 	if (!cache_key)
@@ -285,7 +285,7 @@ sentence_transformers_embedding(PG_FUNCTION_ARGS)
 
 	init_python();
 
-	model_name = pg_embedding_st_model_name ? pg_embedding_st_model_name : DEFAULT_MODEL_NAME;
+	model_name = jolix_embedding_model_name ? jolix_embedding_model_name : DEFAULT_MODEL_NAME;
 	model = load_model(model_name);
 
 	result = PyObject_CallMethod(model, "encode", "(s)", input_str);
@@ -326,7 +326,7 @@ sentence_transformers_embedding_text(PG_FUNCTION_ARGS)
 
 	init_python();
 
-	model_name = pg_embedding_st_model_name ? pg_embedding_st_model_name : DEFAULT_MODEL_NAME;
+	model_name = jolix_embedding_model_name ? jolix_embedding_model_name : DEFAULT_MODEL_NAME;
 	model = load_model(model_name);
 
 	result = PyObject_CallMethod(model, "encode", "(s)", input_str);
@@ -379,7 +379,7 @@ sentence_transformers_embedding_with_model(PG_FUNCTION_ARGS)
 	input_str = text_to_cstring(input_text);
 
 	if (PG_ARGISNULL(1))
-		model_name = pstrdup(pg_embedding_st_model_name ? pg_embedding_st_model_name : DEFAULT_MODEL_NAME);
+		model_name = pstrdup(jolix_embedding_model_name ? jolix_embedding_model_name : DEFAULT_MODEL_NAME);
 	else
 	{
 		model_name_text = PG_GETARG_TEXT_P(1);
@@ -422,7 +422,7 @@ st_embedding_list_models(PG_FUNCTION_ARGS)
 	bool nulls[1] = {false};
 	const char *model_path;
 
-	model_path = pg_embedding_st_model_path ? pg_embedding_st_model_path : DEFAULT_MODEL_PATH;
+	model_path = jolix_embedding_model_path ? jolix_embedding_model_path : DEFAULT_MODEL_PATH;
 
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
@@ -455,10 +455,10 @@ st_embedding_list_models(PG_FUNCTION_ARGS)
 void
 _PG_init(void)
 {
-	DefineCustomStringVariable("pg_embedding_st.model_name",
+	DefineCustomStringVariable("jolix_embedding.model_name",
 							   "Default model name for sentence-transformers",
 							   NULL,
-							   &pg_embedding_st_model_name,
+							   &jolix_embedding_model_name,
 							   DEFAULT_MODEL_NAME,
 							   PGC_USERSET,
 							   0,
@@ -466,10 +466,10 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
-	DefineCustomStringVariable("pg_embedding_st.model_path",
+	DefineCustomStringVariable("jolix_embedding.model_path",
 							   "Path to store downloaded models",
 							   NULL,
-							   &pg_embedding_st_model_path,
+							   &jolix_embedding_model_path,
 							   DEFAULT_MODEL_PATH,
 							   PGC_SIGHUP,
 							   0,

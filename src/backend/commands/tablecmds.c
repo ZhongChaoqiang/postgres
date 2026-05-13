@@ -14285,7 +14285,7 @@ createEmbeddingTrigger(Oid relOid, AttrNumber attnum, const char *colname)
 	char		trigname[NAMEDATALEN];
 
 	/* Generate a unique trigger name */
-	snprintf(trigname, NAMEDATALEN, "pg_embedding_%s_%u", colname, relOid);
+	snprintf(trigname, NAMEDATALEN, "jolix_predict_%s_%u", colname, relOid);
 
 	/* Create trigger node */
 	trigger = makeNode(CreateTrigStmt);
