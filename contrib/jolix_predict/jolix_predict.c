@@ -59,6 +59,9 @@ static char *jolix_predict_model = NULL;
 static double jolix_predict_temperature = 0.7;
 static int jolix_predict_max_tokens = 1024;
 static int jolix_predict_timeout = 60;
+static char *jolix_predict_current_table = NULL;
+
+#define MAX_HISTORY_CONTENT_LEN 4096
 
 typedef struct LLMHttpResponse
 {
@@ -97,6 +100,9 @@ static char *build_chat_request(const char *model, const char *system_prompt,
 static char *parse_chat_response(const char *json_response);
 static bool read_llm_config(Oid relid, LLMConfig *config);
 static void fill_config_defaults(LLMConfig *config);
+static void record_predict_history_to_table(const char *table_name, const char *role, const char *content);
+static int read_predict_history_from_table(const char *table_name, int count,
+										   char ***out_roles, char ***out_contents);
 static char *get_predict_column_name(Oid relid);
 static char *spi_pstrdup(const char *str);
 static char *format_row_as_text(HeapTupleData *tmptup, TupleDesc tupdesc,
@@ -123,9 +129,12 @@ spi_pstrdup(const char *str)
 }
 
 PG_FUNCTION_INFO_V1(llm_infer);
+PG_FUNCTION_INFO_V1(llm_infer_with_history);
 PG_FUNCTION_INFO_V1(llm_predict_ext);
 PG_FUNCTION_INFO_V1(llm_rag_infer);
 PG_FUNCTION_INFO_V1(llm_rag_predict_ext);
+PG_FUNCTION_INFO_V1(record_predict_history);
+PG_FUNCTION_INFO_V1(clear_predict_history);
 
 void		_PG_init(void);
 
@@ -154,7 +163,7 @@ _PG_init(void)
 							   "Default LLM model name",
 							   NULL,
 							   &jolix_predict_model,
-							   "gpt-3.5-turbo",
+							   "",
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
@@ -185,6 +194,15 @@ _PG_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+
+	DefineCustomStringVariable("jolix_predict.current_table",
+							   "Current table name for PREDICT column (set automatically by trigger)",
+							   NULL,
+							   &jolix_predict_current_table,
+							   "",
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
 }
 
 static size_t
@@ -244,14 +262,29 @@ llm_http_post(const char *url, const char *api_key, const char *json_body)
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, llm_http_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) jolix_predict_timeout);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long) Min(jolix_predict_timeout, 30));
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
 	res = curl_easy_perform(curl);
 
 	if (res != CURLE_OK)
 	{
-		char	   *err_msg = psprintf("LLM API request failed: %s", curl_easy_strerror(res));
+		long		connect_time = 0;
+		long		total_time = 0;
+		char	   *effective_url = NULL;
+
+		curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect_time);
+		curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_time);
+		curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+
+		char	   *err_msg = psprintf("LLM API request failed: %s (url=%s, connect_time=%.2fs, total_time=%.2fs, timeout=%ds)",
+									   curl_easy_strerror(res),
+									   effective_url ? effective_url : url,
+									   (double) connect_time,
+									   (double) total_time,
+									   jolix_predict_timeout);
 
 		curl_slist_free_all(headers);
 		curl_easy_cleanup(curl);
@@ -405,12 +438,36 @@ parse_chat_response(const char *json_response)
 static void
 fill_config_defaults(LLMConfig *config)
 {
-	if (config->api_url == NULL)
-		config->api_url = jolix_predict_api_url ? pstrdup(jolix_predict_api_url) : pstrdup("");
-	if (config->api_key == NULL)
-		config->api_key = jolix_predict_api_key ? pstrdup(jolix_predict_api_key) : pstrdup("");
-	if (config->model == NULL)
-		config->model = jolix_predict_model ? pstrdup(jolix_predict_model) : pstrdup("gpt-3.5-turbo");
+	if (jolix_predict_api_url && strlen(jolix_predict_api_url) > 0)
+	{
+		if (config->api_url)
+			pfree(config->api_url);
+		config->api_url = pstrdup(jolix_predict_api_url);
+	}
+	else if (config->api_url == NULL)
+		config->api_url = pstrdup("");
+
+	if (jolix_predict_api_key && strlen(jolix_predict_api_key) > 0)
+	{
+		if (config->api_key)
+			pfree(config->api_key);
+		config->api_key = pstrdup(jolix_predict_api_key);
+	}
+	else if (config->api_key == NULL)
+		config->api_key = pstrdup("");
+
+	if (jolix_predict_model && strlen(jolix_predict_model) > 0)
+	{
+		if (config->model)
+			pfree(config->model);
+		config->model = pstrdup(jolix_predict_model);
+	}
+	else if (config->model == NULL)
+		config->model = pstrdup("");
+
+	config->temperature = jolix_predict_temperature;
+	config->max_tokens = jolix_predict_max_tokens;
+
 	if (config->system_prompt == NULL)
 		config->system_prompt = pstrdup("");
 	if (config->prompt_template == NULL)
@@ -649,8 +706,10 @@ Datum
 llm_infer(PG_FUNCTION_ARGS)
 {
 	text	   *system_prompt_text = PG_GETARG_TEXT_PP(0);
-	int			history_count = 0;
 	text	   *user_input_text;
+	int			history_count = 0;
+	char	   *table_name = NULL;
+	bool		table_name_allocated = false;
 	char	   *system_prompt;
 	char	   *user_input;
 	char	   *json_body;
@@ -659,22 +718,45 @@ llm_infer(PG_FUNCTION_ARGS)
 	LLMConfig	config;
 	char	  **history_roles = NULL;
 	char	  **history_contents = NULL;
+	int			actual_history_count = 0;
 
 	memset(&config, 0, sizeof(LLMConfig));
 
 	system_prompt = text_to_cstring(system_prompt_text);
 
-	if (PG_NARGS() >= 3)
-	{
-		history_count = PG_GETARG_INT32(1);
-		user_input_text = PG_GETARG_TEXT_PP(2);
-	}
-	else
+	if (PG_NARGS() == 2)
 	{
 		user_input_text = PG_GETARG_TEXT_PP(1);
 	}
+	else if (PG_NARGS() == 3)
+	{
+		user_input_text = PG_GETARG_TEXT_PP(1);
+		history_count = PG_GETARG_INT32(2);
+	}
+	else if (PG_NARGS() == 4)
+	{
+		user_input_text = PG_GETARG_TEXT_PP(1);
+		history_count = PG_GETARG_INT32(2);
+		table_name = text_to_cstring(PG_GETARG_TEXT_PP(3));
+		table_name_allocated = true;
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("llm_infer requires 2, 3, or 4 arguments")));
+	}
 
 	user_input = text_to_cstring(user_input_text);
+
+	if (table_name == NULL || strlen(table_name) == 0)
+	{
+		if (jolix_predict_current_table != NULL && strlen(jolix_predict_current_table) > 0)
+		{
+			table_name = pstrdup(jolix_predict_current_table);
+			table_name_allocated = true;
+		}
+	}
 
 	read_llm_config(InvalidOid, &config);
 
@@ -684,19 +766,68 @@ llm_infer(PG_FUNCTION_ARGS)
 				 errmsg("jolix_predict.api_url is not configured"),
 				 errhint("Set jolix_predict.api_url or use set_predict_config() to configure the API endpoint.")));
 
-	json_body = build_chat_request(config.model, system_prompt,
-								   history_count, history_roles, history_contents,
-								   user_input,
-								   config.temperature, config.max_tokens);
+	if (history_count > 0 && table_name != NULL && strlen(table_name) > 0)
+	{
+		MemoryContext oldcontext;
+		MemoryContext histcontext;
 
-	response = llm_http_post(config.api_url, config.api_key, json_body);
+		histcontext = AllocSetContextCreate(CurrentMemoryContext,
+											"llm_infer_history",
+											ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(histcontext);
 
-	content = parse_chat_response(response);
+		actual_history_count = read_predict_history_from_table(
+			table_name, history_count,
+			&history_roles, &history_contents);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	PG_TRY();
+	{
+		json_body = build_chat_request(config.model, system_prompt,
+									   actual_history_count, history_roles, history_contents,
+									   user_input,
+									   config.temperature, config.max_tokens);
+
+		response = llm_http_post(config.api_url, config.api_key, json_body);
+
+		content = parse_chat_response(response);
+	}
+	PG_CATCH();
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("llm_infer: LLM inference failed, returning NULL")));
+		content = NULL;
+	}
+	PG_END_TRY();
+
+	if (content != NULL)
+	{
+		MemoryContext oldcontext;
+		MemoryContext reccontext;
+
+		reccontext = AllocSetContextCreate(CurrentMemoryContext,
+										   "llm_infer_record_history",
+										   ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(reccontext);
+
+		if (table_name != NULL && strlen(table_name) > 0)
+		{
+			record_predict_history_to_table(table_name, "user", user_input);
+			record_predict_history_to_table(table_name, "assistant", content);
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(reccontext);
+	}
+
+	if (table_name_allocated && table_name != NULL)
+		pfree(table_name);
 
 	if (content == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("failed to parse LLM API response")));
+		PG_RETURN_NULL();
 
 	PG_RETURN_TEXT_P(cstring_to_text(content));
 }
@@ -962,6 +1093,290 @@ llm_predict_ext(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(content));
 }
 
+static int
+read_predict_history_from_table(const char *table_name, int count,
+								char ***out_roles, char ***out_contents)
+{
+	int			ret;
+	int			history_count = 0;
+	Oid			argtypes[2] = {TEXTOID, INT4OID};
+	Datum		values[2];
+	char		nulls[2] = {' ', ' '};
+
+	*out_roles = NULL;
+	*out_contents = NULL;
+
+	if (count <= 0 || table_name == NULL || strlen(table_name) == 0)
+		return 0;
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+		return 0;
+
+	values[0] = CStringGetTextDatum(table_name);
+	values[1] = Int32GetDatum(count * 2);
+
+	ret = SPI_execute_with_args(
+		"SELECT role, content FROM jolix_predict_history "
+		"WHERE table_name = $1 ORDER BY created_at DESC LIMIT $2",
+		2, argtypes, values, nulls, true, count * 2);
+
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		int			nrows = Min(SPI_processed, (uint64) (count * 2));
+		int			i;
+
+		*out_roles = (char **) palloc(sizeof(char *) * nrows);
+		*out_contents = (char **) palloc(sizeof(char *) * nrows);
+
+		for (i = nrows - 1; i >= 0; i--)
+		{
+			HeapTuple	tuple = SPI_tuptable->vals[i];
+			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+			bool		isnull;
+			char	   *role_str;
+			char	   *content_str;
+
+			role_str = SPI_getvalue(tuple, tupdesc, 1);
+			if (role_str == NULL)
+				continue;
+
+			SPI_getbinval(tuple, tupdesc, 2, &isnull);
+			if (isnull)
+			{
+				pfree(role_str);
+				continue;
+			}
+			content_str = SPI_getvalue(tuple, tupdesc, 2);
+			if (content_str == NULL)
+			{
+				pfree(role_str);
+				continue;
+			}
+
+			(*out_roles)[history_count] = pstrdup(role_str);
+			(*out_contents)[history_count] = pstrdup(content_str);
+			history_count++;
+
+			pfree(role_str);
+			pfree(content_str);
+		}
+	}
+
+	SPI_finish();
+	return history_count;
+}
+
+static void
+record_predict_history_to_table(const char *table_name, const char *role, const char *content)
+{
+	int			ret;
+	Oid			argtypes[3] = {TEXTOID, TEXTOID, TEXTOID};
+	Datum		values[3];
+	char		nulls[3] = {' ', ' ', ' '};
+	char	   *truncated_content;
+
+	if (table_name == NULL || strlen(table_name) == 0)
+		return;
+	if (role == NULL || content == NULL)
+		return;
+
+	if (strlen(content) > MAX_HISTORY_CONTENT_LEN)
+	{
+		truncated_content = pnstrdup(content, MAX_HISTORY_CONTENT_LEN);
+	}
+	else
+	{
+		truncated_content = pstrdup(content);
+	}
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+	{
+		pfree(truncated_content);
+		return;
+	}
+
+	values[0] = CStringGetTextDatum(table_name);
+	values[1] = CStringGetTextDatum(role);
+	values[2] = CStringGetTextDatum(truncated_content);
+
+	pfree(truncated_content);
+
+	SPI_execute_with_args(
+		"INSERT INTO jolix_predict_history (table_name, role, content) VALUES ($1, $2, $3)",
+		3, argtypes, values, nulls, false, 0);
+
+	SPI_finish();
+}
+
+Datum
+llm_infer_with_history(PG_FUNCTION_ARGS)
+{
+	text	   *system_prompt_text = PG_GETARG_TEXT_PP(0);
+	text	   *user_input_text = PG_GETARG_TEXT_PP(1);
+	int			history_count = PG_GETARG_INT32(2);
+	text	   *table_name_text = PG_GETARG_TEXT_PP(3);
+	char	   *system_prompt;
+	char	   *user_input;
+	char	   *table_name;
+	char	   *json_body;
+	char	   *response;
+	char	   *content;
+	LLMConfig	config;
+	char	  **history_roles = NULL;
+	char	  **history_contents = NULL;
+	int			actual_history_count = 0;
+
+	memset(&config, 0, sizeof(LLMConfig));
+
+	system_prompt = text_to_cstring(system_prompt_text);
+	user_input = text_to_cstring(user_input_text);
+	table_name = text_to_cstring(table_name_text);
+
+	read_llm_config(InvalidOid, &config);
+
+	if (strlen(config.api_url) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("jolix_predict.api_url is not configured"),
+				 errhint("Set jolix_predict.api_url or use set_predict_config() to configure the API endpoint.")));
+
+	if (history_count > 0)
+	{
+		MemoryContext oldcontext;
+		MemoryContext histcontext;
+
+		histcontext = AllocSetContextCreate(CurrentMemoryContext,
+											"llm_infer_history",
+											ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(histcontext);
+
+		actual_history_count = read_predict_history_from_table(
+			table_name, history_count,
+			&history_roles, &history_contents);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	PG_TRY();
+	{
+		json_body = build_chat_request(config.model, system_prompt,
+									   actual_history_count, history_roles, history_contents,
+									   user_input,
+									   config.temperature, config.max_tokens);
+
+		response = llm_http_post(config.api_url, config.api_key, json_body);
+
+		content = parse_chat_response(response);
+	}
+	PG_CATCH();
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("llm_infer_with_history: LLM inference failed, returning NULL")));
+		content = NULL;
+	}
+	PG_END_TRY();
+
+	if (content != NULL)
+	{
+		MemoryContext oldcontext;
+		MemoryContext reccontext;
+
+		reccontext = AllocSetContextCreate(CurrentMemoryContext,
+										   "llm_infer_record_history",
+										   ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(reccontext);
+
+		record_predict_history_to_table(table_name, "user", user_input);
+		record_predict_history_to_table(table_name, "assistant", content);
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(reccontext);
+	}
+
+	if (content == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TEXT_P(cstring_to_text(content));
+}
+
+Datum
+record_predict_history(PG_FUNCTION_ARGS)
+{
+	text	   *p_table_name = PG_GETARG_TEXT_PP(0);
+	text	   *p_role = PG_GETARG_TEXT_PP(1);
+	text	   *p_content = PG_GETARG_TEXT_PP(2);
+	char	   *role;
+	int			ret;
+	Oid			argtypes[3] = {TEXTOID, TEXTOID, TEXTOID};
+	Datum		values[3];
+	char		nulls[3] = {' ', ' ', ' '};
+
+	role = text_to_cstring(p_role);
+
+	if (strcmp(role, "user") != 0 && strcmp(role, "assistant") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("role must be 'user' or 'assistant', got '%s'", role)));
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("could not connect to SPI")));
+
+	values[0] = PointerGetDatum(p_table_name);
+	values[1] = PointerGetDatum(p_role);
+	values[2] = PointerGetDatum(p_content);
+
+	SPI_execute_with_args(
+		"INSERT INTO jolix_predict_history (table_name, role, content) VALUES ($1, $2, $3)",
+		3, argtypes, values, nulls, false, 0);
+
+	SPI_finish();
+
+	PG_RETURN_VOID();
+}
+
+Datum
+clear_predict_history(PG_FUNCTION_ARGS)
+{
+	text	   *p_table_name = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
+	int			ret;
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("could not connect to SPI")));
+
+	if (p_table_name != NULL)
+	{
+		Oid			argtypes[1] = {TEXTOID};
+		Datum		values[1];
+		char		nulls[1] = {' '};
+
+		values[0] = PointerGetDatum(p_table_name);
+
+		SPI_execute_with_args(
+			"DELETE FROM jolix_predict_history WHERE table_name = $1",
+			1, argtypes, values, nulls, false, 0);
+	}
+	else
+	{
+		SPI_execute("DELETE FROM jolix_predict_history", false, 0);
+	}
+
+	{
+		int			deleted = SPI_processed;
+
+		SPI_finish();
+		PG_RETURN_INT32(deleted);
+	}
+}
+
 static char *
 find_embedding_column_name(Oid relid)
 {
@@ -1000,11 +1415,28 @@ compute_embedding_for_text(Oid rag_table, const char *embedding_colname,
 
 	func_oid = get_embedding_function_oid(rag_table, embedding_colname);
 	if (!OidIsValid(func_oid))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("no embedding function configured for column \"%s\" of table \"%s\"",
-						embedding_colname, get_rel_name(rag_table)),
-				 errhint("Use EMBEDDING AS (function_name(column)) STORED syntax or set the embedding_function table option.")));
+	{
+		FuncCandidateList clist;
+		List	   *namelist;
+		int			fgc_flags;
+
+		namelist = list_make1(makeString("simple_embedding"));
+		clist = FuncnameGetCandidates(namelist, 1, NIL, false, false, false, true, &fgc_flags);
+		list_free(namelist);
+
+		if (clist != NULL)
+		{
+			func_oid = clist->oid;
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("no embedding function configured for column \"%s\" of table \"%s\"",
+							embedding_colname, get_rel_name(rag_table)),
+					 errhint("Use EMBEDDING AS (function_name(column)) STORED syntax or set the embedding_function table option.")));
+		}
+	}
 
 	fmgr_info(func_oid, &flinfo);
 
@@ -1156,19 +1588,22 @@ Datum
 llm_rag_infer(PG_FUNCTION_ARGS)
 {
 	text	   *system_prompt_text = PG_GETARG_TEXT_PP(0);
-	int			history_count = PG_GETARG_INT32(1);
-	text	   *user_input_text = PG_GETARG_TEXT_PP(2);
-	Oid			rag_table = PG_GETARG_OID(3);
-	float8		rag_similarity = PG_GETARG_FLOAT8(4);
-	int			rag_topn = PG_GETARG_INT32(5);
+	text	   *user_input_text = PG_GETARG_TEXT_PP(1);
+	int			history_count = PG_GETARG_INT32(2);
 	char	   *system_prompt;
 	char	   *user_input;
+	char	   *table_name = NULL;
+	bool		table_name_allocated = false;
+	Oid			rag_table = InvalidOid;
 	char	   *rag_context;
 	char	   *combined_user_input;
 	char	   *json_body;
 	char	   *response;
 	char	   *content;
 	LLMConfig	config;
+	double		rag_similarity;
+	int			rag_topn;
+	int			actual_history_count = 0;
 	char	  **history_roles = NULL;
 	char	  **history_contents = NULL;
 	MemoryContext oldcontext;
@@ -1179,6 +1614,27 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 	system_prompt = text_to_cstring(system_prompt_text);
 	user_input = text_to_cstring(user_input_text);
 
+	if (jolix_predict_current_table != NULL && strlen(jolix_predict_current_table) > 0)
+	{
+		table_name = pstrdup(jolix_predict_current_table);
+		table_name_allocated = true;
+	}
+
+	if (table_name != NULL)
+	{
+		Oid			relid;
+
+		relid = RelnameGetRelid(table_name);
+		if (OidIsValid(relid))
+			rag_table = relid;
+	}
+
+	if (!OidIsValid(rag_table))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no RAG table available for llm_rag_infer"),
+				 errhint("llm_rag_infer must be called from a PREDICT column on a table with an EMBEDDING column, or set jolix_predict.current_table.")));
+
 	read_llm_config(InvalidOid, &config);
 
 	if (strlen(config.api_url) == 0)
@@ -1187,10 +1643,8 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 				 errmsg("jolix_predict.api_url is not configured"),
 				 errhint("Set jolix_predict.api_url or use set_predict_config() to configure the API endpoint.")));
 
-	if (!OidIsValid(rag_table))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid RAG table OID")));
+	rag_similarity = config.rag_similarity;
+	rag_topn = config.rag_topn;
 
 	if (rag_topn <= 0)
 		rag_topn = 5;
@@ -1211,83 +1665,26 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 
 	combined_user_input = psprintf("%s\n\n%s", rag_context, user_input);
 
-	if (history_count > 0)
+	if (history_count > 0 && table_name != NULL && strlen(table_name) > 0)
 	{
-		int			ret;
-		char	   *relname;
-		char		query[2048];
+		MemoryContext histcontext;
 
-		ret = SPI_connect();
-		if (ret == SPI_OK_CONNECT)
-		{
-			relname = get_rel_name(rag_table);
-			snprintf(query, sizeof(query),
-					 "SELECT * FROM %s ORDER BY ctid DESC LIMIT %d",
-					 quote_identifier(relname),
-					 history_count);
+		histcontext = AllocSetContextCreate(CurrentMemoryContext,
+											"llm_rag_infer_history",
+											ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(histcontext);
 
-			ret = SPI_execute(query, true, history_count);
-			history_count = 0;
+		actual_history_count = read_predict_history_from_table(
+			table_name, history_count,
+			&history_roles, &history_contents);
 
-			if (ret == SPI_OK_SELECT && SPI_processed > 0)
-			{
-				int			nrows = Min(SPI_processed, (uint64) PG_GETARG_INT32(1));
-				int			i;
-
-				history_roles = (char **) palloc(sizeof(char *) * nrows * 2);
-				history_contents = (char **) palloc(sizeof(char *) * nrows * 2);
-
-				for (i = nrows - 1; i >= 0; i--)
-				{
-					HeapTuple	hist_tuple = SPI_tuptable->vals[i];
-					TupleDesc	hist_tupdesc = SPI_tuptable->tupdesc;
-					StringInfo	hist_user_buf;
-					int			j;
-					bool		first = true;
-
-					hist_user_buf = makeStringInfo();
-					appendStringInfoString(hist_user_buf, "Input data:\n");
-
-					for (j = 1; j <= hist_tupdesc->natts; j++)
-					{
-						Form_pg_attribute hattr = TupleDescAttr(hist_tupdesc, j - 1);
-						char	   *hcol_value;
-
-						if (hattr->attisdropped)
-							continue;
-						if (hattr->attembedding)
-							continue;
-						if (namestrcmp(&hattr->attname, "_embedding") == 0 ||
-							namestrcmp(&hattr->attname, "_predict") == 0 ||
-							namestrcmp(&hattr->attname, "_actual") == 0)
-							continue;
-
-						hcol_value = SPI_getvalue(hist_tuple, hist_tupdesc, j);
-						if (hcol_value == NULL)
-							continue;
-
-						if (!first)
-							appendStringInfoCharMacro(hist_user_buf, '\n');
-						appendStringInfo(hist_user_buf, "%s: %s",
-										 NameStr(hattr->attname), hcol_value);
-						first = false;
-					}
-
-					history_roles[history_count] = pstrdup("user");
-					history_contents[history_count] = hist_user_buf->data;
-					history_count++;
-				}
-			}
-
-			SPI_finish();
-			pfree(relname);
-		}
+		MemoryContextSwitchTo(oldcontext);
 	}
 
 	PG_TRY();
 	{
 		json_body = build_chat_request(config.model, system_prompt,
-									   history_count, history_roles, history_contents,
+									   actual_history_count, history_roles, history_contents,
 									   combined_user_input,
 									   config.temperature, config.max_tokens);
 
@@ -1311,6 +1708,28 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 
 	MemoryContextDelete(ragcontext);
+
+	if (content != NULL)
+	{
+		MemoryContext reccontext;
+
+		reccontext = AllocSetContextCreate(CurrentMemoryContext,
+										   "llm_rag_infer_record_history",
+										   ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(reccontext);
+
+		if (table_name != NULL && strlen(table_name) > 0)
+		{
+			record_predict_history_to_table(table_name, "user", user_input);
+			record_predict_history_to_table(table_name, "assistant", content);
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(reccontext);
+	}
+
+	if (table_name_allocated && table_name != NULL)
+		pfree(table_name);
 
 	if (content == NULL)
 		PG_RETURN_NULL();

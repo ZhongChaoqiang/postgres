@@ -383,6 +383,7 @@ typedef struct StdRdOptions
 	int			lists;		/* number of lists for ivfflat vector index, -1 = not set */
 	int			m;			/* max connections per layer for hnsw vector index, -1 = not set */
 	int			ef_construction; /* size of dynamic candidate list for hnsw, -1 = not set */
+	int			embedding_function_offset;	/* offset of embedding function name string */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10

@@ -499,30 +499,65 @@ predict_trigger(PG_FUNCTION_ARGS)
 				TupleTableSlot *slot;
 				Datum		val;
 				bool		val_isnull;
+				char	   *saved_current_table = NULL;
+				const char *relname_str;
 
-				expr = (Expr *) build_column_default(rel, attnum);
-				if (expr != NULL)
+				relname_str = RelationGetRelationName(rel);
 				{
-					estate = CreateExecutorState();
-					exprstate = ExecPrepareExpr(expr, estate);
-
-					slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
-					ExecStoreHeapTuple(newtuple, slot, false);
-
-					econtext = GetPerTupleExprContext(estate);
-					econtext->ecxt_scantuple = slot;
-
-					val = ExecEvalExpr(exprstate, econtext, &val_isnull);
-
-					if (!val_isnull)
-					{
-						predict_datum = datumCopy(val, attr->attbyval, attr->attlen);
-						predict_isnull = false;
-					}
-
-					ExecDropSingleTupleTableSlot(slot);
-					FreeExecutorState(estate);
+					const char *cur_val = GetConfigOption("jolix_predict.current_table", true, false);
+					if (cur_val && strlen(cur_val) > 0)
+						saved_current_table = pstrdup(cur_val);
 				}
+				SetConfigOption("jolix_predict.current_table", relname_str,
+								PGC_USERSET, PGC_S_SESSION);
+
+				PG_TRY();
+				{
+					expr = (Expr *) build_column_default(rel, attnum);
+					if (expr != NULL)
+					{
+						estate = CreateExecutorState();
+						exprstate = ExecPrepareExpr(expr, estate);
+
+						slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+						ExecStoreHeapTuple(newtuple, slot, false);
+
+						econtext = GetPerTupleExprContext(estate);
+						econtext->ecxt_scantuple = slot;
+
+						val = ExecEvalExpr(exprstate, econtext, &val_isnull);
+
+						if (!val_isnull)
+						{
+							predict_datum = datumCopy(val, attr->attbyval, attr->attlen);
+							predict_isnull = false;
+						}
+
+						ExecDropSingleTupleTableSlot(slot);
+						FreeExecutorState(estate);
+					}
+				}
+				PG_CATCH();
+				{
+					if (saved_current_table)
+						SetConfigOption("jolix_predict.current_table", saved_current_table,
+										PGC_USERSET, PGC_S_SESSION);
+					else
+						SetConfigOption("jolix_predict.current_table", "",
+										PGC_USERSET, PGC_S_SESSION);
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+
+				if (saved_current_table)
+				{
+					SetConfigOption("jolix_predict.current_table", saved_current_table,
+									PGC_USERSET, PGC_S_SESSION);
+					pfree(saved_current_table);
+				}
+				else
+					SetConfigOption("jolix_predict.current_table", "",
+									PGC_USERSET, PGC_S_SESSION);
 			}
 		}
 

@@ -23,6 +23,19 @@ CREATE TABLE jolix_predict_config (
 REVOKE ALL ON jolix_predict_config FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON jolix_predict_config TO CURRENT_USER;
 
+CREATE TABLE jolix_predict_history (
+    id serial PRIMARY KEY,
+    table_name text NOT NULL,
+    role text NOT NULL CHECK (role IN ('user', 'assistant')),
+    content text NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+CREATE INDEX idx_predict_history_table_time ON jolix_predict_history(table_name, created_at DESC);
+
+REVOKE ALL ON jolix_predict_history FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON jolix_predict_history TO CURRENT_USER;
+
 CREATE FUNCTION set_predict_config(
     p_api_url text,
     p_api_key text DEFAULT '',
@@ -199,14 +212,26 @@ COMMENT ON FUNCTION llm_infer(text, text) IS
 
 CREATE FUNCTION llm_infer(
     system_prompt text,
-    history_count integer,
-    user_input text
+    user_input text,
+    history_count integer
 ) RETURNS text
 AS 'jolix_predict', 'llm_infer'
 LANGUAGE C VOLATILE;
 
-COMMENT ON FUNCTION llm_infer(text, integer, text) IS
-'Call LLM API with system prompt, history count, and user input. Uses GUC parameters (jolix_predict.*) for API configuration.';
+COMMENT ON FUNCTION llm_infer(text, text, integer) IS
+'Call LLM API with system prompt, user input, and history count. Uses GUC parameters (jolix_predict.*) for API configuration. History is read from jolix_predict_history table using the default table name.';
+
+CREATE FUNCTION llm_infer(
+    system_prompt text,
+    user_input text,
+    history_count integer,
+    table_name text
+) RETURNS text
+AS 'jolix_predict', 'llm_infer_with_history'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION llm_infer(text, text, integer, text) IS
+'Call LLM API with system prompt, user input, history count, and table name. Reads the last N Q&A pairs from jolix_predict_history where table_name matches, and includes them as conversation history. Uses GUC parameters or jolix_predict_config for API configuration. Automatically records the new Q&A pair to history after inference. Content is truncated to 4096 characters for safety.';
 
 CREATE FUNCTION llm_predict_ext(
     input_row record
@@ -219,17 +244,14 @@ COMMENT ON FUNCTION llm_predict_ext(record) IS
 
 CREATE FUNCTION llm_rag_infer(
     system_prompt text,
-    history_count integer,
     user_input text,
-    rag_table regclass,
-    rag_similarity float8,
-    rag_topn integer
+    history_count integer DEFAULT 0
 ) RETURNS text
 AS 'jolix_predict', 'llm_rag_infer'
 LANGUAGE C VOLATILE;
 
-COMMENT ON FUNCTION llm_rag_infer(text, integer, text, regclass, float8, integer) IS
-'RAG-enhanced LLM inference function. Performs vector similarity search on the specified RAG table (which must have an EMBEDDING column), retrieves relevant context, and combines it with the system prompt and user input before calling the LLM. Parameters: system_prompt - system instruction for the LLM; history_count - number of recent conversation turns to include; user_input - the latest user query; rag_table - table with EMBEDDING column for RAG retrieval; rag_similarity - minimum cosine similarity threshold (0.0-2.0, lower means more similar); rag_topn - maximum number of RAG results to retrieve.';
+COMMENT ON FUNCTION llm_rag_infer(text, text, integer) IS
+'RAG-enhanced LLM inference function. Automatically uses the current table (from jolix_predict.current_table) as the RAG table. The current table must have an EMBEDDING column. Performs vector similarity search, retrieves relevant context, and combines it with the system prompt and user input before calling the LLM. RAG parameters (rag_similarity, rag_topn) are read from jolix_predict_config via set_predict_config(). Parameters: system_prompt - system instruction for the LLM; user_input - the latest user query; history_count - number of recent conversation turns to include (default 0).';
 
 CREATE FUNCTION llm_rag_predict_ext(
     input_row record
@@ -239,3 +261,23 @@ LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION llm_rag_predict_ext(record) IS
 'RAG-enhanced default predict function for PREDICT columns (extension implementation). Reads configuration from jolix_predict_config table including rag_table, rag_similarity, rag_topn. Performs vector similarity search on the RAG table to retrieve relevant context, then combines it with the row data and system prompt before calling the LLM. If rag_table is not configured, falls back to llm_predict behavior.';
+
+CREATE FUNCTION record_predict_history(
+    p_table_name text,
+    p_role text,
+    p_content text
+) RETURNS void
+AS 'jolix_predict', 'record_predict_history'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION record_predict_history(text, text, text) IS
+'Record a Q&A history entry to jolix_predict_history table. Parameters: p_table_name - table name to associate the history with; p_role - must be ''user'' or ''assistant''; p_content - the question or answer text. Used by llm_infer with history and llm_predict_ext to automatically record conversation history.';
+
+CREATE FUNCTION clear_predict_history(
+    p_table_name text DEFAULT NULL
+) RETURNS integer
+AS 'jolix_predict', 'clear_predict_history'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION clear_predict_history(text) IS
+'Clear Q&A history from jolix_predict_history table. If p_table_name is provided, only clears history for that table. If NULL, clears all history. Returns the number of rows deleted.';

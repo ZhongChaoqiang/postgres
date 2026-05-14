@@ -651,6 +651,15 @@ static relopt_enum enumRelOpts[] =
 
 static relopt_string stringRelOpts[] =
 {
+	{
+		{
+			"embedding_function",
+			"Embedding function name for EMBEDDING columns",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		0, false, NULL, NULL, NULL
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -2023,7 +2032,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"m", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, ef_construction)}
+		offsetof(StdRdOptions, ef_construction)},
+		{"embedding_function", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, embedding_function_offset)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

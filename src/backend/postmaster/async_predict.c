@@ -410,6 +410,9 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 	SPI_connect();
 
+	SetConfigOption("jolix_predict.current_table", relname,
+					PGC_USERSET, PGC_S_SESSION);
+
 	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 
 	oldcontext = MemoryContextSwitchTo(cbcontext);
@@ -579,6 +582,9 @@ async_predict_process_table(Relation rel, AttrNumber predict_attnum,
 
 	MemoryContextSwitchTo(oldcontext);
 	MemoryContextDelete(cbcontext);
+
+	SetConfigOption("jolix_predict.current_table", "",
+					PGC_USERSET, PGC_S_SESSION);
 
 	SPI_finish();
 
