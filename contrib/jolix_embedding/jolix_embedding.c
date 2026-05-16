@@ -18,18 +18,12 @@
 #include "postgres.h"
 
 #include "fmgr.h"
-#include "funcapi.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "miscadmin.h"
-#include "lib/stringinfo.h"
-#include "catalog/pg_type.h"
 #include "catalog/namespace.h"
-#include "utils/lsyscache.h"
 
 #include <sys/stat.h>
-#include <dirent.h>
-#include <unistd.h>
 #include <Python.h>
 
 #include "vector.h"
@@ -48,6 +42,16 @@ static char *jolix_embedding_model_path = NULL;
 
 static Oid vector_type_oid = InvalidOid;
 
+PG_FUNCTION_INFO_V1(sentence_transformers_embedding);
+PG_FUNCTION_INFO_V1(sentence_transformers_embedding_with_model);
+PG_FUNCTION_INFO_V1(st_text_placeholder_distance);
+
+static void init_python(void);
+static void ensure_model_dir(const char *model_path);
+static PyObject *load_model(const char *model_name);
+static Vector *embedding_to_vector(PyObject *embedding_list);
+static void ensure_vector_type(void);
+
 Datum
 st_text_placeholder_distance(PG_FUNCTION_ARGS)
 {
@@ -57,18 +61,6 @@ st_text_placeholder_distance(PG_FUNCTION_ARGS)
 			 errhint("This operator is reserved for EMBEDDING columns. Use: ORDER BY embedding_column <=> 'search text'. The query rewriter will automatically convert it to a vector distance query.")));
 	PG_RETURN_NULL();
 }
-
-static void init_python(void);
-static void ensure_model_dir(const char *model_path);
-static PyObject *load_model(const char *model_name);
-static Vector *embedding_to_vector(PyObject *embedding_list);
-static void ensure_vector_type(void);
-
-PG_FUNCTION_INFO_V1(sentence_transformers_embedding);
-PG_FUNCTION_INFO_V1(sentence_transformers_embedding_text);
-PG_FUNCTION_INFO_V1(sentence_transformers_embedding_with_model);
-PG_FUNCTION_INFO_V1(st_embedding_list_models);
-PG_FUNCTION_INFO_V1(st_text_placeholder_distance);
 
 static void
 ensure_vector_type(void)
@@ -307,59 +299,6 @@ sentence_transformers_embedding(PG_FUNCTION_ARGS)
 }
 
 Datum
-sentence_transformers_embedding_text(PG_FUNCTION_ARGS)
-{
-	text *input_text;
-	char *input_str;
-	const char *model_name;
-	PyObject *model = NULL;
-	PyObject *result = NULL;
-	Vector *vector_result;
-	StringInfoData buf;
-	int i;
-
-	if (PG_ARGISNULL(0))
-		PG_RETURN_NULL();
-
-	input_text = PG_GETARG_TEXT_P(0);
-	input_str = text_to_cstring(input_text);
-
-	init_python();
-
-	model_name = jolix_embedding_model_name ? jolix_embedding_model_name : DEFAULT_MODEL_NAME;
-	model = load_model(model_name);
-
-	result = PyObject_CallMethod(model, "encode", "(s)", input_str);
-
-	pfree(input_str);
-
-	if (!result)
-	{
-		PyErr_Print();
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("could not generate embedding")));
-	}
-
-	vector_result = embedding_to_vector(result);
-	Py_DECREF(result);
-
-	initStringInfo(&buf);
-	appendStringInfoChar(&buf, '[');
-	for (i = 0; i < vector_result->dim; i++)
-	{
-		if (i > 0)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%.8f", vector_result->x[i]);
-	}
-	appendStringInfoChar(&buf, ']');
-
-	pfree(vector_result);
-
-	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
-}
-
-Datum
 sentence_transformers_embedding_with_model(PG_FUNCTION_ARGS)
 {
 	text *input_text;
@@ -406,50 +345,6 @@ sentence_transformers_embedding_with_model(PG_FUNCTION_ARGS)
 	Py_DECREF(result);
 
 	PG_RETURN_POINTER(vector_result);
-}
-
-Datum
-st_embedding_list_models(PG_FUNCTION_ARGS)
-{
-	DIR *dir;
-	struct dirent *entry;
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc tupdesc;
-	Tuplestorestate *tupstore;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
-	Datum values[1];
-	bool nulls[1] = {false};
-	const char *model_path;
-
-	model_path = jolix_embedding_model_path ? jolix_embedding_model_path : DEFAULT_MODEL_PATH;
-
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-
-	MemoryContextSwitchTo(oldcontext);
-
-	dir = opendir(model_path);
-	if (dir)
-	{
-		while ((entry = readdir(dir)) != NULL)
-		{
-			if (entry->d_name[0] == '.')
-				continue;
-
-			values[0] = CStringGetTextDatum(entry->d_name);
-			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-		}
-		closedir(dir);
-	}
-
-	PG_RETURN_NULL();
 }
 
 void

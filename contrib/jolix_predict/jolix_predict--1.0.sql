@@ -36,7 +36,7 @@ CREATE INDEX idx_predict_history_table_time ON jolix_predict_history(table_name,
 REVOKE ALL ON jolix_predict_history FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON jolix_predict_history TO CURRENT_USER;
 
-CREATE FUNCTION set_predict_config(
+CREATE FUNCTION set_llm_config(
     p_api_url text,
     p_api_key text DEFAULT '',
     p_model_name text DEFAULT 'gpt-3.5-turbo',
@@ -69,10 +69,10 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION set_predict_config(text, text, text, float8, integer, text, integer, regclass, float8, integer) IS
+COMMENT ON FUNCTION set_llm_config(text, text, text, float8, integer, text, integer, regclass, float8, integer) IS
 'Set system-level LLM configuration. This applies to all tables unless overridden. p_rag_table specifies the table with EMBEDDING column for RAG retrieval.';
 
-CREATE FUNCTION set_predict_config(
+CREATE FUNCTION set_llm_config(
     p_table_name regclass,
     p_api_url text,
     p_api_key text DEFAULT '',
@@ -108,10 +108,10 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION set_predict_config(regclass, text, text, text, float8, integer, text, text, integer, regclass, float8, integer) IS
+COMMENT ON FUNCTION set_llm_config(regclass, text, text, text, float8, integer, text, text, integer, regclass, float8, integer) IS
 'Set table-level LLM configuration. This overrides system-level config for a specific table. p_prompt_template uses {{column_name}} syntax to reference row columns. p_rag_table specifies the table with EMBEDDING column for RAG retrieval.';
 
-CREATE FUNCTION get_predict_config(
+CREATE FUNCTION get_llm_config(
     OUT api_url text,
     OUT api_key text,
     OUT model_name text,
@@ -147,10 +147,10 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION get_predict_config(OUT text, OUT text, OUT text, OUT float8, OUT integer, OUT text, OUT integer, OUT oid, OUT float8, OUT integer) IS
+COMMENT ON FUNCTION get_llm_config(OUT text, OUT text, OUT text, OUT float8, OUT integer, OUT text, OUT integer, OUT oid, OUT float8, OUT integer) IS
 'Get system-level LLM configuration including RAG settings.';
 
-CREATE FUNCTION get_predict_config(
+CREATE FUNCTION get_llm_config(
     p_table_name regclass,
     OUT api_url text,
     OUT api_key text,
@@ -197,7 +197,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION get_predict_config(regclass, OUT text, OUT text, OUT text, OUT float8, OUT integer, OUT text, OUT text, OUT integer, OUT oid, OUT float8, OUT integer) IS
+COMMENT ON FUNCTION get_llm_config(regclass, OUT text, OUT text, OUT text, OUT float8, OUT integer, OUT text, OUT text, OUT integer, OUT oid, OUT float8, OUT integer) IS
 'Get LLM configuration for a specific table including RAG settings. Falls back to system-level config if no table-level config exists.';
 
 CREATE FUNCTION llm_infer(
@@ -233,15 +233,6 @@ LANGUAGE C VOLATILE;
 COMMENT ON FUNCTION llm_infer(text, text, integer, text) IS
 'Call LLM API with system prompt, user input, history count, and table name. Reads the last N Q&A pairs from jolix_predict_history where table_name matches, and includes them as conversation history. Uses GUC parameters or jolix_predict_config for API configuration. Automatically records the new Q&A pair to history after inference. Content is truncated to 4096 characters for safety.';
 
-CREATE FUNCTION llm_predict_ext(
-    input_row record
-) RETURNS text
-AS 'jolix_predict', 'llm_predict_ext'
-LANGUAGE C VOLATILE;
-
-COMMENT ON FUNCTION llm_predict_ext(record) IS
-'Default LLM predict function for PREDICT columns (extension implementation). Sends the entire row data to the LLM. Reads configuration from jolix_predict_config table. Supports prompt_template with {{column_name}} syntax. If no template is set, the entire row is formatted as key-value pairs. Supports system prompt and history conversations.';
-
 CREATE FUNCTION llm_rag_infer(
     system_prompt text,
     user_input text,
@@ -251,16 +242,7 @@ AS 'jolix_predict', 'llm_rag_infer'
 LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION llm_rag_infer(text, text, integer) IS
-'RAG-enhanced LLM inference function. Automatically uses the current table (from jolix_predict.current_table) as the RAG table. The current table must have an EMBEDDING column. Performs vector similarity search, retrieves relevant context, and combines it with the system prompt and user input before calling the LLM. RAG parameters (rag_similarity, rag_topn) are read from jolix_predict_config via set_predict_config(). Parameters: system_prompt - system instruction for the LLM; user_input - the latest user query; history_count - number of recent conversation turns to include (default 0).';
-
-CREATE FUNCTION llm_rag_predict_ext(
-    input_row record
-) RETURNS text
-AS 'jolix_predict', 'llm_rag_predict_ext'
-LANGUAGE C VOLATILE;
-
-COMMENT ON FUNCTION llm_rag_predict_ext(record) IS
-'RAG-enhanced default predict function for PREDICT columns (extension implementation). Reads configuration from jolix_predict_config table including rag_table, rag_similarity, rag_topn. Performs vector similarity search on the RAG table to retrieve relevant context, then combines it with the row data and system prompt before calling the LLM. If rag_table is not configured, falls back to llm_predict behavior.';
+'RAG-enhanced LLM inference function. Automatically uses the current table (from jolix_predict.current_table) as the RAG table. The current table must have an EMBEDDING column. Performs vector similarity search, retrieves relevant context, and combines it with the system prompt and user input before calling the LLM. RAG parameters (rag_similarity, rag_topn) are read from jolix_predict_config via set_llm_config(). Parameters: system_prompt - system instruction for the LLM; user_input - the latest user query; history_count - number of recent conversation turns to include (default 0).';
 
 CREATE FUNCTION record_predict_history(
     p_table_name text,

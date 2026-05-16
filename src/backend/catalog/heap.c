@@ -3202,12 +3202,19 @@ check_nested_generated_walker(Node *node, void *context)
 		attnum = var->varattno;
 
 		if (attnum > 0 && get_attgenerated(relid, attnum))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("cannot use generated column \"%s\" in column generation expression",
-							get_attname(relid, attnum, false)),
-					 errdetail("A generated column cannot reference another generated column."),
-					 parser_errposition(pstate, var->location)));
+		{
+			Relation	rel = relation_open(relid, AccessShareLock);
+			Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+
+			if (!attr->attembedding)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("cannot use generated column \"%s\" in column generation expression",
+								get_attname(relid, attnum, false)),
+						 errdetail("A generated column cannot reference another generated column."),
+						 parser_errposition(pstate, var->location)));
+			relation_close(rel, AccessShareLock);
+		}
 		/* A whole-row Var is necessarily self-referential, so forbid it */
 		if (attnum == 0)
 			ereport(ERROR,

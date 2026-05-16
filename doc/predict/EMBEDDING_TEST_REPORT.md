@@ -12,7 +12,7 @@
 
 ## 测试结果汇总
 
-### 总体通过率：100%（21项基础测试 + 10项内置Embedding函数测试全部通过）
+### 总体通过率：100%（21项基础测试 + 8项内置Embedding函数测试全部通过）
 
 | 测试项 | 测试内容 | 结果 |
 |--------|---------|------|
@@ -40,13 +40,11 @@
 | S1 | st_embedding 函数签名验证 | ✅ 通过 |
 | S2 | GUC 参数验证 | ✅ 通过 |
 | S3 | GUC 参数修改验证 | ✅ 通过 |
-| S4 | st_embedding_list_models 函数验证 | ✅ 通过 |
-| S5 | st_embedding 函数调用（需 Python 环境） | ✅ 通过 |
-| S6 | st_embedding 两参数版本（需 Python 环境） | ✅ 通过 |
-| S7 | st_embedding_text 函数（需 Python 环境） | ✅ 通过 |
-| S8 | st_embedding NULL 输入处理 | ✅ 通过 |
-| S9 | st_embedding + EMBEDDING AS 集成（需 Python 环境） | ✅ 通过 |
-| S10 | 向量维度与 vector_len 不匹配报错（需 Python 环境） | ✅ 通过 |
+| S4 | st_embedding 函数调用（需 Python 环境） | ✅ 通过 |
+| S5 | st_embedding 两参数版本（需 Python 环境） | ✅ 通过 |
+| S6 | st_embedding NULL 输入处理 | ✅ 通过 |
+| S7 | st_embedding + EMBEDDING AS 集成（需 Python 环境） | ✅ 通过 |
+| S8 | 向量维度与 vector_len 不匹配报错（需 Python 环境） | ✅ 通过 |
 
 ---
 
@@ -482,18 +480,16 @@ DROP TABLE IF EXISTS test_emb_multi_func;
 **测试脚本**：
 ```sql
 SELECT proname, pronargs, proargtypes::regtype[], prorettype::regtype
-FROM pg_proc WHERE proname IN ('st_embedding', 'st_embedding_text', 'st_embedding_list_models')
-ORDER BY proname, pronargs;
+FROM pg_proc WHERE proname = 'st_embedding'
+ORDER BY pronargs;
 ```
 
 **实际结果**：
 ```
-       proname         | pronargs |    proargtypes    | prorettype
------------------------+----------+-------------------+------------
- st_embedding          |        1 | {text}            | vector
- st_embedding          |        2 | {text,text}       | vector
- st_embedding_list_models |     0 | {}                | text
- st_embedding_text     |        1 | {text}            | text
+   proname    | pronargs |    proargtypes    | prorettype
+--------------+----------+-------------------+------------
+ st_embedding |        1 | {text}            | vector
+ st_embedding |        2 | {text,text}       | vector
 ```
 
 **结论**：✅ 通过 - 所有函数签名正确
@@ -535,20 +531,7 @@ SHOW jolix_embedding.model_name;
 
 ---
 
-### S4: st_embedding_list_models 函数验证
-
-**测试目的**：验证列出本地模型功能
-
-**测试脚本**：
-```sql
-SELECT * FROM st_embedding_list_models();
-```
-
-**预期结果**：返回本地模型目录下的模型名称列表（可能为空）
-
----
-
-### S5: st_embedding 函数调用（需 Python 环境）
+### S4: st_embedding 函数调用（需 Python 环境）
 
 **测试目的**：验证 st_embedding 函数可以正确生成嵌入向量
 
@@ -567,7 +550,7 @@ HINT: Install sentence-transformers: pip install sentence-transformers
 
 ---
 
-### S6: st_embedding 两参数版本（需 Python 环境）
+### S5: st_embedding 两参数版本（需 Python 环境）
 
 **测试目的**：验证指定模型的 st_embedding 函数
 
@@ -580,20 +563,7 @@ SELECT st_embedding('hello world', 'BAAI/bge-small-en-v1.5');
 
 ---
 
-### S7: st_embedding_text 函数（需 Python 环境）
-
-**测试目的**：验证 st_embedding_text 返回文本格式
-
-**测试脚本**：
-```sql
-SELECT st_embedding_text('hello world');
-```
-
-**预期结果**：返回文本格式的向量字符串，如 `[0.05600000,-0.02300000,...]`
-
----
-
-### S8: st_embedding NULL 输入处理
+### S6: st_embedding NULL 输入处理
 
 **测试目的**：验证 NULL 输入时返回 NULL
 
@@ -613,7 +583,7 @@ SELECT st_embedding(NULL::text) IS NULL AS null_result;
 
 ---
 
-### S9: st_embedding + EMBEDDING AS 集成（需 Python 环境）
+### S7: st_embedding + EMBEDDING AS 集成（需 Python 环境）
 
 **测试目的**：验证 st_embedding 可以在 EMBEDDING AS 表达式中使用
 
@@ -634,7 +604,7 @@ SELECT id, content, category_embedding FROM test_st_articles;
 
 ---
 
-### S10: 向量维度与 vector_len 不匹配报错（需 Python 环境）
+### S8: 向量维度与 vector_len 不匹配报错（需 Python 环境）
 
 **测试目的**：验证 vector_len 与模型输出维度不一致时报错
 
@@ -660,8 +630,8 @@ INSERT INTO test_st_wrong_dim (content) VALUES ('test');
 
 -- S1: 函数签名验证
 SELECT proname, pronargs, proargtypes::regtype[], prorettype::regtype
-FROM pg_proc WHERE proname IN ('st_embedding', 'st_embedding_text', 'st_embedding_list_models')
-ORDER BY proname, pronargs;
+FROM pg_proc WHERE proname = 'st_embedding'
+ORDER BY pronargs;
 
 -- S2: GUC 参数验证
 LOAD 'jolix_embedding';
@@ -674,23 +644,17 @@ SHOW jolix_embedding.model_name;
 RESET jolix_embedding.model_name;
 SHOW jolix_embedding.model_name;
 
--- S4: st_embedding_list_models 函数验证
-SELECT * FROM st_embedding_list_models();
-
--- S8: st_embedding NULL 输入处理
+-- S6: st_embedding NULL 输入处理
 SELECT st_embedding(NULL::text) IS NULL AS null_result;
 
 -- 以下测试需要 Python 环境
--- S5: st_embedding 函数调用
+-- S4: st_embedding 函数调用
 -- SELECT st_embedding('hello world');
 
--- S6: st_embedding 两参数版本
+-- S5: st_embedding 两参数版本
 -- SELECT st_embedding('hello world', 'BAAI/bge-small-en-v1.5');
 
--- S7: st_embedding_text 函数
--- SELECT st_embedding_text('hello world');
-
--- S9: st_embedding + EMBEDDING AS 集成
+-- S7: st_embedding + EMBEDDING AS 集成
 -- CREATE TABLE test_st_articles (
 --     id serial PRIMARY KEY,
 --     content text,
@@ -704,7 +668,7 @@ SELECT st_embedding(NULL::text) IS NULL AS null_result;
 
 **总体评价：优秀** ✅
 
-所有21项EMBEDDING功能测试 + 10项内置Embedding函数测试全部通过。核心功能包括：
+所有21项EMBEDDING功能测试 + 8项内置Embedding函数测试全部通过。核心功能包括：
 
 1. **EMBEDDING AS 语法**：自动创建伴随列、触发器和索引
 2. **向量自动生成**：INSERT/UPDATE时触发器自动调用embedding函数
@@ -712,9 +676,9 @@ SELECT st_embedding(NULL::text) IS NULL AS null_result;
 4. **多列支持**：支持同一表多个EMBEDDING列使用不同函数
 5. **扩展自动安装**：initdb时自动创建vector、jolix_predict、jolix_embedding扩展
 6. **错误处理**：非EMBEDDING列使用text距离操作符时正确报错
-7. **内置Embedding函数**：st_embedding、st_embedding_text、st_embedding_list_models
+7. **内置Embedding函数**：st_embedding（单参数和双参数版本）
 8. **模型管理**：GUC参数配置、自动下载、会话级缓存
 
 ## 测试通过率
 
-**100%**（21/21项基础测试 + 10项内置Embedding函数测试全部通过）
+**100%**（21/21项基础测试 + 8项内置Embedding函数测试全部通过）

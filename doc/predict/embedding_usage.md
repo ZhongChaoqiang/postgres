@@ -304,34 +304,6 @@ SELECT st_embedding('hello world', 'sentence-transformers/all-mpnet-base-v2');
 
 **注意**：不同模型输出不同维度的向量，`vector_len` 必须与模型输出维度一致。
 
-### st_embedding_text 函数
-
-使用默认模型生成文本嵌入向量，返回 `text` 类型（JSON 数组格式）。
-
-```sql
--- 语法
-st_embedding_text(input_text text) RETURNS text
-
--- 示例
-SELECT st_embedding_text('hello world');
--- 返回: "[0.05600000,-0.02300000,0.08900000,...]"
-```
-
-**用途**：当需要将嵌入向量作为文本存储或传输时使用。通常建议使用 `st_embedding` 直接返回 vector 类型。
-
-### st_embedding_list_models 函数
-
-列出本地已下载的模型。
-
-```sql
--- 语法
-st_embedding_list_models() RETURNS SETOF text
-
--- 示例
-SELECT * FROM st_embedding_list_models();
--- 返回本地模型目录下的所有模型名称
-```
-
 ### 常用模型参考
 
 | 模型名称 | 维度 | 大小 | 说明 |
@@ -370,8 +342,6 @@ SELECT * FROM st_embedding_list_models();
 |------|---------|---------|------|
 | `st_embedding(text)` | vector | GUC 默认模型 | EMBEDDING 列表达式（推荐） |
 | `st_embedding(text, text)` | vector | 参数指定模型 | 多模型场景 |
-| `st_embedding_text(text)` | text | GUC 默认模型 | 文本格式输出 |
-| `st_embedding_list_models()` | SETOF text | - | 列出本地模型 |
 
 ## 示例场景
 
@@ -504,9 +474,6 @@ export HTTPS_PROXY=http://your-proxy:port
 -- 检查模型路径
 LOAD 'jolix_embedding';
 SHOW jolix_embedding.model_path;
-
--- 列出已下载的模型
-SELECT * FROM st_embedding_list_models();
 ```
 
 ---
