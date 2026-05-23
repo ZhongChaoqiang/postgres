@@ -192,8 +192,8 @@ SELECT extname, extnamespace::regnamespace, extversion FROM pg_extension ORDER B
 LOAD 'jolix_predict';
 LOAD 'jolix_embedding';
 
-SHOW jolix_predict.api_url;
-SHOW jolix_predict.model;
+SHOW jolix_predict.llm_api_url;
+SHOW jolix_predict.llm_model;
 SHOW jolix_embedding.model_name;
 
 -- ============================================

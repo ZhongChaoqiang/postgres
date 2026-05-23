@@ -345,7 +345,7 @@ SELECT extname, extnamespace::regnamespace, extversion FROM pg_extension ORDER B
 ```sql
 LOAD 'jolix_predict';
 LOAD 'jolix_embedding';
-SHOW jolix_predict.model;
+SHOW jolix_predict.llm_model;
 SHOW jolix_embedding.model_name;
 ```
 
@@ -456,7 +456,7 @@ SELECT extname, extnamespace::regnamespace, extversion FROM pg_extension ORDER B
 
 LOAD 'jolix_predict';
 LOAD 'jolix_embedding';
-SHOW jolix_predict.model;
+SHOW jolix_predict.llm_model;
 SHOW jolix_embedding.model_name;
 
 SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) AS default_expr

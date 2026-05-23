@@ -25,6 +25,7 @@ SELECT set_llm_config(
     p_temperature := 0.7,
     p_max_tokens := 1024,
     p_system_prompt := 'You are a helpful assistant.',
+    p_prompt_template := '',
     p_history_count := 0,
     p_rag_similarity := 0.5,
     p_rag_topn := 5
@@ -59,10 +60,10 @@ SELECT * FROM get_llm_config('my_table');
 也可以通过 GUC 参数配置（优先级低于配置表）：
 
 ```sql
-SET jolix_predict.api_url = 'https://api.openai.com/v1/chat/completions';
-SET jolix_predict.api_key = 'sk-xxx';
-SET jolix_predict.model = 'gpt-4';
-SET jolix_predict.timeout = 300;
+SET jolix_predict.llm_api_url = 'https://api.openai.com/v1/chat/completions';
+SET jolix_predict.llm_api_key = 'sk-xxx';
+SET jolix_predict.llm_model = 'gpt-4';
+SET jolix_predict.llm_timeout = 300;
 ```
 
 ## 3. 函数说明
@@ -72,7 +73,7 @@ SET jolix_predict.timeout = 300;
 调用 LLM API 进行推理，支持三种重载形式：
 
 ```sql
--- 基本调用（无历史）
+-- 基本调用（自动记录历史到默认表）
 SELECT llm_infer(
     'You are a helpful assistant.',   -- system_prompt
     'What is PostgreSQL?'              -- user_input
@@ -98,15 +99,19 @@ SELECT llm_infer(
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| `system_prompt` | text | 是 | 系统提示词 |
-| `user_input` | text | 是 | 用户输入文本 |
+| `system_prompt` | text | 是 | 系统提示词。传入 NULL 或空字符串时使用 `set_llm_config()` 配置的 `system_prompt` |
+| `user_input` | text | 是 | 用户输入文本。传入 NULL 或空字符串时使用 `set_llm_config()` 配置的 `prompt_template` |
 | `history_count` | integer | 否 | 历史对话轮数（默认0） |
 | `table_name` | text | 否 | 历史记录关联的表名 |
 
 **说明**：
-- 当 `history_count > 0` 时，从 `jolix_predict_history` 表读取最近的 N 轮 Q&A 对话作为上下文
+- 两参数版本会自动将对话记录到 `jolix_predict.llm_history_table` 指定的默认表（默认为 `"default"`）
+- 当 `system_prompt` 为 NULL 或空字符串时，自动使用 `set_llm_config()` 配置的 `system_prompt`
+- 当 `user_input` 为 NULL 或空字符串时，自动使用 `set_llm_config()` 配置的 `prompt_template`
+- 当 `history_count > 0` 时，从 `jolix_llm_history` 表读取最近的 N 轮 Q&A 对话作为上下文
 - 推理完成后自动将 Q&A 记录到历史表
 - 内容超过 4096 字符会自动截断
+- 设置 `jolix_predict.llm_history_table = ''` 可禁用自动记录
 
 ### 3.2 llm_rag_infer 函数
 
@@ -140,8 +145,8 @@ SELECT llm_rag_infer(
 
 | 参数 | 类型 | 必选 | 说明 |
 |------|------|------|------|
-| `system_prompt` | text | 是 | 系统提示词 |
-| `user_input` | text | 是 | 用户输入文本 |
+| `system_prompt` | text | 是 | 系统提示词。传入 NULL 或空字符串时使用 `set_llm_config()` 配置的 `system_prompt` |
+| `user_input` | text | 是 | 用户输入文本。传入 NULL 或空字符串时使用 `set_llm_config()` 配置的 `prompt_template` |
 | `history_count` | integer | 否 | 历史对话轮数（默认0） |
 
 **RAG 配置参数**（通过 `set_llm_config()` 设置）：
@@ -263,12 +268,43 @@ SELECT clear_predict_history('my_table');
 -- 清除所有历史
 SELECT clear_predict_history();
 
+-- 手动清理过期历史记录（根据 history_retention_days 设置）
+SELECT cleanup_predict_history();
+
 -- 查看历史记录
 SELECT table_name, role, content, created_at
-FROM jolix_predict_history
+FROM jolix_llm_history
 WHERE table_name = 'my_table'
 ORDER BY created_at DESC
 LIMIT 10;
+```
+
+### 3.6 历史记录过期清理
+
+历史记录表 `jolix_llm_history` 会随着使用不断增长。为防止表过大，系统提供了自动过期清理功能：
+
+**GUC 参数**：`jolix_predict.history_retention_days`（默认 7 天）
+
+```sql
+LOAD 'jolix_predict';
+
+-- 查看当前保留天数
+SHOW jolix_predict.history_retention_days;
+
+-- 设置保留 30 天
+SET jolix_predict.history_retention_days = 30;
+
+-- 设置永不过期
+SET jolix_predict.history_retention_days = 0;
+```
+
+**自动清理**：每次记录新的历史时，系统会自动检查并清理过期记录（间隔至少 1 小时执行一次，避免频繁清理影响性能）。
+
+**手动清理**：也可以随时手动触发清理：
+
+```sql
+-- 清理过期记录，返回删除的行数
+SELECT cleanup_predict_history();
 ```
 
 ## 4. PREDICT 列使用
@@ -331,7 +367,78 @@ CREATE TABLE knowledge_qa (
 );
 ```
 
-### 4.4 predict_timing 选项
+### 4.4 LLM 文本分类
+
+使用 `llm_infer` 函数实现 LLM 文本分类，自动对列内容进行分类标注。
+
+**配置说明**：使用 `set_llm_config()` 配置 LLM API 参数，配置保存在 `jolix_llm_config` 表中，触发器中执行推理时会自动读取。
+
+```sql
+-- 1. 配置 LLM API
+SELECT set_llm_config(
+    p_api_url := 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
+    p_api_key := '<your-api-key>',
+    p_model_name := '<your-model-name>',
+    p_temperature := 0.3,
+    p_max_tokens := 64
+);
+
+-- 2. 创建表，PREDICT 表达式引用多个列
+CREATE TABLE test_llm_articles (
+    id serial PRIMARY KEY,
+    title text,
+    content text,
+    category text PREDICT AS (llm_infer(
+        'Classify the following text into exactly one category: technology, sports, politics, entertainment. Reply with only the category name, nothing else.',
+        'Classify this text: ' || title || '. ' || content
+    )) STORED
+) WITH (predict_timing=immediate);
+
+-- 3. INSERT 不提供 category - LLM 自动分类
+INSERT INTO test_llm_articles (title, content) VALUES ('AI Revolution', 'AI and machine learning are transforming software development');
+
+-- 4. INSERT 提供 category - 保存为实际值
+INSERT INTO test_llm_articles (title, content, category) VALUES ('Box Office Hit', 'The new movie broke box office records', 'entertainment');
+```
+
+**更多分类场景**：
+
+```sql
+-- 情感分析（引用单列）
+CREATE TABLE reviews (
+    id serial PRIMARY KEY,
+    review_text text,
+    sentiment text PREDICT AS (llm_infer(
+        'Classify the sentiment. Reply with exactly one word: positive, negative, or neutral.',
+        review_text
+    )) STORED
+) WITH (predict_timing=immediate);
+
+-- 优先级分类（引用多列：产品名 + 描述）
+CREATE TABLE support_tickets (
+    id serial PRIMARY KEY,
+    product text,
+    description text,
+    priority text PREDICT AS (llm_infer(
+        'Classify the priority. Reply with exactly one word: critical, high, medium, or low.',
+        'Product: ' || product || '. Issue: ' || description
+    )) STORED
+) WITH (predict_timing=immediate);
+
+-- 垃圾邮件检测（引用多列：主题 + 正文）
+CREATE TABLE emails (
+    id serial PRIMARY KEY,
+    sender text,
+    subject text,
+    body text,
+    is_spam text PREDICT AS (llm_infer(
+        'Determine if this email is spam. Reply with exactly one word: spam or not_spam.',
+        'From: ' || sender || '. Subject: ' || subject || '. Body: ' || body
+    )) STORED
+) WITH (predict_timing=immediate);
+```
+
+### 4.5 predict_timing 选项
 
 | 值 | 说明 |
 |------|------|
@@ -340,7 +447,7 @@ CREATE TABLE knowledge_qa (
 
 ## 5. 配置表结构
 
-### 5.1 jolix_predict_config
+### 5.1 jolix_llm_config
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -359,7 +466,7 @@ CREATE TABLE knowledge_qa (
 | `rag_similarity` | float8 | RAG 相似度阈值 |
 | `rag_topn` | integer | RAG 检索数量 |
 
-### 5.2 jolix_predict_history
+### 5.2 jolix_llm_history
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -380,24 +487,26 @@ CREATE TABLE knowledge_qa (
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `jolix_predict.api_url` | string | API 地址 |
-| `jolix_predict.api_key` | string | API 密钥 |
-| `jolix_predict.model` | string | 模型名称 |
-| `jolix_predict.timeout` | integer | 请求超时（秒） |
+| `jolix_predict.llm_api_url` | string | API 地址 |
+| `jolix_predict.llm_api_key` | string | API 密钥 |
+| `jolix_predict.llm_model` | string | 模型名称 |
+| `jolix_predict.llm_timeout` | integer | 请求超时（秒） |
+| `jolix_predict.llm_history_table` | string | 默认历史记录表名（默认default，空字符串禁用自动记录） |
 | `jolix_predict.current_table` | string | 当前表名（内部使用） |
+| `jolix_predict.history_retention_days` | integer | 历史记录保留天数（默认7，0=永不过期） |
 
 ## 8. 常见问题
 
 ### Q: LLM 推理超时怎么办？
 
 ```sql
-SET jolix_predict.timeout = 300;  -- 设置为 300 秒
+SET jolix_predict.llm_timeout = 300;  -- 设置为 300 秒
 ```
 
 ### Q: 如何查看历史记录？
 
 ```sql
-SELECT * FROM jolix_predict_history WHERE table_name = 'my_table' ORDER BY created_at DESC;
+SELECT * FROM jolix_llm_history WHERE table_name = 'my_table' ORDER BY created_at DESC;
 ```
 
 ### Q: llm_rag_infer 报错 "no RAG table available"？

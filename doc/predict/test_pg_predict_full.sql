@@ -39,7 +39,7 @@ SELECT llm_infer(
 
 -- 5. 查看历史记录
 SELECT table_name, role, substring(content, 1, 60) as content_preview
-FROM jolix_predict_history
+FROM jolix_llm_history
 WHERE table_name = 'test_history'
 ORDER BY created_at;
 

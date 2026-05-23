@@ -37,7 +37,7 @@ SELECT id, content, answer FROM rag_knowledge WHERE content = 'What is PostgreSQ
 
 -- 6. 查看历史记录
 SELECT table_name, role, substring(content, 1, 80) as content_preview
-FROM jolix_predict_history
+FROM jolix_llm_history
 WHERE table_name = 'rag_knowledge'
 ORDER BY created_at;
 

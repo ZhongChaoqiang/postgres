@@ -8,7 +8,7 @@
  * - llm_predict(): Default predict function for PREDICT columns
  * - llm_rag_infer(): RAG-enhanced LLM inference function
  * - llm_rag_predict(): RAG-enhanced predict function for PREDICT columns
- * - Configuration via jolix_predict_config table and GUC parameters
+ * - Configuration via jolix_llm_config table and GUC parameters
  *
  * The llm_predict function sends the entire row data to the LLM,
  * inspired by MindsDB's approach. It supports:
@@ -45,6 +45,7 @@
 #include "catalog/pg_class.h"
 #include "utils/rel.h"
 #include "utils/predict.h"
+#include "utils/timestamp.h"
 
 #include <curl/curl.h>
 #include <string.h>
@@ -53,15 +54,18 @@
 
 PG_MODULE_MAGIC;
 
-static char *jolix_predict_api_url = NULL;
-static char *jolix_predict_api_key = NULL;
-static char *jolix_predict_model = NULL;
+static char *jolix_predict_llm_api_url = NULL;
+static char *jolix_predict_llm_api_key = NULL;
+static char *jolix_predict_llm_model = NULL;
 static double jolix_predict_temperature = 0.7;
 static int jolix_predict_max_tokens = 1024;
-static int jolix_predict_timeout = 60;
+static int jolix_predict_llm_timeout = 60;
 static char *jolix_predict_current_table = NULL;
+static char *jolix_predict_llm_history_table = NULL;
+static int jolix_llm_history_retention_days = 7;
 
 #define MAX_HISTORY_CONTENT_LEN 4096
+#define HISTORY_CLEANUP_INTERVAL 3600
 
 typedef struct LLMHttpResponse
 {
@@ -122,34 +126,37 @@ PG_FUNCTION_INFO_V1(llm_infer_with_history);
 PG_FUNCTION_INFO_V1(llm_rag_infer);
 PG_FUNCTION_INFO_V1(record_predict_history);
 PG_FUNCTION_INFO_V1(clear_predict_history);
+PG_FUNCTION_INFO_V1(cleanup_predict_history);
+
+static void maybe_cleanup_expired_history(void);
 
 void		_PG_init(void);
 
 void
 _PG_init(void)
 {
-	DefineCustomStringVariable("jolix_predict.api_url",
+	DefineCustomStringVariable("jolix_predict.llm_api_url",
 							   "Default LLM API URL",
 							   NULL,
-							   &jolix_predict_api_url,
+							   &jolix_predict_llm_api_url,
 							   "",
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomStringVariable("jolix_predict.api_key",
+	DefineCustomStringVariable("jolix_predict.llm_api_key",
 							   "Default LLM API key",
 							   NULL,
-							   &jolix_predict_api_key,
+							   &jolix_predict_llm_api_key,
 							   "",
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomStringVariable("jolix_predict.model",
+	DefineCustomStringVariable("jolix_predict.llm_model",
 							   "Default LLM model name",
 							   NULL,
-							   &jolix_predict_model,
+							   &jolix_predict_llm_model,
 							   "",
 							   PGC_USERSET,
 							   0,
@@ -173,10 +180,10 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("jolix_predict.timeout",
+	DefineCustomIntVariable("jolix_predict.llm_timeout",
 							"LLM API request timeout in seconds",
 							NULL,
-							&jolix_predict_timeout,
+							&jolix_predict_llm_timeout,
 							60, 1, 600,
 							PGC_USERSET,
 							0,
@@ -190,6 +197,24 @@ _PG_init(void)
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("jolix_predict.llm_history_table",
+							   "Default history table name for llm_infer auto-recording. Empty string disables auto-recording.",
+							   NULL,
+							   &jolix_predict_llm_history_table,
+							   "default",
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("jolix_predict.history_retention_days",
+							"Number of days to retain predict history. 0 means keep forever.",
+							NULL,
+							&jolix_llm_history_retention_days,
+							7, 0, 3650,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
 }
 
 static size_t
@@ -248,8 +273,8 @@ llm_http_post(const char *url, const char *api_key, const char *json_body)
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, llm_http_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) jolix_predict_timeout);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long) Min(jolix_predict_timeout, 30));
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) jolix_predict_llm_timeout);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long) Min(jolix_predict_llm_timeout, 30));
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -271,7 +296,7 @@ llm_http_post(const char *url, const char *api_key, const char *json_body)
 									   effective_url ? effective_url : url,
 									   (double) connect_time,
 									   (double) total_time,
-									   jolix_predict_timeout);
+									   jolix_predict_llm_timeout);
 
 		curl_slist_free_all(headers);
 		curl_easy_cleanup(curl);
@@ -425,29 +450,29 @@ parse_chat_response(const char *json_response)
 static void
 fill_config_defaults(LLMConfig *config)
 {
-	if (jolix_predict_api_url && strlen(jolix_predict_api_url) > 0)
+	if (jolix_predict_llm_api_url && strlen(jolix_predict_llm_api_url) > 0)
 	{
 		if (config->api_url)
 			pfree(config->api_url);
-		config->api_url = pstrdup(jolix_predict_api_url);
+		config->api_url = pstrdup(jolix_predict_llm_api_url);
 	}
 	else if (config->api_url == NULL)
 		config->api_url = pstrdup("");
 
-	if (jolix_predict_api_key && strlen(jolix_predict_api_key) > 0)
+	if (jolix_predict_llm_api_key && strlen(jolix_predict_llm_api_key) > 0)
 	{
 		if (config->api_key)
 			pfree(config->api_key);
-		config->api_key = pstrdup(jolix_predict_api_key);
+		config->api_key = pstrdup(jolix_predict_llm_api_key);
 	}
 	else if (config->api_key == NULL)
 		config->api_key = pstrdup("");
 
-	if (jolix_predict_model && strlen(jolix_predict_model) > 0)
+	if (jolix_predict_llm_model && strlen(jolix_predict_llm_model) > 0)
 	{
 		if (config->model)
 			pfree(config->model);
-		config->model = pstrdup(jolix_predict_model);
+		config->model = pstrdup(jolix_predict_llm_model);
 	}
 	else if (config->model == NULL)
 		config->model = pstrdup("");
@@ -489,7 +514,7 @@ read_llm_config(Oid relid, LLMConfig *config)
 				 "SELECT api_url, api_key, model_name, temperature, max_tokens, "
 				 "system_prompt, prompt_template, history_count, "
 				 "rag_table, rag_similarity, rag_topn "
-				 "FROM jolix_predict_config WHERE scope = 'table' AND relid = %u",
+				 "FROM jolix_llm_config WHERE scope = 'table' AND relid = %u",
 				 relid);
 
 		ret = SPI_execute(query, true, 1);
@@ -503,7 +528,7 @@ read_llm_config(Oid relid, LLMConfig *config)
 				 "SELECT api_url, api_key, model_name, temperature, max_tokens, "
 				 "system_prompt, prompt_template, history_count, "
 				 "rag_table, rag_similarity, rag_topn "
-				 "FROM jolix_predict_config WHERE scope = 'system' LIMIT 1");
+				 "FROM jolix_llm_config WHERE scope = 'system' LIMIT 1");
 
 		ret = SPI_execute(query, true, 1);
 		if (ret == SPI_OK_SELECT && SPI_processed > 0)
@@ -561,7 +586,7 @@ read_llm_config(Oid relid, LLMConfig *config)
 Datum
 llm_infer(PG_FUNCTION_ARGS)
 {
-	text	   *system_prompt_text = PG_GETARG_TEXT_PP(0);
+	text	   *system_prompt_text;
 	text	   *user_input_text;
 	int			history_count = 0;
 	char	   *table_name = NULL;
@@ -578,23 +603,52 @@ llm_infer(PG_FUNCTION_ARGS)
 
 	memset(&config, 0, sizeof(LLMConfig));
 
-	system_prompt = text_to_cstring(system_prompt_text);
+	if (PG_ARGISNULL(0))
+		system_prompt = NULL;
+	else
+	{
+		system_prompt_text = PG_GETARG_TEXT_PP(0);
+		system_prompt = text_to_cstring(system_prompt_text);
+	}
 
 	if (PG_NARGS() == 2)
 	{
-		user_input_text = PG_GETARG_TEXT_PP(1);
+		if (PG_ARGISNULL(1))
+			user_input = NULL;
+		else
+		{
+			user_input_text = PG_GETARG_TEXT_PP(1);
+			user_input = text_to_cstring(user_input_text);
+		}
 	}
 	else if (PG_NARGS() == 3)
 	{
-		user_input_text = PG_GETARG_TEXT_PP(1);
+		if (PG_ARGISNULL(1))
+			user_input = NULL;
+		else
+		{
+			user_input_text = PG_GETARG_TEXT_PP(1);
+			user_input = text_to_cstring(user_input_text);
+		}
 		history_count = PG_GETARG_INT32(2);
 	}
 	else if (PG_NARGS() == 4)
 	{
-		user_input_text = PG_GETARG_TEXT_PP(1);
+		if (PG_ARGISNULL(1))
+			user_input = NULL;
+		else
+		{
+			user_input_text = PG_GETARG_TEXT_PP(1);
+			user_input = text_to_cstring(user_input_text);
+		}
 		history_count = PG_GETARG_INT32(2);
-		table_name = text_to_cstring(PG_GETARG_TEXT_PP(3));
-		table_name_allocated = true;
+		if (PG_ARGISNULL(3))
+			table_name = NULL;
+		else
+		{
+			table_name = text_to_cstring(PG_GETARG_TEXT_PP(3));
+			table_name_allocated = true;
+		}
 	}
 	else
 	{
@@ -603,8 +657,6 @@ llm_infer(PG_FUNCTION_ARGS)
 				 errmsg("llm_infer requires 2, 3, or 4 arguments")));
 	}
 
-	user_input = text_to_cstring(user_input_text);
-
 	if (table_name == NULL || strlen(table_name) == 0)
 	{
 		if (jolix_predict_current_table != NULL && strlen(jolix_predict_current_table) > 0)
@@ -612,15 +664,45 @@ llm_infer(PG_FUNCTION_ARGS)
 			table_name = pstrdup(jolix_predict_current_table);
 			table_name_allocated = true;
 		}
+		else if (jolix_predict_llm_history_table != NULL && strlen(jolix_predict_llm_history_table) > 0)
+		{
+			table_name = pstrdup(jolix_predict_llm_history_table);
+			table_name_allocated = true;
+		}
 	}
 
 	read_llm_config(InvalidOid, &config);
 
+	if (system_prompt == NULL || strlen(system_prompt) == 0)
+	{
+		if (config.system_prompt != NULL && strlen(config.system_prompt) > 0)
+		{
+			if (system_prompt != NULL)
+				pfree(system_prompt);
+			system_prompt = pstrdup(config.system_prompt);
+		}
+	}
+
+	if (user_input == NULL || strlen(user_input) == 0)
+	{
+		if (config.prompt_template != NULL && strlen(config.prompt_template) > 0)
+		{
+			if (user_input != NULL)
+				pfree(user_input);
+			user_input = pstrdup(config.prompt_template);
+		}
+	}
+
+	if (system_prompt == NULL)
+		system_prompt = pstrdup("");
+	if (user_input == NULL)
+		user_input = pstrdup("");
+
 	if (strlen(config.api_url) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("jolix_predict.api_url is not configured"),
-				 errhint("Set jolix_predict.api_url or use set_llm_config() to configure the API endpoint.")));
+				 errmsg("jolix_predict.llm_api_url is not configured"),
+				 errhint("Set jolix_predict.llm_api_url or use set_llm_config() to configure the API endpoint.")));
 
 	if (history_count > 0 && table_name != NULL && strlen(table_name) > 0)
 	{
@@ -649,6 +731,14 @@ llm_infer(PG_FUNCTION_ARGS)
 		response = llm_http_post(config.api_url, config.api_key, json_body);
 
 		content = parse_chat_response(response);
+
+		if (content != NULL)
+		{
+			char	   *saved_content;
+
+			saved_content = MemoryContextStrdup(CurTransactionContext, content);
+			content = saved_content;
+		}
 	}
 	PG_CATCH();
 	{
@@ -712,7 +802,7 @@ read_predict_history_from_table(const char *table_name, int count,
 	values[1] = Int32GetDatum(count * 2);
 
 	ret = SPI_execute_with_args(
-		"SELECT role, content FROM jolix_predict_history "
+		"SELECT role, content FROM jolix_llm_history "
 		"WHERE table_name = $1 ORDER BY created_at DESC LIMIT $2",
 		2, argtypes, values, nulls, true, count * 2);
 
@@ -776,6 +866,8 @@ record_predict_history_to_table(const char *table_name, const char *role, const 
 	if (role == NULL || content == NULL)
 		return;
 
+	maybe_cleanup_expired_history();
+
 	if (strlen(content) > MAX_HISTORY_CONTENT_LEN)
 	{
 		truncated_content = pnstrdup(content, MAX_HISTORY_CONTENT_LEN);
@@ -799,7 +891,7 @@ record_predict_history_to_table(const char *table_name, const char *role, const 
 	pfree(truncated_content);
 
 	SPI_execute_with_args(
-		"INSERT INTO jolix_predict_history (table_name, role, content) VALUES ($1, $2, $3)",
+		"INSERT INTO jolix_llm_history (table_name, role, content) VALUES ($1, $2, $3)",
 		3, argtypes, values, nulls, false, 0);
 
 	SPI_finish();
@@ -808,10 +900,10 @@ record_predict_history_to_table(const char *table_name, const char *role, const 
 Datum
 llm_infer_with_history(PG_FUNCTION_ARGS)
 {
-	text	   *system_prompt_text = PG_GETARG_TEXT_PP(0);
-	text	   *user_input_text = PG_GETARG_TEXT_PP(1);
+	text	   *system_prompt_text;
+	text	   *user_input_text;
 	int			history_count = PG_GETARG_INT32(2);
-	text	   *table_name_text = PG_GETARG_TEXT_PP(3);
+	text	   *table_name_text;
 	char	   *system_prompt;
 	char	   *user_input;
 	char	   *table_name;
@@ -825,17 +917,64 @@ llm_infer_with_history(PG_FUNCTION_ARGS)
 
 	memset(&config, 0, sizeof(LLMConfig));
 
-	system_prompt = text_to_cstring(system_prompt_text);
-	user_input = text_to_cstring(user_input_text);
-	table_name = text_to_cstring(table_name_text);
+	if (PG_ARGISNULL(0))
+		system_prompt = NULL;
+	else
+	{
+		system_prompt_text = PG_GETARG_TEXT_PP(0);
+		system_prompt = text_to_cstring(system_prompt_text);
+	}
+
+	if (PG_ARGISNULL(1))
+		user_input = NULL;
+	else
+	{
+		user_input_text = PG_GETARG_TEXT_PP(1);
+		user_input = text_to_cstring(user_input_text);
+	}
+
+	if (PG_ARGISNULL(3))
+		table_name = NULL;
+	else
+	{
+		table_name_text = PG_GETARG_TEXT_PP(3);
+		table_name = text_to_cstring(table_name_text);
+	}
 
 	read_llm_config(InvalidOid, &config);
+
+	if (system_prompt == NULL || strlen(system_prompt) == 0)
+	{
+		if (config.system_prompt != NULL && strlen(config.system_prompt) > 0)
+		{
+			if (system_prompt != NULL)
+				pfree(system_prompt);
+			system_prompt = pstrdup(config.system_prompt);
+		}
+	}
+
+	if (user_input == NULL || strlen(user_input) == 0)
+	{
+		if (config.prompt_template != NULL && strlen(config.prompt_template) > 0)
+		{
+			if (user_input != NULL)
+				pfree(user_input);
+			user_input = pstrdup(config.prompt_template);
+		}
+	}
+
+	if (system_prompt == NULL)
+		system_prompt = pstrdup("");
+	if (user_input == NULL)
+		user_input = pstrdup("");
+	if (table_name == NULL)
+		table_name = pstrdup("");
 
 	if (strlen(config.api_url) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("jolix_predict.api_url is not configured"),
-				 errhint("Set jolix_predict.api_url or use set_llm_config() to configure the API endpoint.")));
+				 errmsg("jolix_predict.llm_api_url is not configured"),
+				 errhint("Set jolix_predict.llm_api_url or use set_llm_config() to configure the API endpoint.")));
 
 	if (history_count > 0)
 	{
@@ -864,6 +1003,14 @@ llm_infer_with_history(PG_FUNCTION_ARGS)
 		response = llm_http_post(config.api_url, config.api_key, json_body);
 
 		content = parse_chat_response(response);
+
+		if (content != NULL)
+		{
+			char	   *saved_content;
+
+			saved_content = MemoryContextStrdup(CurTransactionContext, content);
+			content = saved_content;
+		}
 	}
 	PG_CATCH();
 	{
@@ -927,7 +1074,7 @@ record_predict_history(PG_FUNCTION_ARGS)
 	values[2] = PointerGetDatum(p_content);
 
 	SPI_execute_with_args(
-		"INSERT INTO jolix_predict_history (table_name, role, content) VALUES ($1, $2, $3)",
+		"INSERT INTO jolix_llm_history (table_name, role, content) VALUES ($1, $2, $3)",
 		3, argtypes, values, nulls, false, 0);
 
 	SPI_finish();
@@ -956,12 +1103,12 @@ clear_predict_history(PG_FUNCTION_ARGS)
 		values[0] = PointerGetDatum(p_table_name);
 
 		SPI_execute_with_args(
-			"DELETE FROM jolix_predict_history WHERE table_name = $1",
+			"DELETE FROM jolix_llm_history WHERE table_name = $1",
 			1, argtypes, values, nulls, false, 0);
 	}
 	else
 	{
-		SPI_execute("DELETE FROM jolix_predict_history", false, 0);
+		SPI_execute("DELETE FROM jolix_llm_history", false, 0);
 	}
 
 	{
@@ -970,6 +1117,80 @@ clear_predict_history(PG_FUNCTION_ARGS)
 		SPI_finish();
 		PG_RETURN_INT32(deleted);
 	}
+}
+
+static int
+do_cleanup_expired_history(void)
+{
+	int			ret;
+	int			deleted = 0;
+	char		query[256];
+
+	if (jolix_llm_history_retention_days <= 0)
+		return 0;
+
+	snprintf(query, sizeof(query),
+			 "DELETE FROM jolix_llm_history WHERE created_at < now() - interval '%d days'",
+			 jolix_llm_history_retention_days);
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+		return 0;
+
+	ret = SPI_execute(query, false, 0);
+	if (ret == SPI_OK_DELETE)
+		deleted = SPI_processed;
+
+	SPI_finish();
+	return deleted;
+}
+
+static void
+maybe_cleanup_expired_history(void)
+{
+	static TimestampTz last_cleanup_time = 0;
+	TimestampTz		now;
+	int				deleted;
+
+	if (jolix_llm_history_retention_days <= 0)
+		return;
+
+	now = GetCurrentTimestamp();
+
+	if (last_cleanup_time != 0)
+	{
+		long	secs;
+		int		microsecs;
+
+		TimestampDifference(last_cleanup_time, now, &secs, &microsecs);
+		if (secs < HISTORY_CLEANUP_INTERVAL)
+			return;
+	}
+
+	last_cleanup_time = now;
+
+	PG_TRY();
+	{
+		deleted = do_cleanup_expired_history();
+		if (deleted > 0)
+			elog(LOG, "jolix_predict: auto-cleaned %d expired history records (retention=%d days)",
+				 deleted, jolix_llm_history_retention_days);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+}
+
+Datum
+cleanup_predict_history(PG_FUNCTION_ARGS)
+{
+	int			deleted;
+
+	deleted = do_cleanup_expired_history();
+
+	PG_RETURN_INT32(deleted);
 }
 
 static char *
@@ -1182,9 +1403,9 @@ do_rag_retrieval(Oid rag_table, const char *user_input,
 Datum
 llm_rag_infer(PG_FUNCTION_ARGS)
 {
-	text	   *system_prompt_text = PG_GETARG_TEXT_PP(0);
-	text	   *user_input_text = PG_GETARG_TEXT_PP(1);
-	int			history_count = PG_GETARG_INT32(2);
+	text	   *system_prompt_text;
+	text	   *user_input_text;
+	int			history_count;
 	char	   *system_prompt;
 	char	   *user_input;
 	char	   *table_name = NULL;
@@ -1206,8 +1427,26 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 
 	memset(&config, 0, sizeof(LLMConfig));
 
-	system_prompt = text_to_cstring(system_prompt_text);
-	user_input = text_to_cstring(user_input_text);
+	if (PG_ARGISNULL(0))
+		system_prompt = NULL;
+	else
+	{
+		system_prompt_text = PG_GETARG_TEXT_PP(0);
+		system_prompt = text_to_cstring(system_prompt_text);
+	}
+
+	if (PG_ARGISNULL(1))
+		user_input = NULL;
+	else
+	{
+		user_input_text = PG_GETARG_TEXT_PP(1);
+		user_input = text_to_cstring(user_input_text);
+	}
+
+	if (PG_NARGS() >= 3 && !PG_ARGISNULL(2))
+		history_count = PG_GETARG_INT32(2);
+	else
+		history_count = 0;
 
 	if (jolix_predict_current_table != NULL && strlen(jolix_predict_current_table) > 0)
 	{
@@ -1232,11 +1471,36 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 
 	read_llm_config(InvalidOid, &config);
 
+	if (system_prompt == NULL || strlen(system_prompt) == 0)
+	{
+		if (config.system_prompt != NULL && strlen(config.system_prompt) > 0)
+		{
+			if (system_prompt != NULL)
+				pfree(system_prompt);
+			system_prompt = pstrdup(config.system_prompt);
+		}
+	}
+
+	if (user_input == NULL || strlen(user_input) == 0)
+	{
+		if (config.prompt_template != NULL && strlen(config.prompt_template) > 0)
+		{
+			if (user_input != NULL)
+				pfree(user_input);
+			user_input = pstrdup(config.prompt_template);
+		}
+	}
+
+	if (system_prompt == NULL)
+		system_prompt = pstrdup("");
+	if (user_input == NULL)
+		user_input = pstrdup("");
+
 	if (strlen(config.api_url) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("jolix_predict.api_url is not configured"),
-				 errhint("Set jolix_predict.api_url or use set_llm_config() to configure the API endpoint.")));
+				 errmsg("jolix_predict.llm_api_url is not configured"),
+				 errhint("Set jolix_predict.llm_api_url or use set_llm_config() to configure the API endpoint.")));
 
 	rag_similarity = config.rag_similarity;
 	rag_topn = config.rag_topn;
@@ -1286,6 +1550,14 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 		response = llm_http_post(config.api_url, config.api_key, json_body);
 
 		content = parse_chat_response(response);
+
+		if (content != NULL)
+		{
+			char	   *saved_content;
+
+			saved_content = MemoryContextStrdup(CurTransactionContext, content);
+			content = saved_content;
+		}
 	}
 	PG_CATCH();
 	{

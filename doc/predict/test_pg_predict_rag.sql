@@ -38,7 +38,7 @@ SELECT id, content, answer FROM rag_test WHERE content = 'What is PostgreSQL?';
 
 -- 7. 查看历史记录
 SELECT table_name, role, substring(content, 1, 80) as content_preview
-FROM jolix_predict_history
+FROM jolix_llm_history
 WHERE table_name = 'rag_test'
 ORDER BY created_at;
 

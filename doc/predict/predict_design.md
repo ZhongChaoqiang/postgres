@@ -250,10 +250,20 @@ jolix_predict 扩展提供大语言模型（LLM）推理功能，允许用户在
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `jolix_predict.api_url` | 空 | LLM API 地址 |
-| `jolix_predict.api_key` | 空 | LLM API 密钥 |
-| `jolix_predict.model` | gpt-3.5-turbo | LLM 模型名称 |
+| `jolix_predict.llm_api_url` | 空 | LLM API 地址 |
+| `jolix_predict.llm_api_key` | 空 | LLM API 密钥 |
+| `jolix_predict.llm_model` | gpt-3.5-turbo | LLM 模型名称 |
+| `jolix_predict.llm_history_table` | default | 默认历史记录表名，空字符串禁用自动记录 |
+
+### 8.4 参数默认值回退机制
+
+当 `llm_infer` 和 `llm_rag_infer` 的 `system_prompt` 或 `user_input` 参数为 NULL 或空字符串时，自动使用 `set_llm_config()` 配置的默认值：
+
+| 参数 | 回退配置 | 说明 |
+|------|----------|------|
+| `system_prompt` | `set_llm_config(p_system_prompt := '...')` | 系统提示词默认值 |
+| `user_input` | `set_llm_config(p_prompt_template := '...')` | 用户输入默认值 |
 
 ---
-**文档版本**: 1.0  
-**最后更新**: 2026-05-13
+**文档版本**: 1.1  
+**最后更新**: 2026-05-23

@@ -1,56 +1,23 @@
-# PREDICT 功能测试报告
+-- ================================================
+-- PostgreSQL PREDICT 全量功能测试脚本
+-- 测试日期: 2026-05-23
+-- ================================================
 
-**测试日期**: 2026-05-23
-**测试环境**: WSL Ubuntu, PostgreSQL 18 + jolix_predict + jolix_embedding
-**LLM API**: https://ark.cn-beijing.volces.com/api/v3/chat/completions
+\echo '========================================'
+\echo '1. 基础功能测试'
+\echo '========================================'
 
-## 测试结果概要
-
-| 测试项 | 结果 |
-|--------|------|
-| 扩展安装与 GUC 参数 | ✅ 通过 |
-| GUC 参数修改验证 | ✅ 通过 |
-| LLM 配置函数 | ✅ 通过 |
-| llm_infer 基本推理（2参数） | ✅ 通过 |
-| llm_infer 带历史记录推理（3参数） | ✅ 通过 |
-| llm_infer 带历史记录和表名推理（4参数） | ✅ 通过 |
-| llm_infer_with_history 函数 | ✅ 通过 |
-| PREDICT 列推理 | ✅ 通过 |
-| PREDICT 列文本分类 | ✅ 通过 |
-| PREDICT 列优先级分类 | ✅ 通过 |
-| PREDICT 列垃圾邮件检测 | ✅ 通过 |
-| llm_rag_infer RAG 推理 | ✅ 通过 |
-| 历史记录管理 | ✅ 通过 |
-| 历史记录过期清理 | ✅ 通过 |
-| Embedding 功能 | ✅ 通过 |
-| RAG + Embedding + Predict 集成 | ✅ 通过 |
-| llm_history_table GUC 参数 | ✅ 通过 |
-
-## 1. 基础功能测试
-
-### 1.1 扩展安装验证
-
-```sql
+\echo '--- 1.1 扩展安装验证 ---'
 DROP EXTENSION IF EXISTS jolix_predict;
 CREATE EXTENSION jolix_predict;
 SELECT extname, extversion FROM pg_extension WHERE extname = 'jolix_predict';
-```
 
-**结果**: ✅ 返回 `jolix_predict | 1.0`
-
-### 1.2 配置表验证
-
-```sql
+\echo '--- 1.2 配置表验证 ---'
 SELECT table_name FROM information_schema.tables
 WHERE table_name IN ('jolix_llm_config', 'jolix_llm_history')
 ORDER BY table_name;
-```
 
-**结果**: ✅ 返回 `jolix_llm_config` 和 `jolix_llm_history`
-
-### 1.3 GUC 参数验证
-
-```sql
+\echo '--- 1.3 GUC 参数验证 ---'
 SHOW jolix_predict.llm_api_url;
 SHOW jolix_predict.llm_api_key;
 SHOW jolix_predict.llm_model;
@@ -58,53 +25,25 @@ SHOW jolix_predict.llm_timeout;
 SHOW jolix_predict.llm_history_table;
 SHOW jolix_predict.current_table;
 SHOW jolix_predict.history_retention_days;
-```
 
-**结果**: ✅ 所有参数均可访问，默认值正确：
-- `llm_api_url`: 空
-- `llm_api_key`: 空
-- `llm_model`: gpt-3.5-turbo
-- `llm_timeout`: 60
-- `llm_history_table`: default
-- `current_table`: 空
-- `history_retention_days`: 7
-
-### 1.4 GUC 参数修改验证
-
-```sql
+\echo '--- 1.4 GUC 参数修改验证 ---'
 SET jolix_predict.llm_timeout = 120;
 SHOW jolix_predict.llm_timeout;
 SET jolix_predict.llm_history_table = 'my_history';
 SHOW jolix_predict.llm_history_table;
-```
+SET jolix_predict.llm_history_table = 'default';
+SET jolix_predict.llm_timeout = 60;
 
-**结果**: ✅ 参数修改和恢复均正常
-
-### 1.5 函数签名验证
-
-```sql
+\echo '--- 1.5 函数签名验证 ---'
 SELECT proname, pronargs FROM pg_proc WHERE proname LIKE 'llm_%' ORDER BY proname, pronargs;
-```
-
-**结果**: ✅ 返回 `llm_infer`(2/3/4参数)、`llm_infer_with_history`(4参数)、`llm_rag_infer`(2/3参数)
-
-```sql
 SELECT count(*) as deleted_func_count FROM pg_proc WHERE proname IN ('llm_predict_ext', 'llm_rag_predict_ext', 'set_predict_config', 'get_predict_config');
-```
-
-**结果**: ✅ 返回 0
-
-```sql
 SELECT count(*) as config_func_count FROM pg_proc WHERE proname IN ('set_llm_config', 'get_llm_config');
-```
 
-**结果**: ✅ 返回 4（系统级+表级各2个）
+\echo '========================================'
+\echo '2. LLM 配置测试'
+\echo '========================================'
 
-## 2. LLM 配置测试
-
-### 2.1 系统级配置
-
-```sql
+\echo '--- 2.1 系统级配置 ---'
 SELECT set_llm_config(
     p_api_url := 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
     p_api_key := 'acc96ba1-d743-45d7-9b0e-a415bd96a046',
@@ -115,90 +54,61 @@ SELECT set_llm_config(
     p_rag_similarity := 2.0,
     p_rag_topn := 3
 );
-```
 
-**结果**: ✅ 配置成功
-
-### 2.2 查看系统级配置
-
-```sql
+\echo '--- 2.2 查看系统级配置 ---'
 SELECT api_url, model_name, temperature, max_tokens, rag_similarity, rag_topn FROM get_llm_config();
-```
 
-**结果**: ✅ 返回配置的值（rag_similarity=2.0, rag_topn=3）
+\echo '========================================'
+\echo '3. LLM 推理测试'
+\echo '========================================'
 
-## 3. LLM 推理测试
-
-### 3.1 基本推理（2参数）
-
-```sql
+\echo '--- 3.1 基本推理（2参数）---'
 SET jolix_predict.llm_timeout = 300;
-
 SELECT llm_infer(
     'You are a helpful assistant. Reply in one short sentence.',
     'What is PostgreSQL?'
-);
-```
+) AS two_param_result;
 
-**结果**: ✅ 返回 LLM 生成的回答："PostgreSQL is a free, open-source object-relational database management system..."
-
-**说明**: 两参数版本自动将对话记录到 `jolix_predict.llm_history_table` 指定的默认表（默认为 `"default"`）
-
-### 3.2 验证两参数版本自动记录历史
-
-```sql
+\echo '--- 3.2 验证两参数版本自动记录历史 ---'
 SELECT count(*) AS history_count_default FROM jolix_llm_history WHERE table_name = 'default';
 SELECT table_name, role, left(content, 60) AS content_preview
 FROM jolix_llm_history WHERE table_name = 'default' ORDER BY created_at DESC LIMIT 4;
-```
 
-**结果**: ✅ 两参数版本自动记录到 "default" 表，包含 user 和 assistant 两条记录
-
-### 3.3 带历史记录推理（3参数）
-
-```sql
+\echo '--- 3.3 带历史记录推理（3参数）---'
 SELECT clear_predict_history();
 
 SELECT llm_infer(
     'You are a helpful assistant. Reply concisely.',
     'What is PostgreSQL?',
     2
-);
-```
+) AS three_param_result;
 
-**结果**: ✅ 返回 LLM 回答，历史记录自动保存
-
-### 3.4 带历史记录和表名推理（4参数）
-
-```sql
+\echo '--- 3.4 带历史记录和表名推理（4参数）---'
 SELECT llm_infer(
     'You are a helpful assistant. Reply concisely.',
     'Tell me more about its features.',
     2,
     'test_infer'
-);
-```
+) AS four_param_result;
 
-**结果**: ✅ 返回 LLM 回答，能参考之前的对话上下文
+\echo '--- 3.5 验证4参数版本历史记录 ---'
+SELECT table_name, role, left(content, 60) AS content_preview
+FROM jolix_llm_history WHERE table_name = 'test_infer' ORDER BY created_at;
 
-### 3.5 llm_infer_with_history 函数
-
-```sql
+\echo '--- 3.6 llm_infer_with_history 函数 ---'
 SELECT llm_infer_with_history(
     'You are a helpful assistant. Reply concisely.',
     'What are the main features?',
     2,
     'test_infer'
-);
-```
+) AS with_history_result;
 
-**结果**: ✅ 返回 LLM 回答，历史记录正常保存
+\echo '========================================'
+\echo '4. PREDICT 列测试'
+\echo '========================================'
 
-## 4. PREDICT 列测试
-
-### 4.1 基本 PREDICT 列
-
-```sql
+\echo '--- 4.1 基本 PREDICT 列 ---'
+DROP TABLE IF EXISTS qa_test CASCADE;
 CREATE TABLE qa_test (
     id serial PRIMARY KEY,
     question text,
@@ -210,13 +120,9 @@ CREATE TABLE qa_test (
 
 INSERT INTO qa_test (question) VALUES ('What is Python?');
 SELECT id, question, answer FROM qa_test;
-```
 
-**结果**: ✅ answer 列自动填充 LLM 回答
-
-### 4.2 PREDICT 列带历史记录
-
-```sql
+\echo '--- 4.2 PREDICT 列带历史记录 ---'
+DROP TABLE IF EXISTS chat_test CASCADE;
 CREATE TABLE chat_test (
     id serial PRIMARY KEY,
     question text,
@@ -231,16 +137,9 @@ CREATE TABLE chat_test (
 INSERT INTO chat_test (question) VALUES ('What is machine learning?');
 INSERT INTO chat_test (question) VALUES ('Give me an example.');
 SELECT question, answer FROM chat_test;
-```
 
-**结果**: ✅ PREDICT 列带历史记录正常工作，第二次 INSERT 能参考之前的对话上下文
-
-### 4.3 LLM 文本分类（多列引用）
-
-**测试目的**：验证 PREDICT 列使用 `llm_infer` 对多列内容进行自动分类
-
-**测试脚本**：
-```sql
+\echo '--- 4.3 LLM 文本分类（多列引用）---'
+DROP TABLE IF EXISTS test_llm_articles CASCADE;
 CREATE TABLE test_llm_articles (
     id serial PRIMARY KEY,
     title text,
@@ -254,22 +153,9 @@ CREATE TABLE test_llm_articles (
 INSERT INTO test_llm_articles (title, content) VALUES ('AI Revolution', 'AI and machine learning are transforming software development');
 INSERT INTO test_llm_articles (title, content, category) VALUES ('Box Office Hit', 'The new movie broke box office records', 'entertainment');
 SELECT id, title, content, category FROM test_llm_articles;
-```
 
-**实际结果**：
-```
- id |     title      |                            content                            |   category
-----+----------------+---------------------------------------------------------------+---------------
-  1 | AI Revolution  | AI and machine learning are transforming software development | technology
-  2 | Box Office Hit | The new movie broke box office records                        | entertainment
-```
-
-**结论**: ✅ 通过 - LLM 自动分类正确，用户提供的值也正确保存
-
-### 4.4 优先级分类（多列引用）
-
-**测试脚本**：
-```sql
+\echo '--- 4.4 优先级分类 ---'
+DROP TABLE IF EXISTS test_llm_tickets CASCADE;
 CREATE TABLE test_llm_tickets (
     id serial PRIMARY KEY,
     product text,
@@ -283,22 +169,9 @@ CREATE TABLE test_llm_tickets (
 INSERT INTO test_llm_tickets (product, description) VALUES ('Database', 'Production database is down, all users affected.');
 INSERT INTO test_llm_tickets (product, description) VALUES ('Dashboard', 'Feature request: add dark mode to the dashboard.');
 SELECT id, product, description, priority FROM test_llm_tickets;
-```
 
-**实际结果**：
-```
- id |  product  |                   description                    | priority
-----+-----------+--------------------------------------------------+----------
-  1 | Database  | Production database is down, all users affected. | critical
-  2 | Dashboard | Feature request: add dark mode to the dashboard. | medium
-```
-
-**结论**: ✅ 通过 - 优先级分类正确，LLM 能结合产品名和描述做出合理判断
-
-### 4.5 垃圾邮件检测（多列引用）
-
-**测试脚本**：
-```sql
+\echo '--- 4.5 垃圾邮件检测 ---'
+DROP TABLE IF EXISTS test_llm_emails CASCADE;
 CREATE TABLE test_llm_emails (
     id serial PRIMARY KEY,
     sender text,
@@ -313,23 +186,13 @@ CREATE TABLE test_llm_emails (
 INSERT INTO test_llm_emails (sender, subject, body) VALUES ('prize@scam.com', 'Congratulations! You won $1M', 'Click here to claim your prize now!');
 INSERT INTO test_llm_emails (sender, subject, body) VALUES ('colleague@company.com', 'Meeting Tomorrow', 'Hi, just a reminder about our meeting at 3pm.');
 SELECT id, sender, subject, is_spam FROM test_llm_emails;
-```
 
-**实际结果**：
-```
- id |        sender         |           subject            | is_spam
-----+-----------------------+------------------------------+----------
-  1 | prize@scam.com        | Congratulations! You won $1M | spam
-  2 | colleague@company.com | Meeting Tomorrow             | not_spam
-```
+\echo '========================================'
+\echo '5. RAG 推理测试'
+\echo '========================================'
 
-**结论**: ✅ 通过 - 垃圾邮件检测正确，LLM 能综合发件人、主题和正文判断
-
-## 5. RAG 推理测试
-
-### 5.1 创建 RAG 表（EMBEDDING AS 语法）
-
-```sql
+\echo '--- 5.1 创建 RAG 表 ---'
+DROP TABLE IF EXISTS rag_test CASCADE;
 CREATE TABLE rag_test (
     id serial PRIMARY KEY,
     content text EMBEDDING AS (simple_embedding(content)) STORED,
@@ -338,106 +201,63 @@ CREATE TABLE rag_test (
         content
     )) STORED
 ) WITH (predict_timing = immediate, vector_len = 3);
-```
 
-**结果**: ✅ 表创建成功
-
-### 5.2 插入知识数据
-
-```sql
+\echo '--- 5.2 插入知识数据 ---'
 INSERT INTO rag_test (content) VALUES ('PostgreSQL is a powerful open source database system');
 INSERT INTO rag_test (content) VALUES ('Python is a popular programming language for data science');
 INSERT INTO rag_test (content) VALUES ('Machine learning models can be trained on large datasets');
 SELECT id, content, content_embedding FROM rag_test;
-```
 
-**结果**: ✅ embedding 列自动填充向量数据
-
-### 5.3 RAG 推理
-
-```sql
+\echo '--- 5.3 RAG 推理 ---'
 INSERT INTO rag_test (content) VALUES ('What is PostgreSQL?');
 SELECT id, content, answer FROM rag_test WHERE content = 'What is PostgreSQL?';
-```
 
-**结果**: ✅ answer 列基于 RAG 上下文生成回答："PostgreSQL is a free, open-source object-relational database management system..."
+\echo '========================================'
+\echo '6. 历史记录测试'
+\echo '========================================'
 
-## 6. 历史记录测试
-
-### 6.1 自动记录验证
-
-```sql
+\echo '--- 6.1 自动记录验证 ---'
 SELECT table_name, role, left(content, 60) AS content_preview
 FROM jolix_llm_history ORDER BY created_at DESC LIMIT 10;
-```
 
-**结果**: ✅ 每次推理后自动记录 user 和 assistant 两条记录
-
-### 6.2 手动记录
-
-```sql
+\echo '--- 6.2 手动记录 ---'
 SELECT record_predict_history('manual_test', 'user', 'Test question');
 SELECT record_predict_history('manual_test', 'assistant', 'Test answer');
 SELECT table_name, role, content FROM jolix_llm_history WHERE table_name = 'manual_test';
-```
 
-**结果**: ✅ 手动记录成功
-
-### 6.3 清除历史
-
-```sql
+\echo '--- 6.3 清除历史 ---'
 SELECT clear_predict_history('manual_test');
 SELECT count(*) AS remaining FROM jolix_llm_history WHERE table_name = 'manual_test';
-```
 
-**结果**: ✅ 清除成功，返回删除行数 2，剩余 0 条
-
-### 6.4 历史记录过期清理
-
-**测试脚本**：
-```sql
+\echo '--- 6.4 历史记录过期清理 ---'
 SHOW jolix_predict.history_retention_days;
 SELECT record_predict_history('test_cleanup', 'user', 'current question');
 INSERT INTO jolix_llm_history (table_name, role, content, created_at)
 VALUES ('test_cleanup', 'user', 'old question', now() - interval '8 days');
 SELECT cleanup_predict_history();
 SELECT table_name, role, content FROM jolix_llm_history WHERE table_name = 'test_cleanup';
-```
 
-**实际结果**：
-- 默认 `history_retention_days = 7`，8天前的数据被清理（返回1）✅
-- 当前数据保留 ✅
-
-### 6.5 动态调整保留天数
-
-```sql
+\echo '--- 6.5 动态调整保留天数 ---'
 SET jolix_predict.history_retention_days = 3;
 INSERT INTO jolix_llm_history (table_name, role, content, created_at)
 VALUES ('test_cleanup', 'user', 'mid question', now() - interval '4 days');
 SELECT cleanup_predict_history();
 SELECT table_name, role, content FROM jolix_llm_history WHERE table_name = 'test_cleanup';
-```
 
-**实际结果**：
-- 设置3天保留后，4天前的数据被清理（返回1）✅
-- 当前数据保留 ✅
-- 设置0后，不执行清理 ✅
+SET jolix_predict.history_retention_days = 0;
+SELECT cleanup_predict_history();
 
-**结论**: ✅ 通过 - 过期清理功能正常，GUC 参数可动态调整
+SET jolix_predict.history_retention_days = 7;
 
-## 7. Embedding 功能测试
+\echo '========================================'
+\echo '7. Embedding 功能测试'
+\echo '========================================'
 
-### 7.1 simple_embedding 函数
-
-```sql
+\echo '--- 7.1 simple_embedding 函数 ---'
 SELECT simple_embedding('hello world');
-```
 
-**结果**: ✅ 返回 3 维向量 `[4,1,4]`
-
-### 7.2 EMBEDDING AS 语法
-
-```sql
+\echo '--- 7.2 EMBEDDING AS 语法 ---'
+DROP TABLE IF EXISTS emb_test CASCADE;
 CREATE TABLE emb_test (
     id serial PRIMARY KEY,
     content text EMBEDDING AS (simple_embedding(content)) STORED
@@ -446,24 +266,15 @@ CREATE TABLE emb_test (
 INSERT INTO emb_test (content) VALUES ('Test embedding');
 INSERT INTO emb_test (content) VALUES ('Another test');
 SELECT id, content, content_embedding FROM emb_test;
-```
 
-**结果**: ✅ EMBEDDING AS 语法正常工作，embedding 自动生成
+\echo '========================================'
+\echo '8. RAG + Embedding + Predict 集成测试'
+\echo '========================================'
 
-```
- id |    content     | content_embedding
-----+----------------+-------------------
-  1 | Test embedding | [4,4,4]
-  2 | Another test   | [5,2,5]
-```
-
-## 8. RAG + Embedding + Predict 集成测试
-
-### 8.1 完整集成测试
-
-```sql
+\echo '--- 8.1 完整集成测试 ---'
 SELECT clear_predict_history();
 
+DROP TABLE IF EXISTS rag_integration CASCADE;
 CREATE TABLE rag_integration (
     id serial PRIMARY KEY,
     content text EMBEDDING AS (simple_embedding(content)) STORED,
@@ -477,89 +288,49 @@ INSERT INTO rag_integration (content) VALUES ('PostgreSQL is a powerful open sou
 INSERT INTO rag_integration (content) VALUES ('Python is a popular programming language for data science');
 INSERT INTO rag_integration (content) VALUES ('What is PostgreSQL?');
 SELECT id, content, answer FROM rag_integration WHERE content = 'What is PostgreSQL?';
-```
 
-**结果**: ✅ 完整流程通过：
-- EMBEDDING 列自动生成向量
-- PREDICT 列自动触发 RAG 推理
-- RAG 检索到相关上下文
-- LLM 基于上下文生成正确回答
-- 历史记录自动保存
-
-### 8.2 历史记录验证
-
-```sql
+\echo '--- 8.2 历史记录验证 ---'
 SELECT table_name, role, left(content, 60) AS content_preview
 FROM jolix_llm_history
 WHERE table_name = 'rag_integration'
 ORDER BY created_at;
-```
 
-**结果**: ✅ 6 条记录（3 条 user + 3 条 assistant），对应 3 次 INSERT 操作
+\echo '========================================'
+\echo '9. llm_history_table GUC 参数专项测试'
+\echo '========================================'
 
-## 9. llm_history_table GUC 参数专项测试
-
-### 9.1 默认值验证
-
-```sql
+\echo '--- 9.1 默认值验证 ---'
 SHOW jolix_predict.llm_history_table;
-```
 
-**结果**: ✅ 默认值为 `default`
-
-### 9.2 两参数版本自动记录到默认表
-
-```sql
+\echo '--- 9.2 两参数版本自动记录到默认表 ---'
 SELECT clear_predict_history();
 SELECT llm_infer(
     'You are a helpful assistant. Reply in one word.',
     'What color is the sky?'
 ) AS sky_result;
 SELECT count(*) AS default_history_count FROM jolix_llm_history WHERE table_name = 'default';
-```
 
-**结果**: ✅ 返回 "Blue"，历史记录表 "default" 中有 2 条记录（user + assistant）
-
-### 9.3 修改 llm_history_table 后自动记录到新表
-
-```sql
+\echo '--- 9.3 修改 llm_history_table 后自动记录到新表 ---'
 SET jolix_predict.llm_history_table = 'custom_history';
 SELECT llm_infer(
     'You are a helpful assistant. Reply in one word.',
     'What color is grass?'
 ) AS grass_result;
 SELECT count(*) AS custom_history_count FROM jolix_llm_history WHERE table_name = 'custom_history';
-```
 
-**结果**: ✅ 返回 "Green"，历史记录表 "custom_history" 中有 2 条记录
-
-### 9.4 禁用自动记录
-
-```sql
+\echo '--- 9.4 禁用自动记录 ---'
 SET jolix_predict.llm_history_table = '';
 SELECT llm_infer(
     'You are a helpful assistant. Reply in one word.',
     'What is 2+2?'
 ) AS math_result;
 SELECT count(*) AS no_record_count FROM jolix_llm_history WHERE table_name = '';
-```
 
-**结果**: ✅ 返回 "4"，空表名下无历史记录（自动记录已禁用）
-
-### 9.5 恢复默认值
-
-```sql
+\echo '--- 9.5 恢复默认值 ---'
 SET jolix_predict.llm_history_table = 'default';
-```
 
-**结果**: ✅ 恢复成功
+\echo '========================================'
+\echo '测试完成'
+\echo '========================================'
 
-## 已知限制
-
-1. **st_embedding 在触发器中的稳定性**: `st_embedding` 函数调用 Python 模型，在触发器上下文中可能导致超时或崩溃。建议在触发器中使用 `simple_embedding` 或其他轻量级嵌入函数，`st_embedding` 适合在 INSERT 后手动 UPDATE 触发。
-2. **vector_len 必须匹配**: 建表时 `vector_len` 必须与嵌入函数输出维度一致，否则 INSERT 会失败。
-3. **simple_embedding 需手动创建**: `simple_embedding` 函数不是 jolix_predict 或 jolix_embedding 扩展的一部分，需要手动创建。建议在测试前先创建此函数。
-
----
-**文档版本**: 2.0
-**最后更新**: 2026-05-23
+SELECT clear_predict_history();
