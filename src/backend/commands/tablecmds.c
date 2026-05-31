@@ -1461,6 +1461,7 @@ BuildDescForRelation(const List *columns)
 		att->attgenerated = entry->generated;
 		att->attpredict = entry->is_predict;
 		att->attembedding = entry->is_embedding;
+		att->attvectorize = entry->is_embeddings;
 		att->atthidden = entry->is_hidden;
 		att->attcompression = GetAttributeCompression(att->atttypid, entry->compression);
 		if (entry->storage)

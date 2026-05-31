@@ -758,6 +758,7 @@ typedef struct ColumnDef
 	bool		is_from_type;	/* column definition came from table type */
 	bool		is_predict;		/* PREDICT option specified? */
 	bool		is_embedding;	/* EMBEDDING option specified? */
+	bool		is_embeddings;
 	bool		is_hidden;		/* hidden from SELECT * expansion? */
 	char		storage;		/* attstorage setting, or 0 for default */
 	char	   *storage_name;	/* attstorage setting name or NULL for default */
@@ -2801,6 +2802,7 @@ typedef enum ConstrType			/* types of constraints */
 	CONSTR_GENERATED,
 	CONSTR_PREDICT,
 	CONSTR_EMBEDDING,
+	CONSTR_EMBEDDINGS,
 	CONSTR_CHECK,
 	CONSTR_PRIMARY,
 	CONSTR_UNIQUE,
@@ -3449,6 +3451,26 @@ typedef struct FetchStmt
  * properties are empty.
  * ----------------------
  */
+typedef struct EmbeddingsStmt
+{
+	NodeTag		type;
+	char	   *vecname;
+	RangeVar   *relation;
+	List	   *embeddingsParams;
+	char	   *accessMethod;
+	List	   *options;
+	bool		if_not_exists;
+} EmbeddingsStmt;
+
+typedef struct DropEmbeddingsStmt
+{
+	NodeTag		type;
+	char	   *vecname;
+	RangeVar   *relation;
+	bool		if_exists;
+	bool		concurrent;
+} DropEmbeddingsStmt;
+
 typedef struct IndexStmt
 {
 	NodeTag		type;

@@ -2482,6 +2482,8 @@ ExecBuildSlotValueDescription(Oid reloid,
 				val = "predict";
 			else if (att->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
 				val = "embedding";
+			else if (att->attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS)
+				val = "embeddings";
 			else if (slot->tts_isnull[i])
 				val = "null";
 			else

@@ -140,7 +140,8 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	/* Is EMBEDDING option specified */
 	bool		attembedding BKI_DEFAULT(f);
 
-	/* Is dropped (ie, logically invisible) or not */
+	bool		attvectorize BKI_DEFAULT(f);
+
 	bool		attisdropped BKI_DEFAULT(f);
 
 	/* Is hidden from SELECT * expansion or not */
@@ -239,6 +240,7 @@ MAKE_SYSCACHE(ATTNUM, pg_attribute_relid_attnum_index, 128);
 #define		  ATTRIBUTE_GENERATED_VIRTUAL	'v'
 #define		  ATTRIBUTE_GENERATED_PREDICT	'p'
 #define		  ATTRIBUTE_GENERATED_EMBEDDING	'e'
+#define		  ATTRIBUTE_GENERATED_EMBEDDINGS	'z'
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

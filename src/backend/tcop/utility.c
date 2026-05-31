@@ -55,6 +55,7 @@
 #include "commands/typecmds.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
+#include "commands/vectorizecmds.h"
 #include "commands/view.h"
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
@@ -204,6 +205,8 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_GrantStmt:
 		case T_ImportForeignSchemaStmt:
 		case T_IndexStmt:
+		case T_EmbeddingsStmt:
+		case T_DropEmbeddingsStmt:
 		case T_ReassignOwnedStmt:
 		case T_RefreshMatViewStmt:
 		case T_RenameStmt:
@@ -1566,6 +1569,13 @@ ProcessUtilitySlow(ParseState *pstate,
 				}
 				break;
 
+			case T_EmbeddingsStmt:
+				CreateVectorize((EmbeddingsStmt *) parsetree);
+				break;
+			case T_DropEmbeddingsStmt:
+				DropVectorize((DropEmbeddingsStmt *) parsetree);
+				break;
+
 			case T_ReindexStmt:
 				ExecReindex(pstate, (ReindexStmt *) parsetree, isTopLevel);
 
@@ -2808,6 +2818,13 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_INDEX;
 			break;
 
+		case T_EmbeddingsStmt:
+			tag = CMDTAG_CREATE_EMBEDDINGS;
+			break;
+		case T_DropEmbeddingsStmt:
+			tag = CMDTAG_DROP_EMBEDDINGS;
+			break;
+
 		case T_RuleStmt:
 			tag = CMDTAG_CREATE_RULE;
 			break;
@@ -3453,6 +3470,11 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_IndexStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
+		case T_EmbeddingsStmt:
+		case T_DropEmbeddingsStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

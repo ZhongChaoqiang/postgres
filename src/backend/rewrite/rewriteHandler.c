@@ -948,7 +948,8 @@ rewriteTargetListIU(List *targetList,
 			 */
 			if (att_tup->attgenerated && !apply_default &&
 				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
-				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING &&
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDINGS)
 			{
 				/*
 				 * If this column's values come from a VALUES RTE, test
@@ -1000,7 +1001,8 @@ rewriteTargetListIU(List *targetList,
 
 			if (att_tup->attgenerated && new_tle && !apply_default &&
 				att_tup->attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
-				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDING &&
+				att_tup->attgenerated != ATTRIBUTE_GENERATED_EMBEDDINGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_GENERATED_ALWAYS),
 						 errmsg("column \"%s\" can only be updated to DEFAULT",
@@ -1012,7 +1014,8 @@ rewriteTargetListIU(List *targetList,
 		if (att_tup->attgenerated)
 		{
 			if (att_tup->attgenerated == ATTRIBUTE_GENERATED_PREDICT ||
-				att_tup->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
+				att_tup->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING ||
+				att_tup->attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS)
 			{
 				/*
 				 * Predict/embedding columns: if user provided a value, keep
@@ -4842,10 +4845,11 @@ convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname)
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
 		attr = TupleDescAttr(tupdesc, attnum - 1);
-		if (!attr->attisdropped && attr->attembedding &&
+		if (!attr->attisdropped && (attr->attembedding || attr->attvectorize) &&
 			strcmp(NameStr(attr->attname), colname) == 0)
 		{
-			if (attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
+			if (attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING ||
+				attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS)
 			{
 				Expr	   *expr;
 

@@ -12568,6 +12568,10 @@
   proname => 'embedding_trigger', proisstrict => 'f', provolatile => 'v',
   prorettype => 'trigger', proargtypes => '',
   prosrc => 'embedding_trigger' },
+{ oid => '6508', descr => 'trigger to call vectorize function for VECTORIZE columns',
+  proname => 'vectorize_trigger', proisstrict => 'f', provolatile => 'v',
+  prorettype => 'trigger', proargtypes => '',
+  prosrc => 'vectorize_trigger' },
 
 # Text vector distance operators
 { oid => '6503', descr => 'L2 distance between text vectors',

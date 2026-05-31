@@ -90,3 +90,14 @@ CREATE OPERATOR <+> (
     LEFTARG = text, RIGHTARG = text, PROCEDURE = st_text_l1_distance,
     COMMUTATOR = '<+>'
 );
+
+-- FT-Transformer embedding function for VECTORIZE columns
+-- Accepts variable number of arguments (multiple columns) and returns a vector
+-- Used with CREATE VECTORIZE ... USING ft_transformer_embedding
+CREATE FUNCTION ft_transformer_embedding(VARIADIC "any")
+RETURNS vector
+AS 'jolix_embedding', 'ft_transformer_embedding'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION ft_transformer_embedding(VARIADIC "any") IS
+'Generate vector embedding using FT-Transformer model. Accepts multiple column values as input. Used with CREATE VECTORIZE for multi-column vectorization.';

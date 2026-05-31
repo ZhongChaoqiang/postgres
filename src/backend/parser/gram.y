@@ -284,12 +284,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		ConstraintsSetStmt CopyStmt CreateAsStmt CreateCastStmt
 		CreateDomainStmt CreateExtensionStmt CreateGroupStmt CreateOpClassStmt
 		CreateOpFamilyStmt AlterOpFamilyStmt CreatePLangStmt
-		CreateSchemaStmt CreateSeqStmt CreateStmt CreateStatsStmt CreateTableSpaceStmt
+		CreateSchemaStmt CreateSeqStmt CreateStmt CreateStatsStmt EmbeddingsStmt CreateTableSpaceStmt
 		CreateFdwStmt CreateForeignServerStmt CreateForeignTableStmt
 		CreateAssertionStmt CreateTransformStmt CreateTrigStmt CreateEventTrigStmt
 		CreateUserStmt CreateUserMappingStmt CreateRoleStmt CreatePolicyStmt
 		CreatedbStmt DeclareCursorStmt DefineStmt DeleteStmt DiscardStmt DoStmt
-		DropOpClassStmt DropOpFamilyStmt DropStmt
+		DropOpClassStmt DropOpFamilyStmt DropStmt DropEmbeddingsStmt
 		DropCastStmt DropRoleStmt
 		DropdbStmt DropTableSpaceStmt
 		DropTransformStmt
@@ -720,7 +720,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
-	EACH ELSE EMBEDDING EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENFORCED ENUM_P ERROR_P
+	EACH ELSE EMBEDDING EMBEDDINGS EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENFORCED ENUM_P ERROR_P
 	ESCAPE EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN
 	EXPRESSION EXTENSION EXTERNAL EXTRACT
 
@@ -784,8 +784,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	UESCAPE UNBOUNDED UNCONDITIONAL UNCOMMITTED UNENCRYPTED UNION UNIQUE UNKNOWN
 	UNLISTEN UNLOGGED UNTIL UPDATE USER USING
 
-	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
-	VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
+	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
 
 	WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
 
@@ -1055,6 +1054,7 @@ stmt:
 			| CreateStmt
 			| CreateSubscriptionStmt
 			| CreateStatsStmt
+			| EmbeddingsStmt
 			| CreateTableSpaceStmt
 			| CreateTransformStmt
 			| CreateTrigStmt
@@ -1074,6 +1074,7 @@ stmt:
 			| DropOpFamilyStmt
 			| DropOwnedStmt
 			| DropStmt
+			| DropEmbeddingsStmt
 			| DropSubscriptionStmt
 			| DropTableSpaceStmt
 			| DropTransformStmt
@@ -8234,6 +8235,52 @@ defacl_privilege_target:
  * Note: we cannot put TABLESPACE clause after WHERE clause unless we are
  * willing to make TABLESPACE a fully reserved word.
  *****************************************************************************/
+
+EmbeddingsStmt:
+			CREATE EMBEDDINGS name ON relation_expr USING ColId '(' columnList ')' opt_reloptions
+				{
+					EmbeddingsStmt *n = makeNode(EmbeddingsStmt);
+					n->vecname = $3;
+					n->relation = $5;
+					n->accessMethod = $7;
+					n->embeddingsParams = $9;
+					n->options = $11;
+					n->if_not_exists = false;
+					$$ = (Node *) n;
+				}
+			| CREATE EMBEDDINGS IF_P NOT EXISTS name ON relation_expr USING ColId '(' columnList ')' opt_reloptions
+				{
+					EmbeddingsStmt *n = makeNode(EmbeddingsStmt);
+					n->vecname = $6;
+					n->relation = $8;
+					n->accessMethod = $10;
+					n->embeddingsParams = $12;
+					n->options = $14;
+					n->if_not_exists = true;
+					$$ = (Node *) n;
+				}
+		;
+
+DropEmbeddingsStmt:
+			DROP EMBEDDINGS name ON relation_expr opt_drop_behavior
+				{
+					DropEmbeddingsStmt *n = makeNode(DropEmbeddingsStmt);
+					n->vecname = $3;
+					n->relation = $5;
+					n->if_exists = false;
+					n->concurrent = false;
+					$$ = (Node *) n;
+				}
+			| DROP EMBEDDINGS IF_P EXISTS name ON relation_expr opt_drop_behavior
+				{
+					DropEmbeddingsStmt *n = makeNode(DropEmbeddingsStmt);
+					n->vecname = $5;
+					n->relation = $7;
+					n->if_exists = true;
+					n->concurrent = false;
+					$$ = (Node *) n;
+				}
+		;
 
 IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 			ON relation_expr access_method_clause '(' index_params ')'
@@ -17806,6 +17853,7 @@ unreserved_keyword:
 			| DROP
 			| EACH
 			| EMBEDDING
+			| EMBEDDINGS
 			| EMPTY_P
 			| ENABLE_P
 			| ENCODING
@@ -18387,6 +18435,7 @@ bare_label_keyword:
 			| EACH
 			| ELSE
 			| EMBEDDING
+			| EMBEDDINGS
 			| EMPTY_P
 			| ENABLE_P
 			| ENCODING

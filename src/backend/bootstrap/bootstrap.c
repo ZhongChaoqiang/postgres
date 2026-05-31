@@ -134,7 +134,9 @@ static const struct typinfo TypInfo[] = {
 	{"_char", 1002, CHAROID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT},
 	{"_aclitem", 1034, ACLITEMOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
-	F_ARRAY_IN, F_ARRAY_OUT}
+	F_ARRAY_IN, F_ARRAY_OUT},
+	{"anyarray", ANYARRAYOID, 0, -1, false, TYPALIGN_DOUBLE, TYPSTORAGE_EXTENDED, InvalidOid,
+	F_ANYARRAY_IN, F_ANYARRAY_OUT}
 };
 
 static const int n_types = sizeof(TypInfo) / sizeof(struct typinfo);
@@ -733,6 +735,7 @@ populate_typ_list(void)
 	Assert(Typ == NIL);
 
 	rel = table_open(TypeRelationId, NoLock);
+
 	scan = table_beginscan_catalog(rel, 0, NULL);
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)

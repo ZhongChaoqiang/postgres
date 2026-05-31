@@ -1,0 +1,4 @@
+comment = 'Vectorize extension for multi-column vectorization'
+default_version = '1.0'
+module_pathname = '$libdir/jolix_predict'
+relocatable = true

@@ -601,6 +601,8 @@ RelationBuildTupleDesc(Relation relation)
 			constr->has_generated_predict = true;
 		if (attp->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
 			constr->has_generated_embedding = true;
+		if (attp->attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS)
+			constr->has_generated_vectorize = true;
 		if (attp->atthasdef)
 			ndef++;
 

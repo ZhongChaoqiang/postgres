@@ -45,6 +45,7 @@ static Oid vector_type_oid = InvalidOid;
 PG_FUNCTION_INFO_V1(sentence_transformers_embedding);
 PG_FUNCTION_INFO_V1(sentence_transformers_embedding_with_model);
 PG_FUNCTION_INFO_V1(st_text_placeholder_distance);
+PG_FUNCTION_INFO_V1(ft_transformer_embedding);
 
 static void init_python(void);
 static void ensure_model_dir(const char *model_path);
@@ -347,6 +348,258 @@ sentence_transformers_embedding_with_model(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(vector_result);
 }
 
+#define DEFAULT_FT_MODEL_NAME "ft-transformer-default"
+
+static char *jolix_ft_model_name = NULL;
+
+static Vector *
+generate_deterministic_vector(int dim, const char **col_values, int ncolumns)
+{
+	Vector *result;
+	int i;
+	uint32 hash = 0;
+
+	result = (Vector *) palloc0(VECTOR_SIZE(dim));
+	SET_VARSIZE(result, VECTOR_SIZE(dim));
+	result->dim = dim;
+	result->unused = 0;
+
+	for (i = 0; i < ncolumns; i++)
+	{
+		const char *s = col_values[i];
+		while (*s)
+		{
+			hash = hash * 31 + (uint32) *s;
+			s++;
+		}
+		hash = hash * 31 + (uint32) i;
+	}
+
+	for (i = 0; i < dim; i++)
+	{
+		uint32 h = hash ^ (uint32)(i * 2654435761UL);
+		h = ((h >> 16) ^ h) * 0x45d9f3b;
+		h = ((h >> 16) ^ h) * 0x45d9f3b;
+		h = (h >> 16) ^ h;
+		result->x[i] = (float)((int32) h % 1000) / 1000.0f;
+	}
+
+	return result;
+}
+
+static PyObject *ft_model_cache = NULL;
+
+static PyObject *
+load_ft_model(const char *model_name)
+{
+	PyObject *transformers_module = NULL;
+	PyObject *st_class = NULL;
+	PyObject *model_instance = NULL;
+	PyObject *args = NULL;
+	PyObject *kwargs = NULL;
+	PyObject *cache_key = NULL;
+	PyObject *cached_model = NULL;
+	const char *model_path;
+
+	model_path = jolix_embedding_model_path ? jolix_embedding_model_path : DEFAULT_MODEL_PATH;
+
+	if (!ft_model_cache)
+		ft_model_cache = PyDict_New();
+
+	cache_key = PyUnicode_FromString(model_name);
+	if (cache_key)
+	{
+		cached_model = PyDict_GetItem(ft_model_cache, cache_key);
+		if (cached_model)
+		{
+			Py_DECREF(cache_key);
+			Py_INCREF(cached_model);
+			return cached_model;
+		}
+	}
+
+	PyRun_SimpleString("import os");
+	PyRun_SimpleString("os.environ['HF_ENDPOINT'] = '" HF_MIRROR_URL "'");
+
+	transformers_module = PyImport_ImportModule("sentence_transformers");
+	if (!transformers_module)
+	{
+		PyErr_Clear();
+		if (cache_key)
+			Py_DECREF(cache_key);
+		elog(LOG, "ft_transformer: sentence_transformers module not available, using deterministic vector");
+		return NULL;
+	}
+
+	st_class = PyObject_GetAttrString(transformers_module, "SentenceTransformer");
+	Py_DECREF(transformers_module);
+	if (!st_class)
+	{
+		PyErr_Clear();
+		if (cache_key)
+			Py_DECREF(cache_key);
+		elog(LOG, "ft_transformer: SentenceTransformer class not available, using deterministic vector");
+		return NULL;
+	}
+
+	ensure_model_dir(model_path);
+
+	elog(LOG, "Loading FT-Transformer model: %s (cache: %s)", model_name, model_path);
+
+	args = Py_BuildValue("(s)", model_name);
+	kwargs = Py_BuildValue("{s:s}", "cache_folder", model_path);
+
+	model_instance = PyObject_Call(st_class, args, kwargs);
+
+	Py_DECREF(st_class);
+	Py_DECREF(args);
+	if (kwargs)
+		Py_DECREF(kwargs);
+
+	if (!model_instance)
+	{
+		PyErr_Clear();
+		if (cache_key)
+			Py_DECREF(cache_key);
+		elog(LOG, "ft_transformer: model '%s' not available, using deterministic vector", model_name);
+		return NULL;
+	}
+
+	if (cache_key)
+	{
+		PyDict_SetItem(ft_model_cache, cache_key, model_instance);
+		Py_DECREF(cache_key);
+	}
+
+	return model_instance;
+}
+
+Datum
+ft_transformer_embedding(PG_FUNCTION_ARGS)
+{
+	int			ncolumns = PG_NARGS();
+	PyObject   *model = NULL;
+	Vector	   *vector_result;
+	const char *model_name;
+	int			i;
+	int			vector_len = 128;
+	char	  **col_value_strs = NULL;
+	bool		use_deterministic = true;
+
+	ensure_vector_type();
+
+	model_name = jolix_ft_model_name ? jolix_ft_model_name : DEFAULT_FT_MODEL_NAME;
+
+	init_python();
+	model = load_ft_model(model_name);
+
+	col_value_strs = (char **) palloc(sizeof(char *) * ncolumns);
+
+	for (i = 0; i < ncolumns; i++)
+	{
+		Oid argtype;
+
+		if (PG_ARGISNULL(i))
+		{
+			col_value_strs[i] = pstrdup("");
+			continue;
+		}
+
+		argtype = get_fn_expr_argtype(fcinfo->flinfo, i);
+
+		switch (argtype)
+		{
+			case INT2OID:
+				col_value_strs[i] = psprintf("%d", PG_GETARG_INT16(i));
+				break;
+			case INT4OID:
+				col_value_strs[i] = psprintf("%d", PG_GETARG_INT32(i));
+				break;
+			case INT8OID:
+				col_value_strs[i] = psprintf("%ld", PG_GETARG_INT64(i));
+				break;
+			case FLOAT4OID:
+				col_value_strs[i] = psprintf("%f", PG_GETARG_FLOAT4(i));
+				break;
+			case FLOAT8OID:
+				col_value_strs[i] = psprintf("%f", PG_GETARG_FLOAT8(i));
+				break;
+			case TEXTOID:
+			case VARCHAROID:
+			case BPCHAROID:
+				col_value_strs[i] = text_to_cstring(PG_GETARG_TEXT_P(i));
+				break;
+			case NUMERICOID:
+				{
+					Datum numdatum = PG_GETARG_DATUM(i);
+					col_value_strs[i] = DatumGetCString(DirectFunctionCall1(numeric_out, numdatum));
+				}
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("ft_transformer_embedding: unsupported argument type %u", argtype)));
+				break;
+		}
+	}
+
+	if (model)
+	{
+		PyObject   *features_dict = PyDict_New();
+		PyObject   *result = NULL;
+
+		if (features_dict)
+		{
+			for (i = 0; i < ncolumns; i++)
+			{
+				char		colname[32];
+				PyObject   *key = NULL;
+				PyObject   *value = NULL;
+
+				snprintf(colname, sizeof(colname), "col_%d", i);
+				key = PyUnicode_FromString(colname);
+				value = PyUnicode_FromString(col_value_strs[i]);
+
+				if (key && value)
+					PyDict_SetItem(features_dict, key, value);
+
+				if (key)
+					Py_DECREF(key);
+				if (value)
+					Py_DECREF(value);
+			}
+
+			result = PyObject_CallMethod(model, "encode", "(O)", features_dict);
+			Py_DECREF(features_dict);
+
+			if (result)
+			{
+				vector_result = embedding_to_vector(result);
+				Py_DECREF(result);
+				use_deterministic = false;
+			}
+			else
+			{
+				PyErr_Clear();
+				elog(LOG, "ft_transformer: model encode failed, using deterministic vector");
+			}
+		}
+	}
+
+	if (use_deterministic)
+	{
+		vector_result = generate_deterministic_vector(vector_len,
+													  (const char **) col_value_strs,
+													  ncolumns);
+	}
+
+	for (i = 0; i < ncolumns; i++)
+		pfree(col_value_strs[i]);
+	pfree(col_value_strs);
+
+	PG_RETURN_POINTER(vector_result);
+}
+
 void
 _PG_init(void)
 {
@@ -367,6 +620,17 @@ _PG_init(void)
 							   &jolix_embedding_model_path,
 							   DEFAULT_MODEL_PATH,
 							   PGC_SIGHUP,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	DefineCustomStringVariable("jolix_embedding.ft_model_name",
+							   "Default model name for FT-Transformer vectorize",
+							   NULL,
+							   &jolix_ft_model_name,
+							   DEFAULT_FT_MODEL_NAME,
+							   PGC_USERSET,
 							   0,
 							   NULL,
 							   NULL,

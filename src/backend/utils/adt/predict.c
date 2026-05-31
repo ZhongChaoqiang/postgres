@@ -22,6 +22,7 @@
 #include "utils/datum.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
 #include "utils/predict.h"
 #include "utils/regproc.h"
 #include "access/relation.h"
@@ -32,6 +33,8 @@
 #include "parser/parse_relation.h"
 #include "parser/parse_func.h"
 #include "nodes/pg_list.h"
+#include "nodes/makefuncs.h"
+#include "nodes/parsenodes.h"
 #include "executor/spi.h"
 #include "catalog/pg_proc.h"
 #include "utils/guc.h"
@@ -747,6 +750,7 @@ text_vector_ip_distance(PG_FUNCTION_ARGS)
  * - Evaluates the EMBEDDING AS expression and saves result to _embedding column
  */
 PG_FUNCTION_INFO_V1(embedding_trigger);
+PG_FUNCTION_INFO_V1(vectorize_trigger);
 
 Datum
 embedding_trigger(PG_FUNCTION_ARGS)
@@ -931,6 +935,214 @@ embedding_trigger(PG_FUNCTION_ARGS)
 					}
 				}
 			}
+		}
+	}
+
+	return PointerGetDatum(newtuple);
+}
+
+Datum
+vectorize_trigger(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	TupleDesc	tupdesc;
+	HeapTuple	newtuple;
+	Relation	rel;
+	int			attnum;
+	char	  **tg_args;
+	int			nargs;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"vectorize_trigger\" was not called by trigger manager")));
+
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"vectorize_trigger\" must be called as BEFORE trigger")));
+
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"vectorize_trigger\" must be a ROW-level trigger")));
+
+	if (!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event) && !TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("function \"vectorize_trigger\" must be called for INSERT or UPDATE")));
+
+	rel = trigdata->tg_relation;
+	tupdesc = RelationGetDescr(rel);
+
+	if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		newtuple = trigdata->tg_newtuple;
+	else
+		newtuple = trigdata->tg_trigtuple;
+
+	tg_args = trigdata->tg_trigger->tgargs;
+	nargs = trigdata->tg_trigger->tgnargs;
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+		if (attr->attisdropped)
+			continue;
+
+		if (!attr->attvectorize)
+			continue;
+
+		if (nargs >= 3)
+		{
+			char	   *vecname = tg_args[0];
+			char	   *accessMethod = tg_args[1];
+			char	   *colnames_str = tg_args[2];
+			List	   *colnames_list;
+			ListCell   *lc;
+			Oid			funcoid = InvalidOid;
+			FmgrInfo	funcinfo;
+			int			ncolumns = 0;
+			Datum	   *col_values;
+			bool	   *col_nulls;
+			int			i;
+			bool		any_null = false;
+
+			if (strcmp(NameStr(attr->attname), vecname) != 0)
+				continue;
+
+			if (!SplitIdentifierString(colnames_str, ',', &colnames_list))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid column list in vectorize trigger")));
+
+			ncolumns = list_length(colnames_list);
+			col_values = (Datum *) palloc(sizeof(Datum) * ncolumns);
+			col_nulls = (bool *) palloc(sizeof(bool) * ncolumns);
+			Oid		   *col_types = (Oid *) palloc(sizeof(Oid) * ncolumns);
+
+			i = 0;
+			foreach(lc, colnames_list)
+			{
+				char	   *colname = (char *) lfirst(lc);
+				AttrNumber	src_attnum;
+				Datum		col_datum;
+				bool		col_isnull;
+				Form_pg_attribute src_attr;
+
+				src_attnum = get_attnum(RelationGetRelid(rel), colname);
+				if (src_attnum == InvalidAttrNumber)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_COLUMN),
+							 errmsg("column \"%s\" does not exist", colname)));
+
+				src_attr = TupleDescAttr(tupdesc, src_attnum - 1);
+				col_types[i] = src_attr->atttypid;
+
+				col_datum = heap_getattr(newtuple, src_attnum, tupdesc, &col_isnull);
+				col_values[i] = col_datum;
+				col_nulls[i] = col_isnull;
+				if (col_isnull)
+					any_null = true;
+				i++;
+			}
+
+			if (!any_null)
+			{
+				List	   *namelist;
+				FuncCandidateList clist;
+				int			fgc_flags;
+
+				namelist = stringToQualifiedNameList(accessMethod, NULL);
+				clist = FuncnameGetCandidates(namelist, ncolumns, NIL, true, false, false, true, &fgc_flags);
+
+				if (clist != NULL)
+				{
+					for (; clist != NULL; clist = clist->next)
+					{
+						if (clist->nargs == ncolumns || (clist->nvargs > 0 && ncolumns >= clist->nargs - clist->nvargs))
+						{
+							funcoid = clist->oid;
+							break;
+						}
+					}
+				}
+
+				if (OidIsValid(funcoid))
+				{
+					Datum		vec_datum;
+					int			modify_attnums[1];
+					Datum		modify_values[1];
+					bool		modify_nulls[1];
+					HeapTuple	rettuple;
+					FuncExpr   *funcexpr;
+					List	   *args_list = NIL;
+					Oid		   *argtypes_arr;
+					Oid			rettype;
+
+					fmgr_info(funcoid, &funcinfo);
+
+					rettype = get_func_rettype(funcoid);
+
+					argtypes_arr = (Oid *) palloc(sizeof(Oid) * ncolumns);
+					for (i = 0; i < ncolumns; i++)
+					{
+						argtypes_arr[i] = col_types[i];
+						args_list = lappend(args_list, makeVar(1, i + 1, col_types[i], -1, InvalidOid, 0));
+					}
+
+					funcexpr = makeFuncExpr(funcoid, rettype, args_list,
+										   InvalidOid, InvalidOid,
+										   COERCE_EXPLICIT_CALL);
+
+					funcinfo.fn_expr = (Node *) funcexpr;
+
+					{
+						FunctionCallInfo fcinfo_local;
+						int j;
+
+						fcinfo_local = (FunctionCallInfo) palloc(SizeForFunctionCallInfo(ncolumns));
+						InitFunctionCallInfoData(*fcinfo_local, &funcinfo, ncolumns, InvalidOid, NULL, NULL);
+						for (j = 0; j < ncolumns; j++)
+						{
+							fcinfo_local->args[j].value = col_values[j];
+							fcinfo_local->args[j].isnull = col_nulls[j];
+						}
+
+						vec_datum = FunctionCallInvoke(fcinfo_local);
+						if (fcinfo_local->isnull)
+						{
+							pfree(fcinfo_local);
+							pfree(argtypes_arr);
+							pfree(col_values);
+							pfree(col_nulls);
+							pfree(col_types);
+							list_free(colnames_list);
+							continue;
+						}
+						pfree(fcinfo_local);
+					}
+
+					pfree(argtypes_arr);
+
+					modify_attnums[0] = attnum;
+					modify_values[0] = vec_datum;
+					modify_nulls[0] = false;
+
+					rettuple = heap_modify_tuple_by_cols(newtuple, tupdesc, 1,
+														 modify_attnums, modify_values, modify_nulls);
+					newtuple = rettuple;
+				}
+				else
+				{
+					elog(LOG, "vectorize_trigger: function '%s' with %d args not found", accessMethod, ncolumns);
+				}
+			}
+
+			pfree(col_values);
+			pfree(col_nulls);
+			pfree(col_types);
+			list_free(colnames_list);
 		}
 	}
 

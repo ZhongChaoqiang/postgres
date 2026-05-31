@@ -47,6 +47,7 @@ typedef struct TupleConstr
 	bool		has_generated_virtual;
 	bool		has_generated_predict;
 	bool		has_generated_embedding;
+	bool		has_generated_vectorize;
 } TupleConstr;
 
 /*
@@ -80,6 +81,7 @@ typedef struct CompactAttribute
 	bool		attgenerated;	/* FormData_pg_attribute.attgenerated != '\0' */
 	bool		attpredict;		/* FormData_pg_attribute.attpredict */
 	bool		attembedding;	/* FormData_pg_attribute.attembedding */
+	bool		attvectorize;	/* FormData_pg_attribute.attvectorize */
 	char		attnullability; /* status of not-null constraint, see below */
 	uint8		attalignby;		/* alignment requirement in bytes */
 } CompactAttribute;

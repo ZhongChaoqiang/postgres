@@ -768,6 +768,7 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 	slot[slotCount]->tts_values[Anum_pg_attribute_attgenerated - 1] = CharGetDatum(attrs->attgenerated);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attpredict - 1] = BoolGetDatum(attrs->attpredict);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attembedding - 1] = BoolGetDatum(attrs->attembedding);
+	slot[slotCount]->tts_values[Anum_pg_attribute_attvectorize - 1] = BoolGetDatum(attrs->attvectorize);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attisdropped - 1] = BoolGetDatum(attrs->attisdropped);
 	slot[slotCount]->tts_values[Anum_pg_attribute_atthidden - 1] = BoolGetDatum(attrs->atthidden);
 	slot[slotCount]->tts_values[Anum_pg_attribute_attislocal - 1] = BoolGetDatum(attrs->attislocal);
@@ -3206,7 +3207,7 @@ check_nested_generated_walker(Node *node, void *context)
 			Relation	rel = relation_open(relid, AccessShareLock);
 			Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
 
-			if (!attr->attembedding)
+			if (!attr->attembedding && !attr->attvectorize)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("cannot use generated column \"%s\" in column generation expression",
@@ -3351,7 +3352,8 @@ cookDefault(ParseState *pstate,
 		check_nested_generated(pstate, expr);
 
 		if (attgenerated != ATTRIBUTE_GENERATED_PREDICT &&
-			attgenerated != ATTRIBUTE_GENERATED_EMBEDDING)
+			attgenerated != ATTRIBUTE_GENERATED_EMBEDDING &&
+			attgenerated != ATTRIBUTE_GENERATED_EMBEDDINGS)
 		{
 			if (contain_mutable_functions_after_planning((Expr *) expr))
 				ereport(ERROR,

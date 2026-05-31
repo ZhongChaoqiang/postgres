@@ -369,6 +369,8 @@ CreateTupleDescCopyConstr(TupleDesc tupdesc)
 		cpy->has_generated_stored = constr->has_generated_stored;
 		cpy->has_generated_virtual = constr->has_generated_virtual;
 		cpy->has_generated_predict = constr->has_generated_predict;
+		cpy->has_generated_embedding = constr->has_generated_embedding;
+		cpy->has_generated_vectorize = constr->has_generated_vectorize;
 
 		if ((cpy->num_defval = constr->num_defval) > 0)
 		{
@@ -689,6 +691,10 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 			return false;
 		if (constr1->has_generated_predict != constr2->has_generated_predict)
 			return false;
+		if (constr1->has_generated_embedding != constr2->has_generated_embedding)
+			return false;
+		if (constr1->has_generated_vectorize != constr2->has_generated_vectorize)
+			return false;
 		n = constr1->num_defval;
 		if (n != (int) constr2->num_defval)
 			return false;
@@ -892,6 +898,8 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attidentity = '\0';
 	att->attgenerated = '\0';
 	att->attpredict = false;
+	att->attembedding = false;
+	att->attvectorize = false;
 	att->attisdropped = false;
 	att->atthidden = false;
 	att->attislocal = true;
@@ -957,6 +965,8 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 	att->attidentity = '\0';
 	att->attgenerated = '\0';
 	att->attpredict = false;
+	att->attembedding = false;
+	att->attvectorize = false;
 	att->attisdropped = false;
 	att->atthidden = false;
 	att->attislocal = true;

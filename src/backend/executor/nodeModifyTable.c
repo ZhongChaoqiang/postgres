@@ -479,7 +479,8 @@ ExecInitGenerated(ResultRelInfo *resultRelInfo,
 			Expr	   *expr;
 
 			if (attgenerated == ATTRIBUTE_GENERATED_PREDICT ||
-				attgenerated == ATTRIBUTE_GENERATED_EMBEDDING)
+				attgenerated == ATTRIBUTE_GENERATED_EMBEDDING ||
+				attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS)
 				continue;
 
 			/* Fetch the GENERATED AS expression tree */
