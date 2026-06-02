@@ -18,7 +18,7 @@ DLM（Deep Learning Model）多列组合向量化功能允许用户选择表中�
 
 ### 1.3 两种语法，统一内核
 
-VECTORIZE 提供两种语法入口，用户可以按场景选择：
+EMBEDDINGS 提供两种语法入口，用户可以按场景选择：
 
 | 语法 | 形式 | 适用场景 | 类比 |
 |------|------|---------|------|
@@ -36,16 +36,16 @@ VECTORIZE 提供两种语法入口，用户可以按场景选择：
                 │
                 ▼
         统一内部机制
-        ├── 隐藏向量列: name vector(N)  (atthidden=true, attvectorize=true)
-        ├── 触发器: vectorize_trigger
+        ├── 隐藏向量列: name vector(N)  (atthidden=true, attembeddings=true)
+        ├── 触发器: embeddings_trigger
         ├── 向量索引: hnsw/ivfflat
-        ├── 系统表: pg_vectorize
-        └── 查询重写: rewrite_vectorize_query
+        ├── 系统表: pg_embeddings
+        └── 查询重写: rewrite_embeddings_query
 ```
 
 ### 1.4 与 EMBEDDING 的关系
 
-| 特性 | EMBEDDING | VECTORIZE（列级） | VECTORIZE（表级） |
+| 特性 | EMBEDDING | EMBEDDINGS（列级） | EMBEDDINGS（表级） |
 |------|-----------|-----------------|-----------------|
 | 语法 | `col text EMBEDDING AS (...) STORED` | `name EMBEDDINGS AS (...) STORED` | `CREATE EMBEDDINGS name ON t (...) USING func` |
 | 语义 | 列级属性 | 列级属性 | 表级操作 |
@@ -61,15 +61,15 @@ VECTORIZE 提供两种语法入口，用户可以按场景选择：
 ### 2.1 方式一：CREATE EMBEDDINGS（表级，类似 CREATE INDEX）
 
 ```sql
-CREATE EMBEDDINGS vectorize_name ON table_name (column_list)
+CREATE EMBEDDINGS embeddings_name ON table_name (column_list)
     USING function_name
     [ WITH (options) ];
 
-DROP EMBEDDINGS vectorize_name ON table_name;
+DROP EMBEDDINGS embeddings_name ON table_name;
 ```
 
 **语法说明**：
-- `vectorize_name`：向量化名称，同时作为隐藏向量列的列名
+- `embeddings_name`：向量化名称，同时作为隐藏向量列的列名
 - `ON table_name`：目标表
 - `(column_list)`：参与向量化的列名列表
 - `USING function_name`：向量化函数名
@@ -181,10 +181,10 @@ CREATE TABLE customers (
 ```
 
 两者都创建：
-- 隐藏列 `demographic vector(128)`（`atthidden=true, attvectorize=true`）
-- 触发器 `vectorize_trigger_demographic_{oid}`
+- 隐藏列 `demographic vector(128)`（`atthidden=true, attembeddings=true`）
+- 触发器 `embeddings_trigger_demographic_{oid}`
 - 向量索引 `customers_demographic_vec_idx`
-- pg_vectorize 元数据
+- pg_embeddings 元数据
 
 ### 2.5 WITH 选项
 
@@ -209,7 +209,7 @@ CREATE TABLE articles (
     priority int
 ) WITH (vector_len = 64);
 
--- 再添加 VECTORIZE（不影响表结构）
+-- 再添加 EMBEDDINGS（不影响表结构）
 CREATE EMBEDDINGS meta ON articles (category, priority)
     USING ft_transformer_embedding
     WITH (vector_len = 64);
@@ -246,16 +246,16 @@ pg_attribute:
   attnum=5  attname='demographic'   atttypid=vector   atthidden=t  ← 自动创建，向量化名即列名
 ```
 
-隐藏列命名规则：**直接使用向量化名**（不加 `_vectorize` 后缀）
+隐藏列命名规则：**直接使用向量化名**（不加 `_embeddings` 后缀）
 
 这样设计的核心原因：向量化名必须是真实存在的列，否则查询时解析器无法识别 `demographic <=> ROW(...)` 这样的表达式。
 
 ### 3.2 系统目录
 
-#### 3.2.1 pg_vectorize 系统表
+#### 3.2.1 pg_embeddings 系统表
 
 ```sql
-CREATE TABLE pg_vectorize (
+CREATE TABLE pg_embeddings (
     oid         oid PRIMARY KEY,
     vecname     name NOT NULL,       -- 向量化名称（CREATE EMBEDDINGS 指定的名称）
     vecrelid    oid NOT NULL,        -- 所属表的 OID
@@ -271,7 +271,7 @@ CREATE TABLE pg_vectorize (
 #### 3.2.2 pg_attribute 扩展
 
 ```c
-bool        attvectorize BKI_DEFAULT(f);   /* 是否为 VECTORIZE 隐藏列 */
+bool        attembeddings BKI_DEFAULT(f);   /* 是否为 EMBEDDINGS 隐藏列 */
 ```
 
 #### 3.2.3 新增 attgenerated 值
@@ -287,23 +287,23 @@ bool        attvectorize BKI_DEFAULT(f);   /* 是否为 VECTORIZE 隐藏列 */
 bool    has_generated_embeddings;
 
 // CompactAttribute
-bool    attvectorize;
+bool    attembeddings;
 ```
 
 ### 3.3 触发器
 
-每个 VECTORIZE 创建一个 BEFORE INSERT OR UPDATE 触发器：
+每个 EMBEDDINGS 创建一个 BEFORE INSERT OR UPDATE 触发器：
 
-- 触发器名称：`vectorize_trigger_{vectorize_name}_{oid}`
-- 触发器函数：`vectorize_trigger()`
+- 触发器名称：`embeddings_trigger_{embeddings_name}_{oid}`
+- 触发器函数：`embeddings_trigger()`
 - 触发时机：BEFORE INSERT OR UPDATE
 - 粒度：ROW 级别
 
 ### 3.4 向量索引
 
-每个 VECTORIZE 自动创建向量索引：
+每个 EMBEDDINGS 自动创建向量索引：
 
-- 索引名称：`{table}_{vectorize_name}_vec_idx`
+- 索引名称：`{table}_{embeddings_name}_vec_idx`
 - 索引类型：由 `vector_index` 选项决定（默认 hnsw）
 - 距离类型：由 `vector_distance` 选项决定（默认 vector_cosine_ops）
 
@@ -321,25 +321,25 @@ CREATE EMBEDDINGS demographic ON customers (age, income, category)
     │
     ├── 2. 添加隐藏向量列
     │   ├── ALTER TABLE customers ADD COLUMN demographic vector(128)
-    │   ├── 设置 atthidden=true, attvectorize=true
+    │   ├── 设置 atthidden=true, attembeddings=true
     │   └── 设置 attgenerated=ATTRIBUTE_GENERATED_EMBEDDINGS
     │
     ├── 3. 创建触发器
-    │   └── CREATE TRIGGER vectorize_trigger_demographic_{oid}
+    │   └── CREATE TRIGGER embeddings_trigger_demographic_{oid}
     │       BEFORE INSERT OR UPDATE ON customers
-    │       FOR EACH ROW EXECUTE FUNCTION vectorize_trigger()
+    │       FOR EACH ROW EXECUTE FUNCTION embeddings_trigger()
     │
     ├── 4. 创建向量索引
     │   └── CREATE INDEX customers_demographic_vec_idx
     │       ON customers USING hnsw (demographic vector_cosine_ops)
     │
     ├── 5. 插入元数据
-    │   └── INSERT INTO pg_vectorize (vecname, vecrelid, veccolumns, vecfunc, vecattnum, ...)
+    │   └── INSERT INTO pg_embeddings (vecname, vecrelid, veccolumns, vecfunc, vecattnum, ...)
     │       VALUES ('demographic', customers_oid, '{age,income,category}', func_oid, attnum, ...)
     │
     └── 6. 回填现有数据
-        └── UPDATE customers SET demographic_vectorize = ft_transformer_embedding(age, income, category)
-            WHERE demographic_vectorize IS NULL;
+        └── UPDATE customers SET demographic = ft_transformer_embedding(age, income, category)
+            WHERE demographic IS NULL;
 ```
 
 ### 3.6 删除流程
@@ -347,10 +347,10 @@ CREATE EMBEDDINGS demographic ON customers (age, income, category)
 ```
 DROP EMBEDDINGS demographic ON customers;
     │
-    ├── 1. 从 pg_vectorize 查找元数据
+    ├── 1. 从 pg_embeddings 查找元数据
     │
     ├── 2. 删除触发器
-    │   └── DROP TRIGGER vectorize_trigger_demographic_{oid} ON customers
+    │   └── DROP TRIGGER embeddings_trigger_demographic_{oid} ON customers
     │
     ├── 3. 删除向量索引
     │   └── DROP INDEX customers_demographic_vec_idx
@@ -359,7 +359,7 @@ DROP EMBEDDINGS demographic ON customers;
     │   └── ALTER TABLE customers DROP COLUMN demographic
     │
     └── 5. 删除元数据
-        └── DELETE FROM pg_vectorize WHERE vecname = 'demographic' AND vecrelid = customers_oid
+        └── DELETE FROM pg_embeddings WHERE vecname = 'demographic' AND vecrelid = customers_oid
 ```
 
 ## 4. 向量化函数设计
@@ -367,7 +367,7 @@ DROP EMBEDDINGS demographic ON customers;
 ### 4.1 函数签名
 
 ```sql
--- 多参数版本（推荐，用于 VECTORIZE 触发器内部调用）
+-- 多参数版本（推荐，用于 EMBEDDINGS 触发器内部调用）
 CREATE FUNCTION ft_transformer_embedding(VARIADIC input_values anyarray) RETURNS vector
     AS 'jolix_ft_transformer', 'ft_transformer_embedding'
     LANGUAGE C IMMUTABLE;
@@ -400,8 +400,8 @@ CREATE FUNCTION ft_transformer_embedding(input_row record) RETURNS vector
 ### 4.3 查询用辅助函数
 
 ```sql
-CREATE FUNCTION ft_transformer_vectorize(VARIADIC values anyarray) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_vectorize'
+CREATE FUNCTION ft_transformer_embedding(VARIADIC values anyarray) RETURNS vector
+    AS 'jolix_ft_transformer', 'ft_transformer_embedding'
     LANGUAGE C IMMUTABLE;
 ```
 
@@ -415,12 +415,12 @@ CREATE FUNCTION ft_transformer_vectorize(VARIADIC values anyarray) RETURNS vecto
 
 ## 5. 触发器行为设计
 
-### 5.1 vectorize_trigger 执行流程
+### 5.1 embeddings_trigger 执行流程
 
 ```
-INSERT/UPDATE → BEFORE触发器 → vectorize_trigger
+INSERT/UPDATE → BEFORE触发器 → embeddings_trigger
     │
-    ├── 从 pg_vectorize 获取该表的所有向量化组
+    ├── 从 pg_embeddings 获取该表的所有向量化组
     │
     ├── 对每个向量化组：
     │   │
@@ -445,8 +445,8 @@ INSERT/UPDATE → BEFORE触发器 → vectorize_trigger
 
 ```c
 static bool
-vectorize_columns_changed(HeapTuple old_tuple, HeapTuple new_tuple,
-                          TupleDesc tupdesc, List *source_attnums)
+embeddings_columns_changed(HeapTuple old_tuple, HeapTuple new_tuple,
+                           TupleDesc tupdesc, List *source_attnums)
 {
     ListCell *lc;
     foreach(lc, source_attnums)
@@ -479,18 +479,18 @@ EMBEDDING 的查询重写能工作，是因为 `content` 是一个**真实的可
 
 ### 6.2 解决方案：向量化名即隐藏列名
 
-**关键决策**：隐藏向量列直接用向量化名命名，不加 `_vectorize` 后缀。
+**关键决策**：隐藏向量列直接用向量化名命名，不加 `_embeddings` 后缀。
 
 ```
 CREATE EMBEDDINGS demographic ON customers (age, income, category) USING ft_transformer_embedding;
-→ 创建隐藏列: demographic vector(128)   （不是 demographic_vectorize）
+ 创建隐藏列: demographic vector(128)   （不是 demographic_embeddings）
 ```
 
 这样 `demographic` 就是一个**真实存在的隐藏列**（`atthidden=true`），类型为 `vector`。解析器可以正常解析 `demographic <=> ...`，因为 `demographic` 确实是表的一个列（只是隐藏的）。
 
 **与 EMBEDDING 的对比**：
 
-| | EMBEDDING | VECTORIZE |
+| | EMBEDDING | EMBEDDINGS |
 |---|---|---|
 | 用户写的 | `content <=> 'text'` | `demographic <=> ROW(35, 50000.0, 'premium')` |
 | content 是 | 可见的 text 列 | — |
@@ -498,7 +498,7 @@ CREATE EMBEDDINGS demographic ON customers (age, income, category) USING ft_tran
 | 解析器能识别？ | ✅ content 是真实列 | ✅ demographic 是真实列（隐藏但存在） |
 | 重写步骤 | 3步（换列+换操作符+转换右操作数） | 1步（仅转换右操作数） |
 
-VECTORIZE 的查询重写比 EMBEDDING **更简单**，因为列本身就是 vector 类型，不需要换列和换操作符。
+EMBEDDINGS 的查询重写比 EMBEDDING **更简单**，因为列本身就是 vector 类型，不需要换列和换操作符。
 
 ### 6.3 名称冲突处理
 
@@ -532,13 +532,13 @@ LIMIT 10;
 demographic <=> ROW(35, 50000.0, 'premium')
 
 -- 重写后
-demographic <=> ft_transformer_vectorize(35, 50000.0, 'premium')
+demographic <=> ft_transformer_embedding(35, 50000.0, 'premium')
 ```
 
 重写规则：
 1. `demographic` → 不变（已经是 vector 类型的隐藏列）
 2. 操作符 → 不变（已经是 vector 版本的 `<=>`）
-3. `ROW(v1,v2)` → `ft_transformer_vectorize(v1,v2)`（转换右操作数）
+3. `ROW(v1,v2)` → `ft_transformer_embedding(v1,v2)`（转换右操作数）
 
 **为什么只有1步？** 因为 `demographic` 本身就是 `vector` 类型的隐藏列，不需要像 EMBEDDING 那样换列和换操作符。
 
@@ -546,8 +546,8 @@ demographic <=> ft_transformer_vectorize(35, 50000.0, 'premium')
 
 ```sql
 SELECT * FROM customers
-WHERE demographic <=> ft_transformer_vectorize(35, 50000.0, 'premium') < 0.5
-ORDER BY demographic <=> ft_transformer_vectorize(35, 50000.0, 'premium')
+WHERE demographic <=> ft_transformer_embedding(35, 50000.0, 'premium') < 0.5
+ORDER BY demographic <=> ft_transformer_embedding(35, 50000.0, 'premium')
 LIMIT 10;
 ```
 
@@ -572,15 +572,15 @@ LIMIT 10;
 if (parsetree->commandType == CMD_SELECT)
 {
     rewrite_embedding_query(parsetree);
-    rewrite_vectorize_query(parsetree);
+    rewrite_embeddings_query(parsetree);
 }
 ```
 
 #### 6.5.2 重写触发条件
 
-当满足以下条件时触发 VECTORIZE 查询重写：
+当满足以下条件时触发 EMBEDDINGS 查询重写：
 1. 操作符是向量距离操作符（`<=>`, `<->`, `<#>` 等）
-2. 其中一个操作数是 `Var` 节点，引用了 `attvectorize=true` 的隐藏列
+2. 其中一个操作数是 `Var` 节点，引用了 `attembeddings=true` 的隐藏列
 3. 另一个操作数是 `RowExpr` 节点
 
 #### 6.5.3 is_embeddings_var 检测
@@ -588,7 +588,7 @@ if (parsetree->commandType == CMD_SELECT)
 ```c
 static bool
 is_embeddings_var(Var *var, Query *query,
-                 Oid *out_relid, Oid *out_vecfunc, char **out_vecname)
+                 Oid *out_relid, Oid *out_embeddings_func, char **out_vecname)
 {
     RangeTblEntry *rte;
     Relation rel;
@@ -615,18 +615,18 @@ is_embeddings_var(Var *var, Query *query,
 
     attr = TupleDescAttr(tupdesc, var->varattno - 1);
 
-    /* 检查是否为 VECTORIZE 隐藏列 */
-    if (!(attr->attvectorize && attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS))
+    /* 检查是否为 EMBEDDINGS 隐藏列 */
+    if (!(attr->attembeddings && attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS))
     {
         table_close(rel, AccessShareLock);
         return false;
     }
 
-    /* 从 pg_vectorize 获取向量化函数 */
-    Oid vecfunc = get_vectorize_func_oid(rte->relid, NameStr(attr->attname));
+    /* 从 pg_embeddings 获取向量化函数 */
+    Oid vecfunc = get_embeddings_func_oid(rte->relid, NameStr(attr->attname));
 
     if (out_relid) *out_relid = rte->relid;
-    if (out_vecfunc) *out_vecfunc = vecfunc;
+    if (out_embeddings_func) *out_embeddings_func = vecfunc;
     if (out_vecname) *out_vecname = pstrdup(NameStr(attr->attname));
 
     table_close(rel, AccessShareLock);
@@ -638,7 +638,7 @@ is_embeddings_var(Var *var, Query *query,
 
 ```c
 static Node *
-rewrite_vectorize_opexpr(OpExpr *opexpr, Query *query)
+rewrite_embeddings_opexpr(OpExpr *opexpr, Query *query)
 {
     Node *left, *right;
     Oid relid, vecfunc;
@@ -661,8 +661,8 @@ rewrite_vectorize_opexpr(OpExpr *opexpr, Query *query)
         {
             /* 列引用不需要替换：demographic 本身就是 vector 隐藏列 */
             /* 操作符不需要替换：已经是 vector 版本 */
-            /* 仅转换右操作数：ROW(v1,v2) → ft_transformer_vectorize(v1,v2) */
-            FuncExpr *vec_func = make_vectorize_func(vecfunc, (RowExpr *) right);
+            /* 仅转换右操作数：ROW(v1,v2) → ft_transformer_embedding(v1,v2) */
+            FuncExpr *vec_func = make_embeddings_func(vecfunc, (RowExpr *) right);
             lsecond(opexpr->args) = (Node *) vec_func;
             pfree(vecname);
         }
@@ -673,7 +673,7 @@ rewrite_vectorize_opexpr(OpExpr *opexpr, Query *query)
         Var *var = (Var *) right;
         if (is_embeddings_var(var, query, &relid, &vecfunc, &vecname))
         {
-            FuncExpr *vec_func = make_vectorize_func(vecfunc, (RowExpr *) left);
+            FuncExpr *vec_func = make_embeddings_func(vecfunc, (RowExpr *) left);
             linitial(opexpr->args) = (Node *) vec_func;
             pfree(vecname);
         }
@@ -683,11 +683,11 @@ rewrite_vectorize_opexpr(OpExpr *opexpr, Query *query)
 }
 ```
 
-#### 6.5.5 make_vectorize_func 实现
+#### 6.5.5 make_embeddings_func 实现
 
 ```c
 static FuncExpr *
-make_vectorize_func(Oid vecfunc_oid, RowExpr *rowexpr)
+make_embeddings_func(Oid vecfunc_oid, RowExpr *rowexpr)
 {
     FuncExpr *funcexpr;
     List *func_args = NIL;
@@ -715,15 +715,15 @@ make_vectorize_func(Oid vecfunc_oid, RowExpr *rowexpr)
 
 ### 6.6 与 EMBEDDING 查询重写的对比
 
-| 步骤 | EMBEDDING 重写 | VECTORIZE 重写 |
+| 步骤 | EMBEDDING 重写 | EMBEDDINGS 重写 |
 |------|---------------|---------------|
-| 1. 检测 | `attembedding=true` 的可见列 | `attvectorize=true && attgenerated='z'` 的隐藏列 |
+| 1. 检测 | `attembedding=true` 的可见列 | `attembeddings=true && attgenerated='z'` 的隐藏列 |
 | 2. 换列 | `content` → `content_embedding` | **不需要**（列名就是向量化名） |
 | 3. 换操作符 | text版 `<=>` → vector版 `<=>` | **不需要**（列已是 vector 类型） |
-| 4. 转换右操作数 | `'text'` → `st_embedding('text')::vector` | `ROW(v1,v2)` → `ft_transformer_vectorize(v1,v2)` |
+| 4. 转换右操作数 | `'text'` → `st_embedding('text')::vector` | `ROW(v1,v2)` → `ft_transformer_embedding(v1,v2)` |
 | **总步骤** | **3步** | **1步** |
 
-VECTORIZE 的查询重写更简单，因为向量化名直接就是 vector 类型的隐藏列，不需要换列和换操作符。
+EMBEDDINGS 的查询重写更简单，因为向量化名直接就是 vector 类型的隐藏列，不需要换列和换操作符。
 
 ### 6.7 隐藏列的可见性
 
@@ -736,7 +736,7 @@ VECTORIZE 的查询重写更简单，因为向量化名直接就是 vector 类�
 | `WHERE demographic <=> ROW(...)` | 正常工作 ✅ |
 | `ORDER BY demographic <=> ROW(...)` | 正常工作 ✅ |
 | `INSERT INTO customers ...` | 不需要指定 demographic ✅（触发器自动填充） |
-| `\d customers` | 不显示 demographic 列 ✅（但显示 Vectorize 信息） |
+| `\d customers` | 不显示 demographic 列 ✅（但显示 Embeddings 信息） |
 
 这与 EMBEDDING 的 `content_embedding` 隐藏列行为完全一致。
 
@@ -750,13 +750,13 @@ CREATE EMBEDDINGS demographic ON customers (age, income, category)
     │
     ├── [gram.y] 解析 → EmbeddingsStmt 节点
     │
-    ├── [commands/vectorizecmds.c] 执行创建：
+    ├── [commands/embeddingscmds.c] 执行创建：
     │   ├── 验证表、列、函数存在性
     │   ├── ALTER TABLE ADD COLUMN demographic vector(128)
-    │   │   └── 设置 atthidden=true, attvectorize=true, attgenerated='z'
-    │   ├── CREATE TRIGGER vectorize_trigger_demographic_{oid}
+    │   │   └── 设置 atthidden=true, attembeddings=true, attgenerated='z'
+    │   ├── CREATE TRIGGER embeddings_trigger_demographic_{oid}
     │   ├── CREATE INDEX customers_demographic_vec_idx
-    │   ├── INSERT INTO pg_vectorize (元数据)
+    │   ├── INSERT INTO pg_embeddings (元数据)
     │   └── 回填现有数据
     │
     └── 完成
@@ -767,8 +767,8 @@ CREATE EMBEDDINGS demographic ON customers (age, income, category)
 ```
 INSERT INTO customers (id, age, income, category) VALUES (1, 35, 50000, 'premium')
     │
-    ├── [vectorize_trigger] BEFORE INSERT 触发
-    │   ├── 从 pg_vectorize 获取向量化组
+    ├── [embeddings_trigger] BEFORE INSERT 触发
+    │   ├── 从 pg_embeddings 获取向量化组
     │   ├── 对 'demographic' 组：
     │   │   ├── 提取源列值: age=35, income=50000, category='premium'
     │   │   ├── 调用 ft_transformer_embedding(35, 50000, 'premium')
@@ -787,8 +787,8 @@ SELECT * FROM customers
 ORDER BY demographic <=> ROW(35, 50000.0, 'premium')
 LIMIT 10;
     │
-    ├── [rewrite_vectorize_query] 查询重写（1步）：
-    │   └── ROW(35, 50000.0, 'premium') → ft_transformer_vectorize(35, 50000.0, 'premium')
+    ├── [rewrite_embeddings_query] 查询重写（1步）：
+    │   └── ROW(35, 50000.0, 'premium') → ft_transformer_embedding(35, 50000.0, 'premium')
     │       （demographic 不变，已是 vector 隐藏列；操作符不变，已是 vector 版本）
     │
     └── [执行器] 使用 pgvector 向量距离计算 + 向量索引
@@ -799,13 +799,13 @@ LIMIT 10;
 ```
 DROP EMBEDDINGS demographic ON customers;
     │
-    ├── [commands/vectorizecmds.c] 执行删除：
-    │   ├── DROP TRIGGER vectorize_trigger_demographic_{oid}
+    ├── [commands/embeddingscmds.c] 执行删除：
+    │   ├── DROP TRIGGER embeddings_trigger_demographic_{oid}
     │   ├── DROP INDEX customers_demographic_vec_idx
-    │   ├── ALTER TABLE DROP COLUMN demographic_vectorize
-    │   └── DELETE FROM pg_vectorize WHERE vecname='demographic'
+    │   ├── ALTER TABLE DROP COLUMN demographic
+    │   └── DELETE FROM pg_embeddings WHERE vecname='demographic'
     │
-    └── 完成（表恢复到创建 VECTORIZE 之前的状态）
+    └── 完成（表恢复到创建 EMBEDDINGS 之前的状态）
 ```
 
 ## 8. 解析器扩展设计
@@ -814,7 +814,7 @@ DROP EMBEDDINGS demographic ON customers;
 
 ```c
 // kwlist.h
-PG_KEYWORD("vectorize", EMBEDDINGS, UNRESERVED_KEYWORD, BARE_LABEL)
+PG_KEYWORD("embeddings", EMBEDDINGS, UNRESERVED_KEYWORD, BARE_LABEL)
 ```
 
 ### 8.2 新增语法节点
@@ -844,16 +844,16 @@ typedef struct DropEmbeddingsStmt
 
 ### 8.3 gram.y 语法规则
 
-#### 8.3.1 列级语法：opt_vectorize_clause（与 opt_embedding_clause 对称）
+#### 8.3.1 列级语法：opt_embeddings_clause（与 opt_embedding_clause 对称）
 
 ```yacc
 columnDef: ColId Typename opt_column_storage opt_column_compression
            create_generic_options ColQualList
-           opt_predict_clause opt_embedding_clause opt_vectorize_clause
+           opt_predict_clause opt_embedding_clause opt_embeddings_clause
                 { ... }
     ;
 
-opt_vectorize_clause:
+opt_embeddings_clause:
         EMBEDDINGS AS '(' a_expr ')' STORED
             {
                 Constraint *n = makeNode(Constraint);
@@ -865,7 +865,7 @@ opt_vectorize_clause:
                 n->location = @1;
                 $$ = (Node *) n;
             }
-        | VECTORIZE
+        | EMBEDDINGS
             { $$ = makeInteger(1); }
         | /*EMPTY*/
             { $$ = NULL; }
@@ -880,9 +880,9 @@ opt_embedding_clause:
         | EMBEDDING                            → 标记
         | /*EMPTY*/
 
-opt_vectorize_clause:
+opt_embeddings_clause:
         EMBEDDINGS AS '(' a_expr ')' STORED    → CONSTR_EMBEDDINGS
-        | VECTORIZE                           → 标记
+        | EMBEDDINGS                           → 标记
         | /*EMPTY*/
 ```
 
@@ -894,7 +894,7 @@ Stmt: ... | EmbeddingsStmt | DropEmbeddingsStmt
 
 EmbeddingsStmt:
         CREATE EMBEDDINGS name ON relation_expr '(' column_list ')'
-            USING ColId opt_vectorize_with_clause opt_if_not_exists
+            USING ColId opt_embeddings_with_clause opt_if_not_exists
             {
                 EmbeddingsStmt *n = makeNode(EmbeddingsStmt);
                 n->vecname = $3;
@@ -918,7 +918,7 @@ DropEmbeddingsStmt:
             }
     ;
 
-opt_vectorize_with_clause:
+opt_embeddings_with_clause:
         WITH '(' reloptions_list ')'    { $$ = $3; }
         | /*EMPTY*/                      { $$ = NIL; }
     ;
@@ -936,7 +936,7 @@ column_list:
 ### 9.1 新增命令处理文件
 
 ```
-src/backend/commands/vectorizecmds.c
+src/backend/commands/embeddingscmds.c
 ```
 
 ### 9.2 列级语法处理（parse_utilcmd.c）
@@ -969,7 +969,7 @@ if (column->is_embeddings)
      *
      * 与 EMBEDDING 的区别：
      * - EMBEDDING: content(text,可见) + content_embedding(vector,隐藏) = 2列
-     * - VECTORIZE: demographic(vector,隐藏) = 1列
+     * - EMBEDDINGS: demographic(vector,隐藏) = 1列
      */
 
     /* 强制设置类型为 vector(vector_len) */
@@ -985,7 +985,7 @@ if (column->is_embeddings)
     /* 设置隐藏 */
     column->is_hidden = true;
     column->generated = ATTRIBUTE_GENERATED_EMBEDDINGS;
-    column->attvectorize = true;
+    column->attembeddings = true;
 
     /* 创建向量索引 */
     if (cxt->vector_index != NULL && cxt->vector_distance != NULL)
@@ -1007,11 +1007,11 @@ if (column->is_embeddings)
 }
 ```
 
-### 9.3 表级语法处理（vectorizecmds.c）
+### 9.3 表级语法处理（embeddingscmds.c）
 
 ```c
 Oid
-CreateVectorize(EmbeddingsStmt *stmt, const char *queryString)
+CreateEmbeddings(EmbeddingsStmt *stmt, const char *queryString)
 {
     Oid relid;
     Relation rel;
@@ -1024,44 +1024,44 @@ CreateVectorize(EmbeddingsStmt *stmt, const char *queryString)
     rel = table_open(relid, AccessExclusiveLock);
 
     /* 2. 验证源列存在 */
-    validate_vectorize_columns(rel, stmt->veccolumns);
+    validate_embeddings_columns(rel, stmt->veccolumns);
 
     /* 3. 验证向量化函数存在 */
     vecfunc_oid = LookupFuncName(list_make1(makeString(stmt->vecfunc)), ...);
 
     /* 4. 验证名称唯一且不与现有列冲突 */
-    if (vectorize_name_exists(relid, stmt->vecname) && !stmt->if_not_exists)
+    if (embeddings_name_exists(relid, stmt->vecname) && !stmt->if_not_exists)
         ereport(ERROR, ...);
     if (column_name_exists(rel, stmt->vecname))
         ereport(ERROR, "column \"%s\" already exists in table \"%s\"", ...);
 
     /* 5. 添加隐藏向量列（向量化名即列名） */
     vec_colname = stmt->vecname;
-    vec_attnum = add_vectorize_hidden_column(rel, vec_colname, options);
+    vec_attnum = add_embeddings_hidden_column(rel, vec_colname, options);
 
     /* 6. 创建触发器 */
-    create_vectorize_trigger(rel, stmt->vecname, vec_colname);
+    create_embeddings_trigger(rel, stmt->vecname, vec_colname);
 
     /* 7. 创建向量索引 */
-    create_vectorize_index(rel, vec_colname, options);
+    create_embeddings_index(rel, vec_colname, options);
 
-    /* 8. 插入 pg_vectorize 元数据 */
-    insert_vectorize_metadata(relid, stmt->vecname, stmt->veccolumns,
+    /* 8. 插入 pg_embeddings 元数据 */
+    insert_embeddings_metadata(relid, stmt->vecname, stmt->veccolumns,
                               vecfunc_oid, vec_attnum, options);
 
     /* 9. 回填现有数据 */
-    backfill_vectorize_data(rel, vec_colname, stmt->veccolumns, vecfunc_oid);
+    backfill_embeddings_data(rel, vec_colname, stmt->veccolumns, vecfunc_oid);
 
     table_close(rel, AccessExclusiveLock);
     return vec_attnum;
 }
 ```
 
-### 9.3 DropVectorize 主函数
+### 9.3 DropEmbeddings 主函数
 
 ```c
 void
-DropVectorize(DropEmbeddingsStmt *stmt)
+DropEmbeddings(DropEmbeddingsStmt *stmt)
 {
     Oid relid;
     Relation rel;
@@ -1070,8 +1070,8 @@ DropVectorize(DropEmbeddingsStmt *stmt)
     relid = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock, ...);
     rel = table_open(relid, AccessExclusiveLock);
 
-    /* 查找 pg_vectorize 元数据 */
-    vectup = get_vectorize_tuple(relid, stmt->vecname);
+    /* 查找 pg_embeddings 元数据 */
+    vectup = get_embeddings_tuple(relid, stmt->vecname);
     if (!HeapTupleIsValid(vectup))
     {
         if (stmt->if_exists)
@@ -1083,16 +1083,16 @@ DropVectorize(DropEmbeddingsStmt *stmt)
     }
 
     /* 删除触发器 */
-    drop_vectorize_trigger(rel, stmt->vecname);
+    drop_embeddings_trigger(rel, stmt->vecname);
 
     /* 删除向量索引 */
-    drop_vectorize_index(rel, stmt->vecname);
+    drop_embeddings_index(rel, stmt->vecname);
 
     /* 删除隐藏向量列 */
-    drop_vectorize_hidden_column(rel, stmt->vecname);
+    drop_embeddings_hidden_column(rel, stmt->vecname);
 
-    /* 删除 pg_vectorize 元数据 */
-    delete_vectorize_metadata(relid, stmt->vecname);
+    /* 删除 pg_embeddings 元数据 */
+    delete_embeddings_metadata(relid, stmt->vecname);
 
     table_close(rel, AccessExclusiveLock);
 }
@@ -1102,8 +1102,8 @@ DropVectorize(DropEmbeddingsStmt *stmt)
 
 ```c
 static void
-backfill_vectorize_data(Relation rel, const char *vec_colname,
-                        List *veccolumns, Oid vecfunc_oid)
+backfill_embeddings_data(Relation rel, const char *vec_colname,
+                         List *veccolumns, Oid vecfunc_oid)
 {
     /* 构建回填 SQL */
     StringInfoData query;
@@ -1150,7 +1150,7 @@ db=# \d customers
 Indexes:
     "customers_pkey" PRIMARY KEY, btree (id)
     "customers_demographic_vec_idx" hnsw (demographic vector_cosine_ops)
-Vectorize:
+Embeddings:
     "demographic" ON (age, income, category) USING ft_transformer_embedding WITH (vector_len=128)
 ```
 
@@ -1158,7 +1158,7 @@ Vectorize:
 
 ```
 db=# \dv
-List of Vectorize
+List of Embeddings
  Schema |    Name    |    Table    |     Columns      |       Function
 --------+------------+-------------+------------------+------------------------
  public | demographic| customers   | age, income, cat | ft_transformer_embedding
@@ -1191,8 +1191,8 @@ CREATE FUNCTION ft_transformer_embedding(VARIADIC input_values anyarray, model_n
     LANGUAGE C IMMUTABLE;
 
 -- 查询用辅助函数
-CREATE FUNCTION ft_transformer_vectorize(VARIADIC values anyarray) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_vectorize'
+CREATE FUNCTION ft_transformer_embedding(VARIADIC values anyarray) RETURNS vector
+    AS 'jolix_ft_transformer', 'ft_transformer_embedding'
     LANGUAGE C IMMUTABLE;
 ```
 
@@ -1221,7 +1221,7 @@ Datum ft_transformer_embedding(PG_FUNCTION_ARGS)
     PG_RETURN_POINTER(vector_result);
 }
 
-Datum ft_transformer_vectorize(PG_FUNCTION_ARGS)
+Datum ft_transformer_embedding(PG_FUNCTION_ARGS)
 {
     /* 同 ft_transformer_embedding */
 }
@@ -1231,28 +1231,28 @@ Datum ft_transformer_vectorize(PG_FUNCTION_ARGS)
 
 | 文件路径 | 功能说明 |
 |---------|----------|
-| `src/include/parser/kwlist.h` | 添加 VECTORIZE 关键字 |
+| `src/include/parser/kwlist.h` | 添加 EMBEDDINGS 关键字 |
 | `src/backend/parser/gram.y` | 添加 CREATE/DROP EMBEDDINGS 语法规则 |
 | `src/include/nodes/parsenodes.h` | 添加 EmbeddingsStmt、DropEmbeddingsStmt 节点 |
-| `src/include/catalog/pg_attribute.h` | 添加 attvectorize 字段；添加 ATTRIBUTE_GENERATED_EMBEDDINGS |
-| `src/include/access/tupdesc.h` | CompactAttribute 添加 attvectorize；TupleConstr 添加 has_generated_embeddings |
-| `src/include/catalog/pg_vectorize.h` | 新增 pg_vectorize 系统表定义 |
-| `src/include/catalog/indexing.h` | pg_vectorize 索引注册 |
-| `src/backend/catalog/pg_vectorize.c` | pg_vectorize 系统表操作函数 |
-| `src/backend/commands/vectorizecmds.c` | CreateVectorize / DropVectorize 实现（表级语法） |
-| `src/include/commands/vectorizecmds.h` | 函数声明 |
+| `src/include/catalog/pg_attribute.h` | 添加 attembeddings 字段；添加 ATTRIBUTE_GENERATED_EMBEDDINGS |
+| `src/include/access/tupdesc.h` | CompactAttribute 添加 attembeddings；TupleConstr 添加 has_generated_embeddings |
+| `src/include/catalog/pg_embeddings.h` | 新增 pg_embeddings 系统表定义 |
+| `src/include/catalog/indexing.h` | pg_embeddings 索引注册 |
+| `src/backend/catalog/pg_embeddings.c` | pg_embeddings 系统表操作函数 |
+| `src/backend/commands/embeddingscmds.c` | CreateEmbeddings / DropEmbeddings 实现（表级语法） |
+| `src/include/commands/embeddingscmds.h` | 函数声明 |
 | `src/backend/tcop/utility.c` | 处理 T_EmbeddingsStmt / T_DropEmbeddingsStmt |
 | `src/backend/parser/parse_utilcmd.c` | 处理 CONSTR_EMBEDDINGS（列级语法） |
 | `src/backend/commands/tablecmds.c` | 无需修改（不再在 CREATE TABLE 中处理） |
-| `src/backend/catalog/heap.c` | 跳过 VECTORIZE 列的 IMMUTABLE 检查 |
-| `src/backend/executor/nodeModifyTable.c` | 跳过 VECTORIZE 列的 ExecComputeStoredGenerated；允许用户值 |
-| `src/backend/rewrite/rewriteHandler.c` | 添加 rewrite_vectorize_query 查询重写 |
-| `src/backend/utils/adt/predict.c` | 添加 vectorize_trigger 触发器函数 |
-| `src/include/utils/predict.h` | 添加 vectorize 相关函数声明 |
-| `src/backend/access/common/tupdesc.c` | CompactAttribute 复制 attvectorize |
+| `src/backend/catalog/heap.c` | 跳过 EMBEDDINGS 列的 IMMUTABLE 检查 |
+| `src/backend/executor/nodeModifyTable.c` | 跳过 EMBEDDINGS 列的 ExecComputeStoredGenerated；允许用户值 |
+| `src/backend/rewrite/rewriteHandler.c` | 添加 rewrite_embeddings_query 查询重写 |
+| `src/backend/utils/adt/predict.c` | 添加 embeddings_trigger 触发器函数 |
+| `src/include/utils/predict.h` | 添加 embeddings 相关函数声明 |
+| `src/backend/access/common/tupdesc.c` | CompactAttribute 复制 attembeddings |
 | `src/backend/utils/cache/relcache.c` | 设置 constr->has_generated_embeddings |
-| `src/backend/executor/execMain.c` | attgenerated 显示中添加 vectorize 类型 |
-| `src/bin/psql/describe.c` | `\d` 显示 Vectorize 信息；`\dv` 命令 |
+| `src/backend/executor/execMain.c` | attgenerated 显示中添加 embeddings 类型 |
+| `src/bin/psql/describe.c` | `\d` 显示 Embeddings 信息；`\dv` 命令 |
 | `src/bin/pg_dump/pg_dump.c` | 导出 CREATE EMBEDDINGS 语句 |
 | `src/bin/initdb/initdb.c` | 自动创建 jolix_ft_transformer 扩展 |
 | `contrib/jolix_ft_transformer/` | FT-Transformer 扩展 |
@@ -1270,7 +1270,7 @@ CREATE TABLE articles (
     priority int
 ) WITH (vector_len = 64);
 
--- 随时添加 VECTORIZE
+-- 随时添加 EMBEDDINGS
 CREATE EMBEDDINGS meta ON articles (category, priority)
     USING ft_transformer_embedding
     WITH (vector_len = 64);
@@ -1280,7 +1280,7 @@ CREATE EMBEDDINGS meta ON articles (category, priority)
 
 - 不使用 CREATE EMBEDDINGS 的表完全不受影响
 - 现有 EMBEDDING 功能不受影响
-- pg_vectorize 系统表初始为空，不影响现有数据
+- pg_embeddings 系统表初始为空，不影响现有数据
 
 ## 14. 安全性考虑
 
@@ -1301,9 +1301,9 @@ CREATE EMBEDDINGS meta ON articles (category, priority)
 ## 16. 后续扩展方向
 
 - 支持更多表格模型（TabNet, TabTransformer, AutoInt）
-- 异步向量化（`WITH (vectorize_timing = 'deferred')`）
+- 异步向量化（`WITH (embeddings_timing = 'deferred')`）
 - 向量化列类型扩展（日期/时间、JSON/JSONB、数组）
-- `ALTER VECTORIZE ... REBUILD` 重建向量
+- `ALTER EMBEDDINGS ... REBUILD` 重建向量
 - `CREATE EMBEDDINGS ... WHERE condition` 条件向量化
 
 ---
@@ -1317,32 +1317,36 @@ CREATE EMBEDDINGS meta ON articles (category, priority)
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 语法解析 | ✅ | gram.y 中 EmbeddingsStmt / DropEmbeddingsStmt |
-| 关键字注册 | ✅ | kwlist.h 中 VECTORIZE (UNRESERVED_KEYWORD) |
+| 关键字注册 | ✅ | kwlist.h 中 EMBEDDINGS (UNRESERVED_KEYWORD) |
 | 节点定义 | ✅ | parsenodes.h 中 EmbeddingsStmt / DropEmbeddingsStmt |
 | 命令处理 | ✅ | utility.c 中 T_EmbeddingsStmt / T_DropEmbeddingsStmt |
 | 命令标签 | ✅ | cmdtaglist.h 中 CMDTAG_CREATE_EMBEDDINGS / CMDTAG_DROP_EMBEDDINGS |
-| 系统目录 | ✅ | pg_attribute 新增 attvectorize 字段 |
+| 系统目录 | ✅ | pg_attribute 新增 attembeddings 字段 |
 | 生成列类型 | ✅ | ATTRIBUTE_GENERATED_EMBEDDINGS ('z') |
-| 创建实现 | ✅ | vectorizecmds.c 中 CreateVectorize |
-| 删除实现 | ✅ | vectorizecmds.c 中 DropVectorize |
-| 触发器 | ✅ | predict.c 中 vectorize_trigger |
+| 创建实现 | ✅ | embeddingscmds.c 中 CreateEmbeddings |
+| 删除实现 | ✅ | embeddingscmds.c 中 DropEmbeddings |
+| 触发器 | ✅ | predict.c 中 embeddings_trigger |
 | 触发器注册 | ✅ | pg_proc.dat 中 OID 6508 |
-| 执行器豁免 | ✅ | nodeModifyTable.c 跳过 VECTORIZE 列的 ExecComputeStoredGenerated |
+| 执行器豁免 | ✅ | nodeModifyTable.c 跳过 EMBEDDINGS 列的 ExecComputeStoredGenerated |
 | 查询重写 | ✅ | rewriteHandler.c 中 ATTRIBUTE_GENERATED_EMBEDDINGS 豁免 |
-| 元组描述符 | ✅ | tupdesc.h / tupdesc.c / relcache.c 中 attvectorize 支持 |
+| 元组描述符 | ✅ | tupdesc.h / tupdesc.c / relcache.c 中 attembeddings 支持 |
 | Bootstrap 修复 | ✅ | bootstrap.c 中添加 anyarray 到 TypInfo[] |
 | FT-Transformer 函数 | ✅ | jolix_embedding 扩展中 ft_transformer_embedding(VARIADIC "any") |
 | pgvector 兼容 | ✅ | ivfflat/hnsw handler 改用 makeNode 方式 |
 
-### 17.2 待实现（EMBEDDINGS AS 列级语法）
+### 17.2 已实现（EMBEDDINGS AS 列级语法）
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| 语法解析 | ❌ | gram.y 中 CONSTR_EMBEDDINGS |
-| 列级处理 | ❌ | tablecmds.c 中 is_embeddings 处理 |
-| 查询重写 | ❌ | VECTORIZE 列的查询重写 |
+| 语法解析 | ✅ | gram.y 中 columnDef 独立替代规则匹配 EMBEDDINGS AS |
+| 列级处理 | ✅ | parse_utilcmd.c 中 is_embeddings 处理（vector 类型 + embeddings_trigger） |
+| INSERT/UPDATE | ✅ | embeddings_trigger 自动调用 ft_transformer_embedding 填充向量 |
+| 向量索引 | ✅ | 自动创建向量索引（默认 ivfflat，支持 WITH(vector_index='hnsw', vector_distance='vector_cosine_ops')） |
+| 查询重写 | ⚠️ | 核心逻辑已实现（is_embeddings_var + rewrite_embedding_opexpr），但 ROW() 语法需要 vector<=>record 操作符支持，当前用户可直接使用函数调用形式 |
 
 ### 17.3 测试验证
+
+#### 17.3.1 CREATE EMBEDDINGS（表级语法）
 
 ```sql
 -- 创建表
@@ -1375,14 +1379,71 @@ CREATE EMBEDDINGS IF NOT EXISTS demographic ON customers
 DROP EMBEDDINGS IF EXISTS demographic ON customers;
 ```
 
+#### 17.3.2 EMBEDDINGS AS（列级语法）
+
+```sql
+-- 创建带 EMBEDDINGS AS 列的表
+CREATE TABLE customers_v2 (
+    id int PRIMARY KEY,
+    age int,
+    income float,
+    category text,
+    demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
+) WITH (vector_len = 128);
+
+-- 验证表结构
+\d customers_v2
+-- demographic 列类型为 vector(128)
+-- Trigger: embeddings_demographic_trigger BEFORE INSERT OR UPDATE
+
+-- 插入数据（demographic 列自动填充）
+INSERT INTO customers_v2 (id, age, income, category) VALUES (1, 30, 50000.0, 'A');
+
+-- 验证向量自动生成
+SELECT id, age, income, category, vector_dims(demographic) as dims FROM customers_v2;
+-- dims = 128
+
+-- 更新数据（向量自动重新计算）
+UPDATE customers_v2 SET age = 35, income = 60000.0 WHERE id = 1;
+
+-- 多行插入
+INSERT INTO customers_v2 (id, age, income, category) VALUES
+    (2, 25, 45000.0, 'B'),
+    (3, 40, 75000.0, 'C'),
+    (4, 35, 55000.0, 'A');
+
+-- 向量相似度查询（子查询方式）
+SELECT id, age, income, category,
+       demographic <=> (SELECT demographic FROM customers_v2 WHERE id = 1) AS distance
+FROM customers_v2 ORDER BY distance;
+
+-- 向量相似度查询（函数调用方式，需要显式类型转换）
+SELECT id, age, income, category,
+       demographic <=> ft_transformer_embedding(30::int, 50000.0::float8, 'A'::text) AS distance
+FROM customers_v2 ORDER BY distance;
+
+-- 使用 HNSW 索引和余弦距离
+DROP TABLE IF EXISTS customers_hnsw;
+CREATE TABLE customers_hnsw (
+    id int PRIMARY KEY,
+    age int,
+    income float,
+    category text,
+    demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
+) WITH (vector_len = 128, vector_index = 'hnsw', vector_distance = 'vector_cosine_ops');
+```
+
 ### 17.4 关键修复记录
 
 1. **initdb bootstrap "unrecognized type anyarray"**：将 anyarray 添加到 TypInfo[] 数组
 2. **pgvector ivfflat/hnsw handler 不兼容 PG18**：将 `static const IndexAmRoutine` 改为 `makeNode(IndexAmRoutine)` 方式
-3. **vectorizecmds.c 列引用类型错误**：`columnList` 语法返回 `list of String`，不是 `list of ColumnRef`
-4. **vectorizecmds.c typmod 设置错误**：使用 `A_Const` 节点替代 `makeInteger` 设置 vector 类型修饰符
-5. **DROP EMBEDDINGS 触发器未删除**：`CreateTrigger` 会自动在触发器名后追加 `_{oid}` 后缀，导致 `drop_vectorize_trigger` 用原始名称找不到触发器。修复为使用 `systable_beginscan` 按前缀匹配查找触发器
+3. **embeddingscmds.c 列引用类型错误**：`columnList` 语法返回 `list of String`，不是 `list of ColumnRef`
+4. **embeddingscmds.c typmod 设置错误**：使用 `A_Const` 节点替代 `makeInteger` 设置 vector 类型修饰符
+5. **DROP EMBEDDINGS 触发器未删除**：`CreateTrigger` 会自动在触发器名后追加 `_{oid}` 后缀，导致 `drop_embeddings_trigger` 用原始名称找不到触发器。修复为使用 `systable_beginscan` 按前缀匹配查找触发器
 6. **INSERT 后 demographic 列为 NULL（函数查找失败）**：
    - 原因1：`FuncnameGetCandidates` 的 `expand_variadic=false` 导致 VARIADIC 函数的 `nargs=1` 不匹配实际参数个数。修复为 `expand_variadic=true`
    - 原因2：通过 `fmgr_info` + 手动构造 `FunctionCallInfo` 调用函数时，`flinfo->fn_expr=NULL`，导致 `ft_transformer_embedding` 中 `get_fn_expr_argtype` 返回 0。修复为在调用前构造 `FuncExpr` 节点并设置到 `funcinfo.fn_expr`
 7. **FT-Transformer 模型不可用导致 INSERT 报错**：重写 `ft_transformer_embedding` 函数，添加确定性向量 fallback 机制——模型加载失败时基于列值哈希生成确定性向量
+8. **EMBEDDINGS AS 语法冲突**：`EMBEDDINGS` 作为 `unreserved_keyword` 可被 `Typename`（通过 `GenericType` → `type_function_name`）消费，导致 `EMBEDDINGS AS` 在 `columnDef` 中无法被 `opt_embedding_clause` 匹配。修复为在 `columnDef` 中添加独立替代规则 `ColId EMBEDDINGS AS '(' func_name '(' columnList ')' ')' ...`，直接在 `columnDef` 层面匹配
+9. **`invalid storage type ""` 错误**：新 `columnDef` 替代规则中 bison 栈位置引用导致非 NULL 的空字符串值。修复为在 gram.y 中直接设置 `storage_name = NULL`、`compression = NULL`，在 parse_utilcmd.c 中显式设置 `column->storage_name = NULL; column->compression = NULL; column->fdwoptions = NIL;`
+10. **embeddings_func/embeddings_cols 传递重构**：从 `CreateStmtContext` 中移除 `embeddings_func` 和 `embeddings_cols` 字段，改用 `ColumnDef` 中的 `embeddings_func` 和 `embeddings_cols` 字段传递，避免多列 EMBEDDINGS AS 场景下的数据混淆

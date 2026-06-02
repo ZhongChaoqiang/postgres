@@ -3854,21 +3854,63 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 						if (IsA($8, Constraint))
 						{
 							Constraint *c = (Constraint *) $8;
-							n->is_embedding = true;
-							n->generated = c->generated_kind;
-							n->raw_default = c->raw_expr;
+							if (c->contype == CONSTR_EMBEDDINGS)
+							{
+								n->is_embeddings = true;
+								n->is_embedding = false;
+								n->generated = c->generated_kind;
+							}
+							else
+							{
+								n->is_embedding = true;
+								n->is_embeddings = false;
+								n->generated = c->generated_kind;
+								n->raw_default = c->raw_expr;
+							}
 						}
 						else
 						{
 							n->is_embedding = true;
+							n->is_embeddings = false;
 						}
 					}
 					else
 					{
 						n->is_embedding = false;
+						n->is_embeddings = false;
 					}
 					n->is_hidden = false;
 					SplitColQualList($6, &n->constraints, &n->collClause,
+									 yyscanner);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| ColId EMBEDDINGS AS '(' func_name '(' columnList ')' ')' opt_column_storage opt_column_compression create_generic_options ColQualList
+				{
+					ColumnDef *n = makeNode(ColumnDef);
+
+					n->colname = $1;
+					n->typeName = NULL;
+					n->storage_name = NULL;
+					n->compression = NULL;
+					n->inhcount = 0;
+					n->is_local = true;
+					n->is_not_null = false;
+					n->is_from_type = false;
+					n->storage = 0;
+					n->raw_default = NULL;
+					n->cooked_default = NULL;
+					n->collOid = InvalidOid;
+					n->fdwoptions = $12;
+					n->is_predict = false;
+					n->is_embeddings = true;
+					n->is_embedding = false;
+					n->is_hidden = false;
+					n->generated = ATTRIBUTE_GENERATED_EMBEDDINGS;
+					n->embeddings_func = $5;
+				n->embeddings_cols = $7;
+
+					SplitColQualList($13, &n->constraints, &n->collClause,
 									 yyscanner);
 					n->location = @1;
 					$$ = (Node *) n;

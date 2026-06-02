@@ -140,7 +140,7 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	/* Is EMBEDDING option specified */
 	bool		attembedding BKI_DEFAULT(f);
 
-	bool		attvectorize BKI_DEFAULT(f);
+	bool		attembeddings BKI_DEFAULT(f);
 
 	bool		attisdropped BKI_DEFAULT(f);
 

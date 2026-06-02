@@ -760,6 +760,8 @@ typedef struct ColumnDef
 	bool		is_embedding;	/* EMBEDDING option specified? */
 	bool		is_embeddings;
 	bool		is_hidden;		/* hidden from SELECT * expansion? */
+	List	   *embeddings_func;
+	List	   *embeddings_cols;
 	char		storage;		/* attstorage setting, or 0 for default */
 	char	   *storage_name;	/* attstorage setting name or NULL for default */
 	Node	   *raw_default;	/* default value (untransformed parse tree) */

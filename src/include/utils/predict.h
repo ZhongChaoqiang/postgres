@@ -17,6 +17,6 @@
 
 extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid, const char *colname);
 
-extern Datum vectorize_trigger(PG_FUNCTION_ARGS);
+extern Datum embeddings_trigger(PG_FUNCTION_ARGS);
 
 #endif							/* PREDICT_H */

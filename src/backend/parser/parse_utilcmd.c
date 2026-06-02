@@ -35,6 +35,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_trigger.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic_ext.h"
@@ -981,7 +982,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 					if (saw_generated)
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("multiple generation clauses specified for column \"%s\" of table \"%s\"",
+									errmsg("multiple generation clauses specified for column \"%s\" of table \"%s\"",
 										column->colname, cxt->relation->relname),
 								 parser_errposition(cxt->pstate,
 													constraint->location)));
@@ -995,6 +996,26 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 				{
 					column->is_embedding = true;
 				}
+				break;
+
+			case CONSTR_EMBEDDINGS:
+				if (cxt->ofType)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("embeddings columns are not supported on typed tables")));
+				if (saw_generated)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("multiple generation clauses specified for column \"%s\" of table \"%s\"",
+									column->colname, cxt->relation->relname),
+							 parser_errposition(cxt->pstate,
+												constraint->location)));
+				column->generated = ATTRIBUTE_GENERATED_EMBEDDINGS;
+				column->is_embeddings = true;
+				column->is_hidden = true;
+				column->embeddings_func = (List *) constraint->raw_expr;
+				column->embeddings_cols = constraint->keys;
+				saw_generated = true;
 				break;
 
 			case CONSTR_CHECK:
@@ -1320,6 +1341,159 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 			/* Create index element for the _embedding column */
 			iparam = makeNode(IndexElem);
 			iparam->name = psprintf("%s_embedding", column->colname);
+			iparam->expr = NULL;
+			iparam->indexcolname = NULL;
+			iparam->collation = NIL;
+			iparam->opclass = list_make1(makeString(cxt->vector_distance));
+			iparam->opclassopts = NIL;
+			iparam->ordering = SORTBY_DEFAULT;
+			iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+
+			index->indexParams = list_make1(iparam);
+			index->indexIncludingParams = NIL;
+
+			cxt->alist = lappend(cxt->alist, index);
+		}
+	}
+
+	if (column->is_embeddings)
+	{
+		TypeName   *vector_type;
+		A_Const    *typmod_const;
+		int			vector_len;
+
+		vector_len = cxt->vector_len;
+
+		vector_type = makeNode(TypeName);
+		vector_type->names = list_make1(makeString("vector"));
+
+		typmod_const = makeNode(A_Const);
+		typmod_const->val.ival.type = T_Integer;
+		typmod_const->val.ival.ival = vector_len;
+		typmod_const->location = -1;
+		vector_type->typmods = list_make1(typmod_const);
+		vector_type->typemod = -1;
+		vector_type->location = -1;
+
+		column->typeName = vector_type;
+		column->is_hidden = true;
+		column->storage_name = NULL;
+		column->compression = NULL;
+		column->fdwoptions = NIL;
+
+		{
+			CreateTrigStmt *trigger;
+			StringInfoData args_buf;
+			List	   *tg_args = NIL;
+			char	   *tgname;
+			char	   *funcname_str;
+			ListCell   *lc;
+			List	   *embeddings_func = column->embeddings_func;
+			List	   *embeddings_cols = column->embeddings_cols;
+
+			funcname_str = NameListToString(embeddings_func);
+
+			tgname = psprintf("embeddings_%s_trigger", column->colname);
+
+			initStringInfo(&args_buf);
+			appendStringInfo(&args_buf, "%s", column->colname);
+			tg_args = lappend(tg_args, makeString(pstrdup(args_buf.data)));
+
+			appendStringInfo(&args_buf, ",%s", funcname_str);
+			tg_args = lappend(tg_args, makeString(pstrdup(funcname_str)));
+
+			resetStringInfo(&args_buf);
+			foreach(lc, embeddings_cols)
+			{
+				char	   *colname = strVal(lfirst(lc));
+
+				if (lc != list_head(embeddings_cols))
+					appendStringInfoChar(&args_buf, ',');
+				appendStringInfo(&args_buf, "%s", colname);
+			}
+			tg_args = lappend(tg_args, makeString(pstrdup(args_buf.data)));
+
+			resetStringInfo(&args_buf);
+			appendStringInfo(&args_buf, "vector_len=%d", vector_len);
+			tg_args = lappend(tg_args, makeString(pstrdup(args_buf.data)));
+
+			pfree(args_buf.data);
+
+			trigger = makeNode(CreateTrigStmt);
+			trigger->replace = false;
+			trigger->isconstraint = false;
+			trigger->trigname = tgname;
+			trigger->relation = copyObject(cxt->relation);
+			trigger->funcname = list_make2(makeString("pg_catalog"),
+										   makeString("embeddings_trigger"));
+			trigger->args = tg_args;
+			trigger->row = true;
+			trigger->timing = TRIGGER_TYPE_BEFORE;
+			trigger->events = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE;
+			trigger->columns = NIL;
+			trigger->whenClause = NULL;
+			trigger->transitionRels = NIL;
+			trigger->deferrable = false;
+			trigger->initdeferred = false;
+			trigger->constrrel = NULL;
+
+			cxt->alist = lappend(cxt->alist, trigger);
+		}
+
+		if (cxt->vector_index != NULL && cxt->vector_distance != NULL)
+		{
+			IndexStmt  *index;
+			IndexElem  *iparam;
+			List	   *index_options = NIL;
+
+			index = makeNode(IndexStmt);
+			index->idxname = psprintf("%s_%s_idx",
+									  cxt->relation->relname, column->colname);
+			index->relation = copyObject(cxt->relation);
+			index->accessMethod = pstrdup(cxt->vector_index);
+			index->tableSpace = NULL;
+
+			if (cxt->vector_index_lists != -1)
+			{
+				DefElem    *opt = makeDefElem("lists",
+											  (Node *) makeInteger(cxt->vector_index_lists), -1);
+				index_options = lappend(index_options, opt);
+			}
+			if (cxt->vector_index_m != -1)
+			{
+				DefElem    *opt = makeDefElem("m",
+											  (Node *) makeInteger(cxt->vector_index_m), -1);
+				index_options = lappend(index_options, opt);
+			}
+			if (cxt->vector_index_ef_construction != -1)
+			{
+				DefElem    *opt = makeDefElem("ef_construction",
+											  (Node *) makeInteger(cxt->vector_index_ef_construction), -1);
+				index_options = lappend(index_options, opt);
+			}
+
+			index->options = index_options;
+			index->whereClause = NULL;
+			index->excludeOpNames = NIL;
+			index->idxcomment = NULL;
+			index->indexOid = InvalidOid;
+			index->oldNumber = InvalidRelFileNumber;
+			index->oldCreateSubid = InvalidSubTransactionId;
+			index->oldFirstRelfilelocatorSubid = InvalidSubTransactionId;
+			index->unique = false;
+			index->nulls_not_distinct = false;
+			index->primary = false;
+			index->isconstraint = false;
+			index->iswithoutoverlaps = false;
+			index->deferrable = false;
+			index->initdeferred = false;
+			index->transformed = false;
+			index->concurrent = false;
+			index->if_not_exists = true;
+			index->reset_default_tblspc = false;
+
+			iparam = makeNode(IndexElem);
+			iparam->name = pstrdup(column->colname);
 			iparam->expr = NULL;
 			iparam->indexcolname = NULL;
 			iparam->collation = NIL;

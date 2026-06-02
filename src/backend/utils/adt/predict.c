@@ -750,7 +750,7 @@ text_vector_ip_distance(PG_FUNCTION_ARGS)
  * - Evaluates the EMBEDDING AS expression and saves result to _embedding column
  */
 PG_FUNCTION_INFO_V1(embedding_trigger);
-PG_FUNCTION_INFO_V1(vectorize_trigger);
+PG_FUNCTION_INFO_V1(embeddings_trigger);
 
 Datum
 embedding_trigger(PG_FUNCTION_ARGS)
@@ -942,7 +942,7 @@ embedding_trigger(PG_FUNCTION_ARGS)
 }
 
 Datum
-vectorize_trigger(PG_FUNCTION_ARGS)
+embeddings_trigger(PG_FUNCTION_ARGS)
 {
 	TriggerData *trigdata = (TriggerData *) fcinfo->context;
 	TupleDesc	tupdesc;
@@ -955,22 +955,22 @@ vectorize_trigger(PG_FUNCTION_ARGS)
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-				 errmsg("function \"vectorize_trigger\" was not called by trigger manager")));
+				 errmsg("function \"embeddings_trigger\" was not called by trigger manager")));
 
 	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-				 errmsg("function \"vectorize_trigger\" must be called as BEFORE trigger")));
+				 errmsg("function \"embeddings_trigger\" must be called as BEFORE trigger")));
 
 	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-				 errmsg("function \"vectorize_trigger\" must be a ROW-level trigger")));
+				 errmsg("function \"embeddings_trigger\" must be a ROW-level trigger")));
 
 	if (!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event) && !TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-				 errmsg("function \"vectorize_trigger\" must be called for INSERT or UPDATE")));
+				 errmsg("function \"embeddings_trigger\" must be called for INSERT or UPDATE")));
 
 	rel = trigdata->tg_relation;
 	tupdesc = RelationGetDescr(rel);
@@ -990,7 +990,7 @@ vectorize_trigger(PG_FUNCTION_ARGS)
 		if (attr->attisdropped)
 			continue;
 
-		if (!attr->attvectorize)
+		if (!attr->attembeddings)
 			continue;
 
 		if (nargs >= 3)
@@ -1014,7 +1014,7 @@ vectorize_trigger(PG_FUNCTION_ARGS)
 			if (!SplitIdentifierString(colnames_str, ',', &colnames_list))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("invalid column list in vectorize trigger")));
+						 errmsg("invalid column list in embeddings trigger")));
 
 			ncolumns = list_length(colnames_list);
 			col_values = (Datum *) palloc(sizeof(Datum) * ncolumns);
@@ -1135,7 +1135,7 @@ vectorize_trigger(PG_FUNCTION_ARGS)
 				}
 				else
 				{
-					elog(LOG, "vectorize_trigger: function '%s' with %d args not found", accessMethod, ncolumns);
+					elog(LOG, "embeddings_trigger: function '%s' with %d args not found", accessMethod, ncolumns);
 				}
 			}
 

@@ -55,7 +55,7 @@
 #include "commands/typecmds.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
-#include "commands/vectorizecmds.h"
+#include "commands/embeddingscmds.h"
 #include "commands/view.h"
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
@@ -1570,10 +1570,10 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_EmbeddingsStmt:
-				CreateVectorize((EmbeddingsStmt *) parsetree);
+				CreateEmbeddings((EmbeddingsStmt *) parsetree);
 				break;
 			case T_DropEmbeddingsStmt:
-				DropVectorize((DropEmbeddingsStmt *) parsetree);
+				DropEmbeddings((DropEmbeddingsStmt *) parsetree);
 				break;
 
 			case T_ReindexStmt:

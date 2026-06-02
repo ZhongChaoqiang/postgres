@@ -17,7 +17,7 @@
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
-#include "commands/vectorizecmds.h"
+#include "commands/embeddingscmds.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/value.h"
@@ -35,11 +35,11 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
-static Oid get_vector_type_oid(void);
-static void create_vectorize_trigger(Relation rel, const char *vecname,
-									  const char *accessMethod,
-									  List *vectorizeParams, List *options);
-static void drop_vectorize_trigger(Relation rel, const char *vecname);
+Oid get_vector_type_oid(void);
+void create_embeddings_trigger(Relation rel, const char *vecname,
+							  const char *accessMethod,
+							  List *embeddingsParams, List *options);
+static void drop_embeddings_trigger(Relation rel, const char *vecname);
 
 Oid
 get_vector_type_oid(void)
@@ -48,7 +48,7 @@ get_vector_type_oid(void)
 }
 
 void
-CreateVectorize(EmbeddingsStmt *stmt)
+CreateEmbeddings(EmbeddingsStmt *stmt)
 {
 	Oid			relid;
 	Relation	rel;
@@ -72,7 +72,7 @@ CreateVectorize(EmbeddingsStmt *stmt)
 		if (stmt->if_not_exists)
 		{
 			ereport(NOTICE,
-					(errmsg("vectorize column \"%s\" already exists on relation \"%s\", skipping",
+					(errmsg("embeddings column \"%s\" already exists on relation \"%s\", skipping",
 							stmt->vecname, RelationGetRelationName(rel))));
 			table_close(rel, ShareUpdateExclusiveLock);
 			return;
@@ -91,7 +91,7 @@ CreateVectorize(EmbeddingsStmt *stmt)
 		if (!IsA(lfirst(lc), String))
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
-					 errmsg("invalid column reference in VECTORIZE")));
+					 errmsg("invalid column reference in EMBEDDINGS")));
 
 		colname = strVal(lfirst(lc));
 		attnum = get_attnum(relid, colname);
@@ -168,40 +168,40 @@ CreateVectorize(EmbeddingsStmt *stmt)
 
 	CommandCounterIncrement();
 
-	create_vectorize_trigger(rel, stmt->vecname, stmt->accessMethod,
+	create_embeddings_trigger(rel, stmt->vecname, stmt->accessMethod,
 							 stmt->embeddingsParams, stmt->options);
 
 	table_close(rel, ShareUpdateExclusiveLock);
 }
 
-static void
-create_vectorize_trigger(Relation rel, const char *vecname,
+void
+create_embeddings_trigger(Relation rel, const char *vecname,
 						 const char *accessMethod,
-						 List *vectorizeParams, List *options)
+						 List *embeddingsParams, List *options)
 {
 	CreateTrigStmt *tgstmt;
 	StringInfoData args_buf;
 	ListCell   *lc;
 	List	   *tg_args = NIL;
 	char	   *tgname;
-	Oid			vectorize_trigger_oid;
+	Oid			embeddings_trigger_oid;
 	int			fgc_flags;
 	FuncCandidateList clist;
 	List	   *namelist;
 
-	namelist = list_make2(makeString("pg_catalog"), makeString("vectorize_trigger"));
+	namelist = list_make2(makeString("pg_catalog"), makeString("embeddings_trigger"));
 	clist = FuncnameGetCandidates(namelist, 0, NIL, false, false, false, true, &fgc_flags);
 	if (clist)
-		vectorize_trigger_oid = clist->oid;
+		embeddings_trigger_oid = clist->oid;
 	else
-		vectorize_trigger_oid = InvalidOid;
+		embeddings_trigger_oid = InvalidOid;
 
-	if (!OidIsValid(vectorize_trigger_oid))
+	if (!OidIsValid(embeddings_trigger_oid))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
-				 errmsg("function vectorize_trigger() not found")));
+				 errmsg("function embeddings_trigger() not found")));
 
-	tgname = psprintf("vectorize_%s_trigger", vecname);
+	tgname = psprintf("embeddings_%s_trigger", vecname);
 
 	initStringInfo(&args_buf);
 	appendStringInfo(&args_buf, "%s", vecname);
@@ -211,10 +211,10 @@ create_vectorize_trigger(Relation rel, const char *vecname,
 	tg_args = lappend(tg_args, makeString(pstrdup(accessMethod)));
 
 	resetStringInfo(&args_buf);
-	foreach(lc, vectorizeParams)
+	foreach(lc, embeddingsParams)
 	{
 		char	   *colname = strVal(lfirst(lc));
-		if (lc != list_head(vectorizeParams))
+		if (lc != list_head(embeddingsParams))
 			appendStringInfoChar(&args_buf, ',');
 		appendStringInfo(&args_buf, "%s", colname);
 	}
@@ -238,7 +238,7 @@ create_vectorize_trigger(Relation rel, const char *vecname,
 	tgstmt->trigname = tgname;
 	tgstmt->relation = makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
 									 pstrdup(RelationGetRelationName(rel)), -1);
-	tgstmt->funcname = list_make2(makeString("pg_catalog"), makeString("vectorize_trigger"));
+	tgstmt->funcname = list_make2(makeString("pg_catalog"), makeString("embeddings_trigger"));
 	tgstmt->args = tg_args;
 	tgstmt->row = true;
 	tgstmt->timing = TRIGGER_TYPE_BEFORE;
@@ -258,7 +258,7 @@ create_vectorize_trigger(Relation rel, const char *vecname,
 }
 
 void
-DropVectorize(DropEmbeddingsStmt *stmt)
+DropEmbeddings(DropEmbeddingsStmt *stmt)
 {
 	Oid			relid;
 	Relation	rel;
@@ -280,7 +280,7 @@ DropVectorize(DropEmbeddingsStmt *stmt)
 		if (stmt->if_exists)
 		{
 			ereport(NOTICE,
-					(errmsg("vectorize column \"%s\" does not exist on relation \"%s\", skipping",
+					(errmsg("embeddings column \"%s\" does not exist on relation \"%s\", skipping",
 							stmt->vecname, RelationGetRelationName(rel))));
 			table_close(rel, ShareUpdateExclusiveLock);
 			return;
@@ -291,7 +291,7 @@ DropVectorize(DropEmbeddingsStmt *stmt)
 						stmt->vecname, RelationGetRelationName(rel))));
 	}
 
-	drop_vectorize_trigger(rel, stmt->vecname);
+	drop_embeddings_trigger(rel, stmt->vecname);
 
 	atstmt = makeNode(AlterTableStmt);
 	atcmd = makeNode(AlterTableCmd);
@@ -313,7 +313,7 @@ DropVectorize(DropEmbeddingsStmt *stmt)
 }
 
 static void
-drop_vectorize_trigger(Relation rel, const char *vecname)
+drop_embeddings_trigger(Relation rel, const char *vecname)
 {
 	char	   *tgname_prefix;
 	Relation	pg_trigger;
@@ -322,7 +322,7 @@ drop_vectorize_trigger(Relation rel, const char *vecname)
 	HeapTuple	tuple;
 	bool		found = false;
 
-	tgname_prefix = psprintf("vectorize_%s_trigger", vecname);
+	tgname_prefix = psprintf("embeddings_%s_trigger", vecname);
 
 	pg_trigger = table_open(TriggerRelationId, AccessShareLock);
 

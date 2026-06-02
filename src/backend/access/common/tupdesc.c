@@ -77,6 +77,7 @@ populate_compact_attribute_internal(Form_pg_attribute src,
 	dst->attgenerated = (src->attgenerated != '\0');
 	dst->attpredict = src->attpredict;
 	dst->attembedding = src->attembedding;
+	dst->attembeddings = src->attembeddings;
 
 	/*
 	 * Assign nullability status for this column.  Assuming that a constraint
@@ -370,7 +371,7 @@ CreateTupleDescCopyConstr(TupleDesc tupdesc)
 		cpy->has_generated_virtual = constr->has_generated_virtual;
 		cpy->has_generated_predict = constr->has_generated_predict;
 		cpy->has_generated_embedding = constr->has_generated_embedding;
-		cpy->has_generated_vectorize = constr->has_generated_vectorize;
+		cpy->has_generated_embeddings = constr->has_generated_embeddings;
 
 		if ((cpy->num_defval = constr->num_defval) > 0)
 		{
@@ -693,7 +694,7 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 			return false;
 		if (constr1->has_generated_embedding != constr2->has_generated_embedding)
 			return false;
-		if (constr1->has_generated_vectorize != constr2->has_generated_vectorize)
+		if (constr1->has_generated_embeddings != constr2->has_generated_embeddings)
 			return false;
 		n = constr1->num_defval;
 		if (n != (int) constr2->num_defval)
@@ -899,7 +900,7 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attgenerated = '\0';
 	att->attpredict = false;
 	att->attembedding = false;
-	att->attvectorize = false;
+	att->attembeddings = false;
 	att->attisdropped = false;
 	att->atthidden = false;
 	att->attislocal = true;
@@ -966,7 +967,7 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 	att->attgenerated = '\0';
 	att->attpredict = false;
 	att->attembedding = false;
-	att->attvectorize = false;
+	att->attembeddings = false;
 	att->attisdropped = false;
 	att->atthidden = false;
 	att->attislocal = true;

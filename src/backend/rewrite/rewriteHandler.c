@@ -46,10 +46,14 @@
 #include "utils/rel.h"
 #include "utils/predict.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_trigger.h"
+#include "commands/embeddingscmds.h"
 #include "catalog/pg_proc.h"
 #include "catalog/namespace.h"
 #include "parser/parse_oper.h"
 #include "utils/syscache.h"
+#include "utils/fmgroids.h"
+#include "utils/regproc.h"
 #include "fmgr.h"
 
 
@@ -4814,6 +4818,178 @@ make_embedding_var(Var *old_var, int embedding_attnum, Oid relid)
 				   -1, InvalidOid, old_var->varlevelsup);
 }
 
+static bool
+is_embeddings_var(Var *var, Query *query, Oid *out_relid, char **out_colname)
+{
+	RangeTblEntry *rte;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	Form_pg_attribute attr;
+
+	if (var->varno <= 0 || var->varno > list_length(query->rtable))
+		return false;
+
+	rte = rt_fetch(var->varno, query->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	if (var->varattno <= 0)
+		return false;
+
+	rel = table_open(rte->relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+
+	if (var->varattno > tupdesc->natts)
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	attr = TupleDescAttr(tupdesc, var->varattno - 1);
+
+	if (!(attr->attembeddings && attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDINGS))
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	if (out_relid)
+		*out_relid = rte->relid;
+	if (out_colname)
+		*out_colname = pstrdup(NameStr(attr->attname));
+
+	table_close(rel, AccessShareLock);
+	return true;
+}
+
+static Oid
+get_embeddings_func_oid_from_trigger(Oid relid, const char *colname)
+{
+	Relation	pg_trigger_rel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tuple;
+	Oid			funcoid = InvalidOid;
+
+	pg_trigger_rel = table_open(TriggerRelationId, AccessShareLock);
+
+	ScanKeyInit(&key,
+				Anum_pg_trigger_tgrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+
+	scan = systable_beginscan(pg_trigger_rel, TriggerRelidNameIndexId,
+							  true, NULL, 1, &key);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_trigger trig_form = (Form_pg_trigger) GETSTRUCT(tuple);
+		char	   *tgname = NameStr(trig_form->tgname);
+		int16		nargs;
+		Datum		argsdatum;
+		bool		isnull;
+		bytea	   *argsval;
+		char	   *args_str;
+
+		if (trig_form->tgisinternal)
+			continue;
+
+		if (strncmp(tgname, "embeddings_", 11) != 0)
+			continue;
+
+		nargs = trig_form->tgnargs;
+		if (nargs < 2)
+			continue;
+
+		argsdatum = heap_getattr(tuple, Anum_pg_trigger_tgargs,
+								 RelationGetDescr(pg_trigger_rel), &isnull);
+		if (isnull)
+			continue;
+
+		argsval = DatumGetByteaPP(argsdatum);
+		args_str = (char *) VARDATA_ANY(argsval);
+
+		{
+			char	   *p = args_str;
+			int			arg_idx;
+			char	   *first_arg = NULL;
+			char	   *second_arg = NULL;
+
+			for (arg_idx = 0; arg_idx < nargs; arg_idx++)
+			{
+				if (arg_idx == 0)
+					first_arg = pstrdup(p);
+				else if (arg_idx == 1)
+					second_arg = pstrdup(p);
+				p += strlen(p) + 1;
+			}
+
+			if (first_arg != NULL && strcmp(first_arg, colname) == 0 &&
+				second_arg != NULL)
+			{
+				List	   *namelist;
+				FuncCandidateList clist;
+
+				if (strchr(second_arg, '.') != NULL)
+					namelist = stringToQualifiedNameList(second_arg, NULL);
+				else
+					namelist = list_make1(makeString(second_arg));
+
+				clist = FuncnameGetCandidates(namelist, -1, NIL,
+											  false, false, false, true, NULL);
+
+				for (; clist != NULL; clist = clist->next)
+				{
+					Oid			rettype;
+
+					rettype = get_func_rettype(clist->oid);
+
+					if (rettype == get_vector_type_oid())
+					{
+						funcoid = clist->oid;
+						break;
+					}
+				}
+
+				if (first_arg) pfree(first_arg);
+				if (second_arg) pfree(second_arg);
+				break;
+			}
+
+			if (first_arg) pfree(first_arg);
+			if (second_arg) pfree(second_arg);
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(pg_trigger_rel, AccessShareLock);
+
+	return funcoid;
+}
+
+static FuncExpr *
+make_embeddings_func_call(Oid funcoid, RowExpr *rowexpr)
+{
+	FuncExpr   *funcexpr;
+	List	   *func_args = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rowexpr->args)
+	{
+		Node	   *arg = (Node *) lfirst(lc);
+		func_args = lappend(func_args, arg);
+	}
+
+	funcexpr = makeNode(FuncExpr);
+	funcexpr->funcid = funcoid;
+	funcexpr->funcresulttype = get_func_rettype(funcoid);
+	funcexpr->funcretset = false;
+	funcexpr->funcvariadic = false;
+	funcexpr->args = func_args;
+	funcexpr->location = -1;
+
+	return funcexpr;
+}
+
 static Const *
 convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname)
 {
@@ -4845,7 +5021,7 @@ convert_text_to_vector_const(Const *text_const, Oid relid, const char *colname)
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
 		attr = TupleDescAttr(tupdesc, attnum - 1);
-		if (!attr->attisdropped && (attr->attembedding || attr->attvectorize) &&
+		if (!attr->attisdropped && (attr->attembedding || attr->attembeddings) &&
 			strcmp(NameStr(attr->attname), colname) == 0)
 		{
 			if (attr->attgenerated == ATTRIBUTE_GENERATED_EMBEDDING ||
@@ -5016,6 +5192,48 @@ rewrite_embedding_opexpr(OpExpr *opexpr, Query *query)
 				}
 				pfree(opname);
 			}
+		}
+	}
+	else if (IsA(left, Var) && IsA(right, RowExpr))
+	{
+		Var	   *var = (Var *) left;
+		Oid		vec_relid;
+		char   *vec_colname;
+
+		if (is_embeddings_var(var, query, &vec_relid, &vec_colname))
+		{
+			Oid			vecfuncoid;
+
+			vecfuncoid = get_embeddings_func_oid_from_trigger(vec_relid, vec_colname);
+			if (OidIsValid(vecfuncoid))
+			{
+				FuncExpr  *vec_func;
+
+				vec_func = make_embeddings_func_call(vecfuncoid, (RowExpr *) right);
+				lsecond(opexpr->args) = (Node *) vec_func;
+			}
+			pfree(vec_colname);
+		}
+	}
+	else if (IsA(right, Var) && IsA(left, RowExpr))
+	{
+		Var	   *var = (Var *) right;
+		Oid		vec_relid;
+		char   *vec_colname;
+
+		if (is_embeddings_var(var, query, &vec_relid, &vec_colname))
+		{
+			Oid			vecfuncoid;
+
+			vecfuncoid = get_embeddings_func_oid_from_trigger(vec_relid, vec_colname);
+			if (OidIsValid(vecfuncoid))
+			{
+				FuncExpr  *vec_func;
+
+				vec_func = make_embeddings_func_call(vecfuncoid, (RowExpr *) left);
+				linitial(opexpr->args) = (Node *) vec_func;
+			}
+			pfree(vec_colname);
 		}
 	}
 	

@@ -441,7 +441,7 @@ bootstrap_signals(void)
 void
 boot_openrel(char *relname)
 {
-	int			i;
+	int		i;
 
 	if (strlen(relname) >= NAMEDATALEN)
 		relname[NAMEDATALEN - 1] = '\0';
@@ -455,9 +455,6 @@ boot_openrel(char *relname)
 
 	if (boot_reldesc != NULL)
 		closerel(NULL);
-
-	elog(DEBUG4, "open relation %s, attrsize %d",
-		 relname, (int) ATTRIBUTE_FIXED_PART_SIZE);
 
 	boot_reldesc = table_openrv(makeRangeVar(NULL, relname, -1), NoLock);
 	numattr = RelationGetNumberOfAttributes(boot_reldesc);

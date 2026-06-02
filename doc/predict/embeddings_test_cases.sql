@@ -23,13 +23,13 @@ CREATE EMBEDDINGS demographic ON t_customers
     WITH (vector_len = 128);
 
 -- 验证：隐藏列已创建
-SELECT attname, atttypid::regtype, atthidden, attvectorize, attgenerated
+SELECT attname, atttypid::regtype, atthidden, attembeddings, attgenerated
 FROM pg_attribute
 WHERE attrelid = 't_customers'::regclass AND attname = 'demographic';
 
 -- 验证：触发器已创建
 SELECT tgname, tgenabled FROM pg_trigger
-WHERE tgrelid = 't_customers'::regclass AND tgname LIKE 'vectorize_%';
+WHERE tgrelid = 't_customers'::regclass AND tgname LIKE 'embeddings_%';
 
 -- 验证：\d 显示表结构
 \d t_customers
@@ -141,7 +141,7 @@ WHERE attrelid = 't_customers'::regclass AND attname = 'demographic';
 
 -- 验证：触发器已删除
 SELECT count(*) = 0 AS trigger_dropped FROM pg_trigger
-WHERE tgrelid = 't_customers'::regclass AND tgname LIKE 'vectorize_%';
+WHERE tgrelid = 't_customers'::regclass AND tgname LIKE 'embeddings_%';
 
 -- 验证：表结构恢复
 \d t_customers
