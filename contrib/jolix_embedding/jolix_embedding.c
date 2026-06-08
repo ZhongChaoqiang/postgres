@@ -348,9 +348,11 @@ sentence_transformers_embedding_with_model(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(vector_result);
 }
 
-#define DEFAULT_FT_MODEL_NAME "ft-transformer-default"
+#define DEFAULT_FT_MODEL_NAME "sentence-transformers/all-MiniLM-L6-v2"
+#define DEFAULT_FT_VECTOR_LEN 384
 
 static char *jolix_ft_model_name = NULL;
+static int jolix_ft_vector_len = DEFAULT_FT_VECTOR_LEN;
 
 static Vector *
 generate_deterministic_vector(int dim, const char **col_values, int ncolumns)
@@ -482,7 +484,6 @@ ft_transformer_embedding(PG_FUNCTION_ARGS)
 	Vector	   *vector_result;
 	const char *model_name;
 	int			i;
-	int			vector_len = 128;
 	char	  **col_value_strs = NULL;
 	bool		use_deterministic = true;
 
@@ -545,50 +546,43 @@ ft_transformer_embedding(PG_FUNCTION_ARGS)
 
 	if (model)
 	{
-		PyObject   *features_dict = PyDict_New();
+		StringInfoData feat_str;
+		PyObject   *py_str = NULL;
 		PyObject   *result = NULL;
 
-		if (features_dict)
+		initStringInfo(&feat_str);
+		for (i = 0; i < ncolumns; i++)
 		{
-			for (i = 0; i < ncolumns; i++)
-			{
-				char		colname[32];
-				PyObject   *key = NULL;
-				PyObject   *value = NULL;
+			if (i > 0)
+				appendStringInfoString(&feat_str, ", ");
+			appendStringInfoString(&feat_str, col_value_strs[i]);
+		}
 
-				snprintf(colname, sizeof(colname), "col_%d", i);
-				key = PyUnicode_FromString(colname);
-				value = PyUnicode_FromString(col_value_strs[i]);
+		py_str = PyUnicode_FromString(feat_str.data);
+		pfree(feat_str.data);
 
-				if (key && value)
-					PyDict_SetItem(features_dict, key, value);
+		if (py_str)
+		{
+			result = PyObject_CallMethod(model, "encode", "(O)", py_str);
+			Py_DECREF(py_str);
+		}
 
-				if (key)
-					Py_DECREF(key);
-				if (value)
-					Py_DECREF(value);
-			}
-
-			result = PyObject_CallMethod(model, "encode", "(O)", features_dict);
-			Py_DECREF(features_dict);
-
-			if (result)
-			{
-				vector_result = embedding_to_vector(result);
-				Py_DECREF(result);
-				use_deterministic = false;
-			}
-			else
-			{
-				PyErr_Clear();
-				elog(LOG, "ft_transformer: model encode failed, using deterministic vector");
-			}
+		if (result)
+		{
+			vector_result = embedding_to_vector(result);
+			Py_DECREF(result);
+			use_deterministic = false;
+		}
+		else
+		{
+			PyErr_Clear();
+			elog(LOG, "ft_transformer: model encode failed, using deterministic vector");
 		}
 	}
 
 	if (use_deterministic)
 	{
-		vector_result = generate_deterministic_vector(vector_len,
+		vector_result = generate_deterministic_vector(jolix_ft_vector_len,
 													  (const char **) col_value_strs,
 													  ncolumns);
 	}
@@ -635,4 +629,17 @@ _PG_init(void)
 							   NULL,
 							   NULL,
 							   NULL);
+
+	DefineCustomIntVariable("jolix_embedding.ft_vector_len",
+							"Vector dimension for ft_transformer_embedding (used when model unavailable)",
+							NULL,
+							&jolix_ft_vector_len,
+							DEFAULT_FT_VECTOR_LEN,
+							1,
+							VECTOR_MAX_DIM,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
 }

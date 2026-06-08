@@ -56,7 +56,7 @@ CreateEmbeddings(EmbeddingsStmt *stmt)
 	AlterTableStmt *atstmt;
 	AlterTableCmd *atcmd;
 	ColumnDef  *coldef;
-	int16		vector_len = 128;
+	int16		vector_len = 384;
 	ListCell   *lc;
 
 	relid = RangeVarGetRelidExtended(stmt->relation, ShareUpdateExclusiveLock,

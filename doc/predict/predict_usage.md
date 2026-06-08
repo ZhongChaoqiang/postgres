@@ -1,6 +1,6 @@
 # Jolix Predict 使用文档
 
-**最后更新**: 2026-05-16
+**最后更新**: 2026-06-02
 
 ## 1. 概述
 
@@ -166,7 +166,7 @@ SELECT llm_rag_infer(
 
 **前提条件**：
 - 当前表必须有 EMBEDDING 列
-- EMBEDDING 列必须使用 `EMBEDDING AS (函数名(列名)) STORED` 语法指定嵌入函数
+- EMBEDDING 列必须使用 `EMBEDDING AS (函数名(列名))` 语法指定嵌入函数
 - 必须配置 `vector_len` 与嵌入函数输出维度匹配
 
 **在 PREDICT 列中使用**：
@@ -184,11 +184,11 @@ SELECT set_llm_config(
 -- 创建同时包含 EMBEDDING 列和 PREDICT 列的表
 CREATE TABLE rag_knowledge (
     id serial PRIMARY KEY,
-    content text EMBEDDING AS (st_embedding(content)) STORED,
+    content text EMBEDDING AS (st_embedding(content)),
     answer text PREDICT AS (llm_rag_infer(
         'Answer questions based on the provided context. Reply in one short sentence.',
         content
-    )) STORED
+    ))
 ) WITH (
     predict_timing = immediate,
     vector_len = 384
@@ -319,7 +319,7 @@ CREATE TABLE qa_table (
     answer text PREDICT AS (llm_infer(
         'Answer the question concisely.',
         question
-    )) STORED
+    ))
 ) WITH (predict_timing = immediate);
 
 -- 插入数据时自动推理
@@ -338,7 +338,7 @@ CREATE TABLE chat_table (
         question,
         3,
         'chat_table'
-    )) STORED
+    ))
 ) WITH (predict_timing = immediate);
 ```
 
@@ -355,12 +355,12 @@ SELECT set_llm_config(
 
 CREATE TABLE knowledge_qa (
     id serial PRIMARY KEY,
-    content text EMBEDDING AS (st_embedding(content)) STORED,
+    content text EMBEDDING AS (st_embedding(content)),
     answer text PREDICT AS (llm_rag_infer(
         'Answer based on context. Reply concisely.',
         content,
         2
-    )) STORED
+    ))
 ) WITH (
     predict_timing = immediate,
     vector_len = 384
@@ -391,7 +391,7 @@ CREATE TABLE test_llm_articles (
     category text PREDICT AS (llm_infer(
         'Classify the following text into exactly one category: technology, sports, politics, entertainment. Reply with only the category name, nothing else.',
         'Classify this text: ' || title || '. ' || content
-    )) STORED
+    ))
 ) WITH (predict_timing=immediate);
 
 -- 3. INSERT 不提供 category - LLM 自动分类
@@ -411,7 +411,7 @@ CREATE TABLE reviews (
     sentiment text PREDICT AS (llm_infer(
         'Classify the sentiment. Reply with exactly one word: positive, negative, or neutral.',
         review_text
-    )) STORED
+    ))
 ) WITH (predict_timing=immediate);
 
 -- 优先级分类（引用多列：产品名 + 描述）
@@ -422,7 +422,7 @@ CREATE TABLE support_tickets (
     priority text PREDICT AS (llm_infer(
         'Classify the priority. Reply with exactly one word: critical, high, medium, or low.',
         'Product: ' || product || '. Issue: ' || description
-    )) STORED
+    ))
 ) WITH (predict_timing=immediate);
 
 -- 垃圾邮件检测（引用多列：主题 + 正文）
@@ -434,7 +434,7 @@ CREATE TABLE emails (
     is_spam text PREDICT AS (llm_infer(
         'Determine if this email is spam. Reply with exactly one word: spam or not_spam.',
         'From: ' || sender || '. Subject: ' || subject || '. Body: ' || body
-    )) STORED
+    ))
 ) WITH (predict_timing=immediate);
 ```
 
@@ -445,9 +445,118 @@ CREATE TABLE emails (
 | `immediate` | 插入数据时立即执行推理 |
 | `async` | 异步执行推理（后台进程处理） |
 
-## 5. 配置表结构
+## 5. EMBEDDINGS 列使用
 
-### 5.1 jolix_llm_config
+### 5.1 概述
+
+EMBEDDINGS 功能允许将表中多个列的值组合为向量表示，支持基于 FT-Transformer 等模型的语义相似性查询。
+
+### 5.2 列级语法：EMBEDDINGS AS
+
+```sql
+-- 基本用法
+CREATE TABLE customers (
+    id int PRIMARY KEY,
+    age int,
+    income float,
+    category text,
+    demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
+);
+
+-- 指定向量维度（需与模型输出维度匹配）
+CREATE TABLE customers (
+    id int PRIMARY KEY,
+    age int,
+    income float,
+    category text,
+    demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
+) WITH (vector_len = 384);
+
+-- 多组 EMBEDDINGS
+CREATE TABLE products (
+    id int PRIMARY KEY,
+    name text,
+    price float,
+    brand text,
+    basic_features EMBEDDINGS AS (ft_transformer_embedding(price, brand)),
+    sales int,
+    rating float,
+    performance EMBEDDINGS AS (ft_transformer_embedding(sales, rating))
+) WITH (vector_len = 384);
+```
+
+**语法说明**：
+- `demographic`：向量化名称，同时作为隐藏向量列的列名
+- `EMBEDDINGS AS`：关键字
+- `ft_transformer_embedding(age, income, category)`：向量化表达式，引用同表其他列
+- `STORED`：可选关键字（默认行为），表示物理存储
+
+### 5.3 表级语法：CREATE EMBEDDINGS
+
+```sql
+-- 先建表
+CREATE TABLE customers (
+    id SERIAL PRIMARY KEY,
+    age INTEGER,
+    income FLOAT8,
+    category TEXT
+);
+
+-- 添加向量化
+CREATE EMBEDDINGS demographic ON customers
+    USING ft_transformer_embedding (age, income, category)
+    WITH (vector_len = 384);
+
+-- 删除向量化
+DROP EMBEDDINGS demographic ON customers;
+```
+
+### 5.4 向量相似性查询
+
+```sql
+-- 方式一：子查询（查找与某行最相似的行）
+SELECT id, age, income, category,
+       demographic <=> (SELECT demographic FROM customers WHERE id = 1) AS cosine_dist
+FROM customers
+WHERE id != 1
+ORDER BY cosine_dist;
+
+-- 方式二：函数调用（实时计算查询向量，需要显式类型转换）
+SELECT id, age, income, category,
+       demographic <=> ft_transformer_embedding(30::int, 50000.0::float8, 'premium'::text) AS query_dist
+FROM customers
+ORDER BY query_dist
+LIMIT 3;
+```
+
+### 5.5 ft_transformer_embedding 函数
+
+`ft_transformer_embedding` 接受可变参数（VARIADIC "any"），将多列值拼接后通过 SentenceTransformer 模型生成向量。
+
+**默认模型**：`sentence-transformers/all-MiniLM-L6-v2`（输出 384 维向量）
+
+**GUC 参数**：
+
+| 参数 | 类型 | 默认值 | 作用域 | 说明 |
+|------|------|--------|--------|------|
+| `jolix_embedding.model_name` | string | `sentence-transformers/all-MiniLM-L6-v2` | USERSET | st_embedding 默认模型 |
+| `jolix_embedding.model_path` | string | `/usr/local/pgsql/models` | SIGHUP | 模型缓存目录 |
+| `jolix_embedding.ft_model_name` | string | `sentence-transformers/all-MiniLM-L6-v2` | USERSET | ft_transformer_embedding 默认模型 |
+| `jolix_embedding.ft_vector_len` | integer | `384` | USERSET | 模型不可用时的降级向量维度 |
+
+**切换模型**：
+
+```sql
+-- 切换为 768 维模型
+SET jolix_embedding.ft_model_name = 'sentence-transformers/all-mpnet-base-v2';
+-- 建表时需指定 vector_len = 768
+```
+
+**降级机制**：当模型加载失败时（如网络不可达），函数自动降级为基于列值哈希的确定性向量生成，不会报错。降级向量维度由 `jolix_embedding.ft_vector_len` 控制。
+
+## 6. 配置表结构
+
+### 6.1 jolix_llm_config
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -466,7 +575,7 @@ CREATE TABLE emails (
 | `rag_similarity` | float8 | RAG 相似度阈值 |
 | `rag_topn` | integer | RAG 检索数量 |
 
-### 5.2 jolix_llm_history
+### 6.2 jolix_llm_history
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -476,14 +585,18 @@ CREATE TABLE emails (
 | `content` | text | 内容 |
 | `created_at` | timestamptz | 创建时间 |
 
-## 6. 表选项
+## 7. 表选项
 
-| 选项 | 类型 | 说明 |
-|------|------|------|
-| `predict_timing` | enum | 推理时机：`immediate` 或 `async` |
-| `vector_len` | integer | 向量维度（需与嵌入函数输出匹配） |
+| 选项 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `predict_timing` | enum | - | 推理时机：`immediate` 或 `async` |
+| `vector_len` | integer | 384 | 向量维度（需与嵌入函数输出匹配） |
+| `vector_index` | enum | hnsw | 向量索引类型（ivfflat/hnsw） |
+| `vector_distance` | enum | vector_cosine_ops | 向量距离类型 |
 
-## 7. GUC 参数
+## 8. GUC 参数
+
+### 8.1 jolix_predict 参数
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
@@ -495,7 +608,16 @@ CREATE TABLE emails (
 | `jolix_predict.current_table` | string | 当前表名（内部使用） |
 | `jolix_predict.history_retention_days` | integer | 历史记录保留天数（默认7，0=永不过期） |
 
-## 8. 常见问题
+### 8.2 jolix_embedding 参数
+
+| 参数 | 类型 | 默认值 | 作用域 | 说明 |
+|------|------|--------|--------|------|
+| `jolix_embedding.model_name` | string | `sentence-transformers/all-MiniLM-L6-v2` | USERSET | st_embedding 默认模型 |
+| `jolix_embedding.model_path` | string | `/usr/local/pgsql/models` | SIGHUP | 模型缓存目录 |
+| `jolix_embedding.ft_model_name` | string | `sentence-transformers/all-MiniLM-L6-v2` | USERSET | ft_transformer_embedding 默认模型 |
+| `jolix_embedding.ft_vector_len` | integer | `384` | USERSET | 模型不可用时的降级向量维度 |
+
+## 9. 常见问题
 
 ### Q: LLM 推理超时怎么办？
 
@@ -514,7 +636,7 @@ SELECT * FROM jolix_llm_history WHERE table_name = 'my_table' ORDER BY created_a
 确保：
 1. 在 PREDICT 列表达式中使用 `llm_rag_infer`
 2. 当前表有 EMBEDDING 列
-3. EMBEDDING 列使用 `EMBEDDING AS (函数名(列名)) STORED` 语法
+3. EMBEDDING 列使用 `EMBEDDING AS (函数名(列名))` 语法
 
 ### Q: embedding 列为空？
 
@@ -522,6 +644,33 @@ SELECT * FROM jolix_llm_history WHERE table_name = 'my_table' ORDER BY created_a
 
 ```sql
 CREATE TABLE my_table (
-    content text EMBEDDING AS (st_embedding(content)) STORED
+    content text EMBEDDING AS (st_embedding(content))
 ) WITH (vector_len = 384);
 ```
+
+### Q: ft_transformer_embedding 向量维度不匹配？
+
+`vector_len` 必须与模型输出维度匹配：
+- `all-MiniLM-L6-v2`：384 维（默认）
+- `all-mpnet-base-v2`：768 维
+
+```sql
+-- 使用默认模型（384维）
+CREATE TABLE t1 (...,
+    vec EMBEDDINGS AS (ft_transformer_embedding(col1, col2))
+);  -- vector_len 默认 384
+
+-- 使用 768 维模型
+SET jolix_embedding.ft_model_name = 'sentence-transformers/all-mpnet-base-v2';
+CREATE TABLE t2 (...,
+    vec EMBEDDINGS AS (ft_transformer_embedding(col1, col2))
+) WITH (vector_len = 768);
+```
+
+### Q: 如何从 Windows 客户端连接 WSL 中的 PostgreSQL？
+
+1. 确保 `postgresql.conf` 中 `listen_addresses = '*'`
+2. 确保 `pg_hba.conf` 中添加了 `host all all 0.0.0.0/0 md5`
+3. 设置 postgres 用户密码：`ALTER USER postgres WITH PASSWORD 'PG';`
+4. 获取 WSL IP：`wsl -d Ubuntu-22.04 -- bash -c "hostname -I"`
+5. 使用该 IP 和端口 5432 连接

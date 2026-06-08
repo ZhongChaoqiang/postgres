@@ -258,7 +258,7 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.ispartitioned = stmt->partspec != NULL;
 	cxt.partbound = stmt->partbound;
 	cxt.ofType = (stmt->ofTypename != NULL);
-	cxt.vector_len = 10;	/* default value */
+	cxt.vector_len = 384;	/* default value, matches all-MiniLM-L6-v2 */
 	cxt.vector_index = "ivfflat";	/* default vector index type */
 	cxt.vector_distance = "vector_l2_ops";	/* default vector distance type */
 	cxt.vector_index_lists = -1;	/* -1 means not specified */
@@ -4069,7 +4069,7 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 	cxt.ispartitioned = (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 	cxt.partbound = NULL;
 	cxt.ofType = false;
-	cxt.vector_len = RelationGetEmbeddingVectorLen(rel, 10);
+	cxt.vector_len = RelationGetEmbeddingVectorLen(rel, 384);
 	cxt.vector_index = NULL;
 	cxt.vector_distance = NULL;
 

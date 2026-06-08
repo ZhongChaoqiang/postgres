@@ -3928,7 +3928,7 @@ opt_column_compression:
 		;
 
 opt_predict_clause:
-			PREDICT AS '(' a_expr ')' STORED
+			PREDICT AS '(' a_expr ')' opt_stored_keyword
 				{
 					Constraint *n = makeNode(Constraint);
 
@@ -3950,7 +3950,7 @@ opt_predict_clause:
 		;
 
 opt_embedding_clause:
-			EMBEDDING AS '(' a_expr ')' STORED
+			EMBEDDING AS '(' a_expr ')' opt_stored_keyword
 				{
 					Constraint *n = makeNode(Constraint);
 
@@ -3969,6 +3969,11 @@ opt_embedding_clause:
 				}
 			| /*EMPTY*/
 				{ $$ = NULL; }
+		;
+
+opt_stored_keyword:
+			STORED									{ ; }
+			| /*EMPTY*/								{ ; }
 		;
 
 column_storage:

@@ -99,16 +99,16 @@ column_name EMBEDDINGS AS (expression) STORED
 -- 示例1：基本用法
 CREATE EMBEDDINGS demographic ON customers (age, income, category)
     USING ft_transformer_embedding
-    WITH (vector_len = 128);
+    WITH (vector_len = 384);
 
 -- 示例2：多组向量化
 CREATE EMBEDDINGS basic_features ON products (price, brand)
     USING ft_transformer_embedding
-    WITH (vector_len = 64);
+    WITH (vector_len = 384);
 
 CREATE EMBEDDINGS performance ON products (sales, rating)
     USING ft_transformer_embedding
-    WITH (vector_len = 64);
+    WITH (vector_len = 384);
 
 -- 示例3：删除向量化
 DROP EMBEDDINGS demographic ON customers;
@@ -123,7 +123,7 @@ CREATE TABLE customers (
     income float,
     category text,
     demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category)) STORED
-) WITH (vector_len = 128);
+) WITH (vector_len = 384);
 
 -- 示例5：多组向量化
 CREATE TABLE products (
@@ -135,7 +135,7 @@ CREATE TABLE products (
     sales int,
     rating float,
     performance EMBEDDINGS AS (ft_transformer_embedding(sales, rating)) STORED
-) WITH (vector_len = 64);
+) WITH (vector_len = 384);
 
 -- 示例6：与 EMBEDDING 共存
 CREATE TABLE articles (
@@ -144,7 +144,7 @@ CREATE TABLE articles (
     category text,
     priority int,
     meta EMBEDDINGS AS (ft_transformer_embedding(category, priority)) STORED
-) WITH (vector_len = 64);
+) WITH (vector_len = 384);
 
 
 -- ===== 两种方式混用 =====
@@ -156,12 +156,12 @@ CREATE TABLE customers (
     income float,
     category text,
     demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category)) STORED
-) WITH (vector_len = 128);
+) WITH (vector_len = 384);
 
 -- 后续追加另一个向量化组
 CREATE EMBEDDINGS extra_vec ON customers (age, income)
     USING ft_transformer_embedding
-    WITH (vector_len = 64);
+    WITH (vector_len = 384);
 ```
 
 ### 2.4 两种语法的等价关系
@@ -171,17 +171,17 @@ CREATE EMBEDDINGS extra_vec ON customers (age, income)
 ```sql
 -- 方式一
 CREATE EMBEDDINGS demographic ON customers (age, income, category)
-    USING ft_transformer_embedding WITH (vector_len = 128);
+    USING ft_transformer_embedding WITH (vector_len = 384);
 
 -- 方式二（等价）
 CREATE TABLE customers (
     ...,
     demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category)) STORED
-) WITH (vector_len = 128);
+) WITH (vector_len = 384);
 ```
 
 两者都创建：
-- 隐藏列 `demographic vector(128)`（`atthidden=true, attembeddings=true`）
+- 隐藏列 `demographic vector(384)`（`atthidden=true, attembeddings=true`）
 - 触发器 `embeddings_trigger_demographic_{oid}`
 - 向量索引 `customers_demographic_vec_idx`
 - pg_embeddings 元数据
@@ -190,7 +190,7 @@ CREATE TABLE customers (
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `vector_len` | int | 128 | 向量维度 |
+| `vector_len` | int | 384 | 向量维度 |
 | `vector_index` | enum | hnsw | 向量索引类型（ivfflat/hnsw） |
 | `vector_distance` | enum | vector_cosine_ops | 向量距离类型 |
 | `lists` | int | - | ivfflat 的 lists 参数 |
@@ -207,12 +207,12 @@ CREATE TABLE articles (
     content text EMBEDDING AS (st_embedding(content)) STORED,
     category text,
     priority int
-) WITH (vector_len = 64);
+) WITH (vector_len = 384);
 
 -- 再添加 EMBEDDINGS（不影响表结构）
 CREATE EMBEDDINGS meta ON articles (category, priority)
     USING ft_transformer_embedding
-    WITH (vector_len = 64);
+    WITH (vector_len = 384);
 ```
 
 ### 2.5 对比：CREATE INDEX vs CREATE EMBEDDINGS
@@ -235,7 +235,7 @@ CREATE EMBEDDINGS vec_name ON table_name (col1, col2) USING ft_transformer_embed
 
 ### 3.1 隐藏向量列
 
-执行 `CREATE EMBEDDINGS demographic ON customers (age, income, category) USING ft_transformer_embedding WITH (vector_len = 128)` 后：
+执行 `CREATE EMBEDDINGS demographic ON customers (age, income, category) USING ft_transformer_embedding WITH (vector_len = 384)` 后：
 
 ```
 pg_attribute:
@@ -311,7 +311,7 @@ bool    attembeddings;
 
 ```
 CREATE EMBEDDINGS demographic ON customers (age, income, category)
-    USING ft_transformer_embedding WITH (vector_len = 128);
+    USING ft_transformer_embedding WITH (vector_len = 384);
     │
     ├── 1. 验证
     │   ├── 表 customers 存在
@@ -320,7 +320,7 @@ CREATE EMBEDDINGS demographic ON customers (age, income, category)
     │   └── 向量化名称 demographic 在该表内唯一
     │
     ├── 2. 添加隐藏向量列
-    │   ├── ALTER TABLE customers ADD COLUMN demographic vector(128)
+    │   ├── ALTER TABLE customers ADD COLUMN demographic vector(384)
     │   ├── 设置 atthidden=true, attembeddings=true
     │   └── 设置 attgenerated=ATTRIBUTE_GENERATED_EMBEDDINGS
     │
@@ -368,50 +368,44 @@ DROP EMBEDDINGS demographic ON customers;
 
 ```sql
 -- 多参数版本（推荐，用于 EMBEDDINGS 触发器内部调用）
-CREATE FUNCTION ft_transformer_embedding(VARIADIC input_values anyarray) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_embedding'
-    LANGUAGE C IMMUTABLE;
+CREATE FUNCTION ft_transformer_embedding(VARIADIC "any") RETURNS vector
+    AS 'jolix_embedding', 'ft_transformer_embedding'
+    LANGUAGE C VOLATILE;
 
 -- 指定模型版本
-CREATE FUNCTION ft_transformer_embedding(VARIADIC input_values anyarray, model_name text) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_embedding_with_model'
-    LANGUAGE C IMMUTABLE;
+CREATE FUNCTION ft_transformer_embedding(VARIADIC "any", model_name text) RETURNS vector
+    AS 'jolix_embedding', 'ft_transformer_embedding_with_model'
+    LANGUAGE C VOLATILE;
 
 -- record 版本
 CREATE FUNCTION ft_transformer_embedding(input_row record) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_embedding_record'
-    LANGUAGE C IMMUTABLE;
+    AS 'jolix_embedding', 'ft_transformer_embedding_record'
+    LANGUAGE C VOLATILE;
 ```
 
 ### 4.2 函数行为
 
 1. 接收多个列值作为参数
-2. 根据各参数的数据类型自动判断特征类型：
-   - 数值类型（int, float, numeric）→ 数值特征
-   - 文本类型（text, varchar）→ 类别特征
-   - 布尔类型（bool）→ 二值特征
-3. 对每种特征进行 Tokenize：
-   - 数值特征：乘以可学习权重 + 偏置 → token
-   - 类别特征：Embedding 查表 → token
-4. 所有 token 输入 Transformer Encoder
-5. 取 [CLS] token 的输出作为行级向量表示
-6. 返回 vector 类型
+2. 将多列值拼接为字符串（以空格分隔）
+3. 通过 SentenceTransformer 模型（默认 `sentence-transformers/all-MiniLM-L6-v2`）对拼接后的字符串进行编码，生成 384 维向量
+4. 如果模型不可用，则基于列值哈希生成确定性向量作为降级方案（维度由 `jolix_embedding.ft_vector_len` GUC 参数控制）
+5. 返回 vector 类型
 
 ### 4.3 查询用辅助函数
 
 ```sql
-CREATE FUNCTION ft_transformer_embedding(VARIADIC values anyarray) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_embedding'
-    LANGUAGE C IMMUTABLE;
+CREATE FUNCTION ft_transformer_embedding(VARIADIC "any") RETURNS vector
+    AS 'jolix_embedding', 'ft_transformer_embedding'
+    LANGUAGE C VOLATILE;
 ```
 
 ### 4.4 GUC 参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `jolix_ft_transformer.model_name` | ft-transformer-default | 默认 FT-Transformer 模型名称 |
-| `jolix_ft_transformer.model_path` | 空 | 本地模型文件路径 |
-| `jolix_ft_transformer.cache_enabled` | true | 是否启用模型缓存 |
+| `jolix_embedding.ft_model_name` | sentence-transformers/all-MiniLM-L6-v2 | 默认 FT 模型名称 |
+| `jolix_embedding.model_path` | /usr/local/pgsql/models | 模型缓存目录 |
+| `jolix_embedding.ft_vector_len` | 384 | 模型不可用时的降级向量维度 |
 
 ## 5. 触发器行为设计
 
@@ -483,7 +477,7 @@ EMBEDDING 的查询重写能工作，是因为 `content` 是一个**真实的可
 
 ```
 CREATE EMBEDDINGS demographic ON customers (age, income, category) USING ft_transformer_embedding;
- 创建隐藏列: demographic vector(128)   （不是 demographic_embeddings）
+ 创建隐藏列: demographic vector(384)   （不是 demographic_embeddings）
 ```
 
 这样 `demographic` 就是一个**真实存在的隐藏列**（`atthidden=true`），类型为 `vector`。解析器可以正常解析 `demographic <=> ...`，因为 `demographic` 确实是表的一个列（只是隐藏的）。
@@ -511,7 +505,7 @@ CREATE EMBEDDINGS demographic ON customers (age, income, category) USING ft_tran
 
 -- 用户需要换一个名字
 CREATE EMBEDDINGS demo_vec ON customers (age, income, category) USING ft_transformer_embedding;
--- OK，创建隐藏列 demo_vec vector(128)
+-- OK，创建隐藏列 demo_vec vector(384)
 ```
 
 ### 6.4 三种查询方式
@@ -746,13 +740,13 @@ EMBEDDINGS 的查询重写更简单，因为向量化名直接就是 vector 类�
 
 ```
 CREATE EMBEDDINGS demographic ON customers (age, income, category)
-    USING ft_transformer_embedding WITH (vector_len = 128);
+    USING ft_transformer_embedding WITH (vector_len = 384);
     │
     ├── [gram.y] 解析 → EmbeddingsStmt 节点
     │
     ├── [commands/embeddingscmds.c] 执行创建：
     │   ├── 验证表、列、函数存在性
-    │   ├── ALTER TABLE ADD COLUMN demographic vector(128)
+    │   ├── ALTER TABLE ADD COLUMN demographic vector(384)
     │   │   └── 设置 atthidden=true, attembeddings=true, attgenerated='z'
     │   ├── CREATE TRIGGER embeddings_trigger_demographic_{oid}
     │   ├── CREATE INDEX customers_demographic_vec_idx
@@ -1151,7 +1145,7 @@ Indexes:
     "customers_pkey" PRIMARY KEY, btree (id)
     "customers_demographic_vec_idx" hnsw (demographic vector_cosine_ops)
 Embeddings:
-    "demographic" ON (age, income, category) USING ft_transformer_embedding WITH (vector_len=128)
+    "demographic" ON (age, income, category) USING ft_transformer_embedding WITH (vector_len=384)
 ```
 
 ### 10.2 \dv 命令（列出向量化）
@@ -1165,35 +1159,35 @@ List of Embeddings
  public | basic_feat | products    | price, brand     | ft_transformer_embedding
 ```
 
-## 11. jolix_ft_transformer 扩展设计
+## 11. jolix_embedding 扩展设计
 
 ### 11.1 扩展结构
 
 ```
-contrib/jolix_ft_transformer/
+contrib/jolix_embedding/
 ├── Makefile
-├── jolix_ft_transformer.c
-├── jolix_ft_transformer--1.0.sql
-└── jolix_ft_transformer.control
+├── jolix_embedding.c
+├── jolix_embedding--1.0.sql
+└── jolix_embedding.control
 ```
 
 ### 11.2 SQL 定义
 
 ```sql
 -- 向量化函数：多参数版本
-CREATE FUNCTION ft_transformer_embedding(VARIADIC input_values anyarray) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_embedding'
-    LANGUAGE C IMMUTABLE;
+CREATE FUNCTION ft_transformer_embedding(VARIADIC "any") RETURNS vector
+    AS 'jolix_embedding', 'ft_transformer_embedding'
+    LANGUAGE C VOLATILE;
 
 -- 向量化函数：指定模型
-CREATE FUNCTION ft_transformer_embedding(VARIADIC input_values anyarray, model_name text) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_embedding_with_model'
-    LANGUAGE C IMMUTABLE;
+CREATE FUNCTION ft_transformer_embedding(VARIADIC "any", model_name text) RETURNS vector
+    AS 'jolix_embedding', 'ft_transformer_embedding_with_model'
+    LANGUAGE C VOLATILE;
 
 -- 查询用辅助函数
-CREATE FUNCTION ft_transformer_embedding(VARIADIC values anyarray) RETURNS vector
-    AS 'jolix_ft_transformer', 'ft_transformer_embedding'
-    LANGUAGE C IMMUTABLE;
+CREATE FUNCTION ft_transformer_embedding(VARIADIC "any") RETURNS vector
+    AS 'jolix_embedding', 'ft_transformer_embedding'
+    LANGUAGE C VOLATILE;
 ```
 
 ### 11.3 C 实现概要
@@ -1203,27 +1197,50 @@ PG_MODULE_MAGIC;
 
 static char *ft_model_name = NULL;
 static char *ft_model_path = NULL;
-static bool ft_cache_enabled = true;
+static int   ft_vector_len = 384;
 
 void _PG_init(void)
 {
-    DefineCustomStringVariable("jolix_ft_transformer.model_name", ...);
-    DefineCustomStringVariable("jolix_ft_transformer.model_path", ...);
-    DefineCustomBoolVariable("jolix_ft_transformer.cache_enabled", ...);
+    DefineCustomStringVariable("jolix_embedding.ft_model_name",
+        "Default FT model name",
+        NULL,
+        &ft_model_name,
+        "sentence-transformers/all-MiniLM-L6-v2",
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomStringVariable("jolix_embedding.model_path",
+        "Model cache directory",
+        NULL,
+        &ft_model_path,
+        "/usr/local/pgsql/models",
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("jolix_embedding.ft_vector_len",
+        "Fallback vector dimension when model unavailable",
+        NULL,
+        &ft_vector_len,
+        384,
+        1, 8192,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
 }
 
 Datum ft_transformer_embedding(PG_FUNCTION_ARGS)
 {
     int nargs = PG_NARGS();
-    /* 提取各列值，根据类型判断特征类型 */
-    /* 调用 Python FT-Transformer 模型 */
-    /* 返回 vector */
+    /* 1. 提取各列值，拼接为字符串（以空格分隔） */
+    /* 2. 尝试加载 SentenceTransformer 模型 */
+    /* 3. 模型可用：调用 model.encode(concat_string) 生成 384 维向量 */
+    /* 4. 模型不可用（降级）：基于列值哈希生成 ft_vector_len 维确定性向量 */
+    /* 5. 返回 vector */
     PG_RETURN_POINTER(vector_result);
 }
 
-Datum ft_transformer_embedding(PG_FUNCTION_ARGS)
+Datum ft_transformer_embedding_with_model(PG_FUNCTION_ARGS)
 {
-    /* 同 ft_transformer_embedding */
+    /* 同 ft_transformer_embedding，但使用指定的模型名称 */
 }
 ```
 
@@ -1254,8 +1271,8 @@ Datum ft_transformer_embedding(PG_FUNCTION_ARGS)
 | `src/backend/executor/execMain.c` | attgenerated 显示中添加 embeddings 类型 |
 | `src/bin/psql/describe.c` | `\d` 显示 Embeddings 信息；`\dv` 命令 |
 | `src/bin/pg_dump/pg_dump.c` | 导出 CREATE EMBEDDINGS 语句 |
-| `src/bin/initdb/initdb.c` | 自动创建 jolix_ft_transformer 扩展 |
-| `contrib/jolix_ft_transformer/` | FT-Transformer 扩展 |
+| `src/bin/initdb/initdb.c` | 自动创建 jolix_embedding 扩展 |
+| `contrib/jolix_embedding/` | FT-Transformer 扩展 |
 
 ## 13. 与现有系统的兼容性
 
@@ -1268,12 +1285,12 @@ CREATE TABLE articles (
     content text EMBEDDING AS (st_embedding(content)) STORED,
     category text,
     priority int
-) WITH (vector_len = 64);
+) WITH (vector_len = 384);
 
 -- 随时添加 EMBEDDINGS
 CREATE EMBEDDINGS meta ON articles (category, priority)
     USING ft_transformer_embedding
-    WITH (vector_len = 64);
+    WITH (vector_len = 384);
 ```
 
 ### 13.2 向后兼容
@@ -1307,8 +1324,8 @@ CREATE EMBEDDINGS meta ON articles (category, priority)
 - `CREATE EMBEDDINGS ... WHERE condition` 条件向量化
 
 ---
-**文档版本**: 9.0
-**最后更新**: 2026-05-28
+**文档版本**: 10.0
+**最后更新**: 2026-06-02
 
 ## 17. 实现状态
 
@@ -1361,7 +1378,7 @@ CREATE TABLE customers (
 CREATE EXTENSION IF NOT EXISTS jolix_embedding;
 CREATE EMBEDDINGS demographic ON customers
     USING ft_transformer_embedding (age, income, category)
-    WITH (vector_len = 128);
+    WITH (vector_len = 384);
 
 -- 插入数据
 INSERT INTO customers (age, income, category) VALUES (30, 50000.0, 'A');
@@ -1375,7 +1392,7 @@ DROP EMBEDDINGS demographic ON customers;
 -- IF NOT EXISTS / IF EXISTS
 CREATE EMBEDDINGS IF NOT EXISTS demographic ON customers
     USING ft_transformer_embedding (age, income, category)
-    WITH (vector_len = 128);
+    WITH (vector_len = 384);
 DROP EMBEDDINGS IF EXISTS demographic ON customers;
 ```
 
@@ -1389,11 +1406,11 @@ CREATE TABLE customers_v2 (
     income float,
     category text,
     demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
-) WITH (vector_len = 128);
+) WITH (vector_len = 384);
 
 -- 验证表结构
 \d customers_v2
--- demographic 列类型为 vector(128)
+-- demographic 列类型为 vector(384)
 -- Trigger: embeddings_demographic_trigger BEFORE INSERT OR UPDATE
 
 -- 插入数据（demographic 列自动填充）
@@ -1401,7 +1418,7 @@ INSERT INTO customers_v2 (id, age, income, category) VALUES (1, 30, 50000.0, 'A'
 
 -- 验证向量自动生成
 SELECT id, age, income, category, vector_dims(demographic) as dims FROM customers_v2;
--- dims = 128
+-- dims = 384
 
 -- 更新数据（向量自动重新计算）
 UPDATE customers_v2 SET age = 35, income = 60000.0 WHERE id = 1;
@@ -1430,7 +1447,7 @@ CREATE TABLE customers_hnsw (
     income float,
     category text,
     demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
-) WITH (vector_len = 128, vector_index = 'hnsw', vector_distance = 'vector_cosine_ops');
+) WITH (vector_len = 384, vector_index = 'hnsw', vector_distance = 'vector_cosine_ops');
 ```
 
 ### 17.4 关键修复记录
@@ -1447,3 +1464,7 @@ CREATE TABLE customers_hnsw (
 8. **EMBEDDINGS AS 语法冲突**：`EMBEDDINGS` 作为 `unreserved_keyword` 可被 `Typename`（通过 `GenericType` → `type_function_name`）消费，导致 `EMBEDDINGS AS` 在 `columnDef` 中无法被 `opt_embedding_clause` 匹配。修复为在 `columnDef` 中添加独立替代规则 `ColId EMBEDDINGS AS '(' func_name '(' columnList ')' ')' ...`，直接在 `columnDef` 层面匹配
 9. **`invalid storage type ""` 错误**：新 `columnDef` 替代规则中 bison 栈位置引用导致非 NULL 的空字符串值。修复为在 gram.y 中直接设置 `storage_name = NULL`、`compression = NULL`，在 parse_utilcmd.c 中显式设置 `column->storage_name = NULL; column->compression = NULL; column->fdwoptions = NIL;`
 10. **embeddings_func/embeddings_cols 传递重构**：从 `CreateStmtContext` 中移除 `embeddings_func` 和 `embeddings_cols` 字段，改用 `ColumnDef` 中的 `embeddings_func` 和 `embeddings_cols` 字段传递，避免多列 EMBEDDINGS AS 场景下的数据混淆
+11. **STORED 关键字改为可选默认行为**：EMBEDDING AS / EMBEDDINGS AS / PREDICT AS 语法中的 STORED 关键字改为可选（opt_stored_keyword），用户可以不写，默认为 STORED 行为
+12. **ft_transformer_embedding 使用真实模型**：默认模型从 `ft-transformer-default`（不存在）改为 `sentence-transformers/all-MiniLM-L6-v2`，将多列值拼接为字符串后调用 `model.encode()`，输出 384 维向量
+13. **新增 jolix_embedding.ft_vector_len GUC 参数**：控制模型不可用时的降级向量维度，默认 384
+14. **默认 vector_len 统一为 384**：parse_utilcmd.c 和 embeddingscmds.c 中的默认 vector_len 从 10/128 统一改为 384
