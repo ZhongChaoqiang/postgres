@@ -11,7 +11,7 @@
 | `libpq5_18.3-1_amd64.deb` | PostgreSQL 客户端共享库 | 167KB |
 | `libpq-dev_18.3-1_amd64.deb` | libpq 开发头文件和静态库 | 21KB |
 | `postgresql-client-18_18.3-1_amd64.deb` | 客户端工具（psql, pg_dump 等） | 759KB |
-| `postgresql-18_18.3-1_amd64.deb` | 数据库服务器主程序（含 pgvector） | 5.8MB |
+| `postgresql-18_18.3-1_amd64.deb` | 数据库服务器主程序（含 pgvector） | 5.9MB |
 | `postgresql-server-dev-18_18.3-1_amd64.deb` | 服务端开发头文件 | 1.5MB |
 | `postgresql-doc-18_18.3-1_all.deb` | 扩展文档 | 3.6KB |
 
@@ -453,7 +453,7 @@ pgvector 已内置在安装包中，初始化数据库时自动创建。支持�
 
 - **向量类型**：`vector(N)` - N 维浮点向量
 - **距离运算符**：
-  - `<=>` - L2 距离（欧几里得距离）
+  - `<->` - L2 距离（欧几里得距离）
   - `<#>` - 内积
   - `<=>` - 余弦距离
 - **索引类型**：
@@ -468,20 +468,173 @@ CREATE EXTENSION IF NOT EXISTS vector SCHEMA public;
 
 ### 6.2 jolix_predict 扩展（已内置）
 
-AI 预测扩展，初始化数据库时自动创建。
+AI 预测扩展，初始化数据库时自动创建。支持 LLM 推理、PREDICT 列和 RAG 推理。
 
 ```sql
 -- 如需手动创建
 CREATE EXTENSION IF NOT EXISTS jolix_predict;
 ```
 
+#### 6.2.1 配置 LLM 连接
+
+```sql
+SELECT set_llm_config(
+    p_api_url := 'https://your-llm-api/v1/chat/completions',
+    p_api_key := 'your-api-key',
+    p_model_name := 'your-model-name',
+    p_temperature := 0.7,
+    p_max_tokens := 256,
+    p_system_prompt := 'You are a helpful assistant.'
+);
+```
+
+#### 6.2.2 基本推理
+
+```sql
+-- 单次推理
+SELECT llm_infer('请简短回答。', '什么是PostgreSQL？');
+
+-- 带对话历史的推理
+SELECT llm_infer('请记住数字42', '请用中文回答。', 3, 'session1');
+SELECT llm_infer('我刚才让你记住的数字是什么？', '请用中文回答。', 3, 'session1');
+```
+
+#### 6.2.3 PREDICT 列
+
+PREDICT 列在 INSERT 时自动调用 LLM 生成回答：
+
+```sql
+CREATE TABLE qa_test (
+    id serial PRIMARY KEY,
+    question text,
+    answer text PREDICT AS (llm_infer('请简短回答以下问题。', question))
+) WITH (predict_timing = immediate);
+
+INSERT INTO qa_test (question) VALUES ('什么是向量数据库？');
+SELECT id, question, answer FROM qa_test;
+```
+
+#### 6.2.4 RAG 推理
+
+RAG 推理结合向量搜索和 LLM，基于知识库上下文回答问题：
+
+```sql
+-- 1. 创建带 EMBEDDING 列的知识库表
+CREATE TABLE knowledge_base (
+    id SERIAL PRIMARY KEY,
+    content text EMBEDDING AS (st_embedding(content))
+);
+
+-- 2. 插入知识数据
+INSERT INTO knowledge_base (content) VALUES ('PostgreSQL is a powerful open source relational database');
+INSERT INTO knowledge_base (content) VALUES ('Machine learning is a subset of artificial intelligence');
+
+-- 3. 配置 RAG 参数
+SET jolix_predict.current_table = 'knowledge_base';
+SELECT set_llm_config(
+    p_api_url := 'https://your-llm-api/v1/chat/completions',
+    p_api_key := 'your-api-key',
+    p_model_name := 'your-model-name',
+    p_rag_similarity := 2.0,
+    p_rag_topn := 3
+);
+
+-- 4. 执行 RAG 推理
+SELECT llm_rag_infer('根据上下文回答问题。', 'PostgreSQL是什么？', 0);
+```
+
 ### 6.3 jolix_embedding 扩展（已内置）
 
-向量嵌入扩展，依赖 pgvector，初始化数据库时自动创建。
+向量嵌入扩展，依赖 pgvector，初始化数据库时自动创建。支持文本向量化和结构化数据向量化。
 
 ```sql
 -- 如需手动创建（需先确保 vector 扩展已创建）
 CREATE EXTENSION IF NOT EXISTS jolix_embedding;
+```
+
+#### 6.3.1 st_embedding 函数（文本向量化）
+
+```sql
+-- 设置模型
+SET jolix_embedding.model_name = 'sentence-transformers/all-MiniLM-L6-v2';
+
+-- 生成文本向量
+SELECT st_embedding('Hello, world!');
+
+-- 向量相似度计算
+SELECT round((st_embedding('hello') <=> st_embedding('hi'))::numeric, 4) AS cosine_dist;
+```
+
+#### 6.3.2 EMBEDDING 列（自动文本向量生成）
+
+EMBEDDING 列在 INSERT/UPDATE 时自动调用 embedding 函数生成向量：
+
+```sql
+CREATE TABLE docs (
+    id SERIAL PRIMARY KEY,
+    content text EMBEDDING AS (st_embedding(content))
+);
+
+INSERT INTO docs (content) VALUES ('Hello world');
+INSERT INTO docs (content) VALUES ('Database system');
+
+-- 自动生成的向量列名为 content_embedding
+SELECT id, content, vector_dims(content_embedding) AS dims FROM docs;
+
+-- 语义搜索
+SELECT id, content,
+       round((content_embedding <=> st_embedding('hello'))::numeric, 4) AS distance
+FROM docs ORDER BY distance;
+```
+
+> **注意**：`EMBEDDING AS (st_embedding(content))` 会自动设置 `embedding_function` reloption，RAG 推理可直接使用。
+
+#### 6.3.3 EMBEDDINGS 列（结构化数据向量化）
+
+EMBEDDINGS 列使用 `ft_transformer_embedding` 对多列结构化数据生成向量：
+
+```sql
+-- 列级语法
+CREATE TABLE customers (
+    id int PRIMARY KEY,
+    age int,
+    income float,
+    category text,
+    demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
+) WITH (vector_len = 384);
+
+INSERT INTO customers VALUES (1, 25, 50000, 'student');
+INSERT INTO customers VALUES (2, 40, 120000, 'professional');
+
+-- 相似性查询
+SELECT id, age, income, category,
+       round((demographic <=> (SELECT demographic FROM customers WHERE id = 1))::numeric, 4) AS distance
+FROM customers WHERE id != 1 ORDER BY distance;
+```
+
+#### 6.3.4 CREATE EMBEDDINGS 语句（对已有表添加向量列）
+
+```sql
+-- 创建基础表
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    price FLOAT8,
+    brand TEXT
+);
+
+-- 添加 EMBEDDINGS 向量列
+CREATE EMBEDDINGS product_vec ON products
+    USING ft_transformer_embedding (price, brand)
+    WITH (vector_len = 384);
+
+-- 插入数据时自动计算向量
+INSERT INTO products (price, brand) VALUES (99.9, 'BrandA');
+
+-- 查询向量
+SELECT id, price, brand, vector_dims(product_vec) AS dims FROM products;
+
+-- 删除 EMBEDDINGS 向量列
+DROP EMBEDDINGS product_vec ON products;
 ```
 
 ### 6.4 jolix_vectorize 扩展
