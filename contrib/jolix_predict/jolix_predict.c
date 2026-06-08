@@ -742,9 +742,12 @@ llm_infer(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
+		ErrorData  *errdata = CopyErrorData();
+
 		ereport(WARNING,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("llm_infer: LLM inference failed, returning NULL")));
+				 errmsg("llm_infer: LLM inference failed: %s", errdata->message)));
+		FlushErrorState();
 		content = NULL;
 	}
 	PG_END_TRY();
@@ -1014,9 +1017,12 @@ llm_infer_with_history(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
+		ErrorData  *errdata = CopyErrorData();
+
 		ereport(WARNING,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("llm_infer_with_history: LLM inference failed, returning NULL")));
+				 errmsg("llm_infer_with_history: LLM inference failed: %s", errdata->message)));
+		FlushErrorState();
 		content = NULL;
 	}
 	PG_END_TRY();

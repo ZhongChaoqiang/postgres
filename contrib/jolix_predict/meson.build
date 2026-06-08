@@ -11,8 +11,9 @@ endif
 
 jolix_predict = shared_module('jolix_predict',
   jolix_predict_sources,
-  dependencies: jolix_predict_deps,
-  kwargs: contrib_mod_args,
+  kwargs: contrib_mod_args + {
+    'dependencies': [jolix_predict_deps, contrib_mod_args['dependencies']],
+  },
 )
 
 contrib_targets += jolix_predict

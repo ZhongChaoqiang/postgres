@@ -100,6 +100,7 @@ typedef struct
 	int			vector_index_lists; /* lists param for ivfflat, -1 = not set */
 	int			vector_index_m;	/* m param for hnsw, -1 = not set */
 	int			vector_index_ef_construction; /* ef_construction param for hnsw, -1 = not set */
+	char	   *embedding_function; /* embedding function name from EMBEDDING AS clause */
 } CreateStmtContext;
 
 /* State shared by transformCreateSchemaStmtElements and its subroutines */
@@ -264,6 +265,7 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.vector_index_lists = -1;	/* -1 means not specified */
 	cxt.vector_index_m = -1;
 	cxt.vector_index_ef_construction = -1;
+	cxt.embedding_function = NULL;
 
 	Assert(!stmt->ofTypename || !stmt->inhRelations);	/* grammar enforces */
 
@@ -418,6 +420,37 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	stmt->tableElts = cxt.columns;
 	stmt->constraints = cxt.ckconstraints;
 	stmt->nnconstraints = cxt.nnconstraints;
+
+	/*
+	 * If we found an EMBEDDING AS clause, add the embedding_function reloption
+	 * so that RAG inference can find the embedding function automatically.
+	 */
+	if (cxt.embedding_function != NULL)
+	{
+		DefElem    *defel;
+		bool		found = false;
+		ListCell   *option;
+
+		/* Check if embedding_function already exists in options */
+		foreach(option, stmt->options)
+		{
+			DefElem    *existing = lfirst_node(DefElem, option);
+
+			if (strcmp(existing->defname, "embedding_function") == 0)
+			{
+				found = true;
+				break;
+			}
+		}
+
+		if (!found)
+		{
+			defel = makeDefElem("embedding_function",
+								(Node *) makeString(pstrdup(cxt.embedding_function)),
+								-1);
+			stmt->options = lappend(stmt->options, defel);
+		}
+	}
 
 	result = lappend(cxt.blist, stmt);
 	result = list_concat(result, cxt.alist);
@@ -1234,6 +1267,46 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 		TypeName   *vector_type;
 		int			vector_len;
 		A_Const    *typmod_const;
+
+		/*
+		 * Extract the embedding function name from the EMBEDDING AS
+		 * expression (e.g., st_embedding(content) -> st_embedding)
+		 * and store it so we can set the embedding_function reloption.
+		 */
+		if (column->raw_default != NULL && IsA(column->raw_default, FuncCall))
+		{
+			FuncCall   *fc = (FuncCall *) column->raw_default;
+			char	   *funcname;
+
+			if (list_length(fc->funcname) == 1)
+				funcname = strVal(linitial(fc->funcname));
+			else
+				funcname = strVal(llast(fc->funcname));
+
+			if (cxt->embedding_function == NULL)
+			{
+				cxt->embedding_function = pstrdup(funcname);
+			}
+			else
+			{
+				char	   *old = cxt->embedding_function;
+				char	   *new_func;
+
+				if (strchr(old, ':') != NULL)
+				{
+					new_func = psprintf("%s;%s:%s", old, column->colname, funcname);
+				}
+				else
+				{
+					new_func = psprintf("%s:%s;%s:%s",
+										cxt->columns ? ((ColumnDef *) linitial(cxt->columns))->colname : "col",
+										old,
+										column->colname, funcname);
+				}
+				cxt->embedding_function = new_func;
+				pfree(old);
+			}
+		}
 
 		/* Get vector_len from relation options */
 		vector_len = cxt->vector_len;
