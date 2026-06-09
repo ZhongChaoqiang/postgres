@@ -31,6 +31,7 @@
 ```
 postgresql-18 依赖:
   ├── postgresql-client-18
+  ├── postgresql-common (>= 200)
   ├── libpq5 (>= 18~)
   └── ssl-cert
 
@@ -44,6 +45,8 @@ postgresql-server-dev-18 依赖:
   ├── libpq-dev
   └── postgresql-common
 ```
+
+> **注意**：`postgresql-common` 是系统包（由 Ubuntu 官方仓库提供），不包含在本安装包中。安装时会自动从 apt 仓库安装。
 
 ## 2. 系统要求
 
@@ -77,7 +80,9 @@ sudo apt-get install -y \
     liblz4-1 \
     libzstd1 \
     libsystemd0 \
-    ssl-cert
+    ssl-cert \
+    postgresql-common \
+    postgresql-client-common
 ```
 
 > **注意**：本安装包已内置 pgvector，无需额外安装 `postgresql-18-pgvector`。
@@ -116,41 +121,30 @@ cp postgresql-server-dev-18_18.3-1_amd64.deb /tmp/pg18-install/
 cp postgresql-doc-18_18.3-1_all.deb /tmp/pg18-install/
 ```
 
-#### 3.1.3 按顺序安装各组件
+#### 3.1.3 安装所有 deb 包
+
+> **重要**：必须同时安装所有 deb 包，否则会因依赖关系导致配置失败。由于本安装包与系统 `postgresql-common`/`postgresql-client-common` 存在文件重叠（如 `/usr/bin/psql`、`/usr/bin/pg_archivecleanup` 等），需要使用 `--force-overwrite` 选项。
 
 ```bash
 cd /tmp/pg18-install
 
-# 1. 安装客户端共享库（基础依赖）
-sudo dpkg -i libpq5_18.3-1_amd64.deb
-
-# 2. 安装客户端工具
-sudo dpkg -i --force-overwrite postgresql-client-18_18.3-1_amd64.deb
-
-# 3. 安装数据库服务器（含 pgvector）
-sudo dpkg -i --force-overwrite postgresql-18_18.3-1_amd64.deb
-
-# 4. （可选）安装开发头文件
-sudo dpkg -i --force-overwrite libpq-dev_18.3-1_amd64.deb
-sudo dpkg -i --force-overwrite postgresql-server-dev-18_18.3-1_amd64.deb
-
-# 5. （可选）安装文档
-sudo dpkg -i postgresql-doc-18_18.3-1_all.deb
-```
-
-#### 3.1.4 修复可能的依赖问题
-
-```bash
-sudo apt-get install -f
-```
-
-#### 3.1.5 一键安装（替代方案）
-
-```bash
-cd /tmp/pg18-install
+# 同时安装所有 deb 包（--force-overwrite 处理与 postgresql-common 的文件冲突）
 sudo dpkg -i --force-overwrite *.deb
-sudo apt-get install -f
+
+# 配置所有未完成的包
+sudo dpkg --configure -a
 ```
+
+> **说明**：
+> - 如果 2.3 节的依赖已提前安装（含 `postgresql-common`），上述两步即可完成安装。
+> - 如果未提前安装 `postgresql-common`，`dpkg -i` 会报依赖缺失，需额外执行：
+>   ```bash
+>   sudo apt --fix-broken install -y
+>   sudo dpkg --force-overwrite -i /var/cache/apt/archives/postgresql-client-common_*.deb /var/cache/apt/archives/postgresql-common_*.deb
+>   sudo dpkg --configure -a
+>   ```
+> - `--force-overwrite` 是安全的，因为本安装包的文件版本（18.3）比系统 `postgresql-common`（238）自带的文件版本更新，覆盖后不影响功能。
+> - 可以用 `dpkg -l postgresql-18` 验证安装状态，`ii` 表示安装成功。
 
 ### 3.2 方法二：从源码构建安装
 
@@ -203,10 +197,14 @@ dpkg-buildpackage -us -uc -j$(nproc) -b
 
 ```bash
 cd ..
-sudo dpkg -i --force-overwrite libpq5_18.3-1_amd64.deb
-sudo dpkg -i --force-overwrite postgresql-client-18_18.3-1_amd64.deb
-sudo dpkg -i --force-overwrite postgresql-18_18.3-1_amd64.deb
-sudo apt-get install -f
+
+# 同时安装所有 deb 包
+sudo dpkg -i --force-overwrite *.deb
+
+# 安装系统依赖并处理文件冲突
+sudo apt --fix-broken install -y
+sudo dpkg --force-overwrite -i /var/cache/apt/archives/postgresql-client-common_*.deb /var/cache/apt/archives/postgresql-common_*.deb
+sudo dpkg --configure -a
 ```
 
 ## 4. 初始化和配置
@@ -249,19 +247,33 @@ Success. You can now start the database server using:
     pg_ctl -D /var/lib/postgresql/18/main -l logfile start
 ```
 
-### 4.3 配置 PostgreSQL
+### 4.3 设置用户密码
 
-#### 4.3.1 编辑 postgresql.conf
+安装完成后，postgres 用户默认没有密码，建议设置密码：
 
 ```bash
-sudo nano /var/lib/postgresql/18/main/postgresql.conf
+# 设置 postgres 系统用户密码
+sudo passwd postgres
+
+# 设置 postgres 数据库用户密码（需先启动 PostgreSQL）
+sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'your_password';"
+```
+
+> **注意**：postgres 系统用户和 postgres 数据库用户是不同的概念。系统用户用于操作系统层面的操作（如启动服务），数据库用户用于 PostgreSQL 连接认证。
+
+### 4.4 配置 PostgreSQL
+
+#### 4.4.1 编辑 postgresql.conf
+
+```bash
+sudo vi /var/lib/postgresql/18/main/postgresql.conf
 ```
 
 关键配置项：
 
 ```ini
 # 监听地址（0.0.0.0 表示监听所有地址）
-listen_addresses = 'localhost'
+listen_addresses = '*'
 
 # 端口
 port = 5432
@@ -290,7 +302,7 @@ log_filename = 'postgresql-%Y-%m-%d.log'
 log_statement = 'mod'
 ```
 
-#### 4.3.2 编辑 pg_hba.conf（客户端认证）
+#### 4.4.2 编辑 pg_hba.conf（客户端认证）
 
 ```bash
 sudo nano /var/lib/postgresql/18/main/pg_hba.conf
@@ -310,9 +322,16 @@ host    all             all             ::1/128                 scram-sha-256
 # host    all             all             192.168.1.0/24          scram-sha-256
 ```
 
-### 4.4 配置 systemd 服务
+> **远程连接配置**：如果需要从其他机器（如 Windows 上的 pgAdmin）连接，需添加以下配置：
+> ```
+> # 允许所有 IP 连接（生产环境请限制具体网段）
+> host    all             all             0.0.0.0/0               scram-sha-256
+> ```
+> 同时需修改 `postgresql.conf` 中 `listen_addresses = '*'`，并重启 PostgreSQL 服务。
 
-#### 4.4.1 创建 systemd 服务文件
+### 4.5 配置 systemd 服务
+
+#### 4.5.1 创建 systemd 服务文件
 
 ```bash
 sudo nano /etc/systemd/system/postgresql-18.service
@@ -341,7 +360,7 @@ OOMScoreAdjust=-1000
 WantedBy=multi-user.target
 ```
 
-#### 4.4.2 启用并启动服务
+#### 4.5.2 启用并启动服务
 
 ```bash
 sudo systemctl daemon-reload
@@ -349,7 +368,7 @@ sudo systemctl enable postgresql-18
 sudo systemctl start postgresql-18
 ```
 
-#### 4.4.3 检查服务状态
+#### 4.5.3 检查服务状态
 
 ```bash
 sudo systemctl status postgresql-18
@@ -835,15 +854,46 @@ FATAL: could not create any TCP/IP sockets
 ### 9.6 依赖缺失
 
 ```
-dpkg: dependency problems prevent configuration of postgresql-18
+dpkg: dependency problems prevent configuration of postgresql-18:
+ postgresql-18 depends on postgresql-client-18; however: Package postgresql-client-18 is not installed.
+ postgresql-18 depends on postgresql-common (>= 200); however: Package postgresql-common is not installed.
+ postgresql-18 depends on libpq5 (>= 18~); however: Package libpq5 is not installed.
 ```
+
+**原因**：只安装了 `postgresql-18` 单个包，未同时安装依赖包。
 
 **解决方案：**
 ```bash
-sudo apt-get install -f
+# 同时安装所有 deb 包
+sudo dpkg -i --force-overwrite libpq5_18.3-1_amd64.deb \
+    postgresql-client-18_18.3-1_amd64.deb \
+    postgresql-18_18.3-1_amd64.deb
+
+# 安装系统依赖
+sudo apt --fix-broken install -y
+sudo dpkg --force-overwrite -i /var/cache/apt/archives/postgresql-client-common_*.deb /var/cache/apt/archives/postgresql-common_*.deb
+sudo dpkg --configure -a
 ```
 
-### 9.7 与官方 PostgreSQL 包冲突
+### 9.7 与 postgresql-common 文件冲突
+
+```
+dpkg: error processing archive .../postgresql-client-common_238_all.deb (--unpack):
+ trying to overwrite '/usr/bin/clusterdb', which is also in package postgresql-client-18 18.3-1
+dpkg: error processing archive .../postgresql-common_238_all.deb (--unpack):
+ trying to overwrite '/usr/bin/pg_archivecleanup', which is also in package postgresql-18 18.3-1
+```
+
+**原因**：本安装包将客户端工具（psql、pg_dump 等）和管理工具（pg_archivecleanup 等）直接安装到 `/usr/bin/`，而系统 `postgresql-common`/`postgresql-client-common` 包也包含这些文件的旧版本，导致文件冲突。
+
+**解决方案：**
+```bash
+# 使用 --force-overwrite 强制安装系统包（本安装包的文件版本更新，覆盖安全）
+sudo dpkg --force-overwrite -i /var/cache/apt/archives/postgresql-client-common_*.deb /var/cache/apt/archives/postgresql-common_*.deb
+sudo dpkg --configure -a
+```
+
+### 9.8 与官方 PostgreSQL 包冲突
 
 **解决方案：**
 ```bash
@@ -856,6 +906,49 @@ sudo dpkg -i --force-overwrite libpq5_18.3-1_amd64.deb \
     postgresql-client-18_18.3-1_amd64.deb \
     postgresql-18_18.3-1_amd64.deb
 ```
+
+### 9.9 WSL2 环境下 pgAdmin 无法连接
+
+```
+connection failed: connection to server at "127.0.0.1", port 5432 failed:
+server closed the connection unexpectedly
+```
+
+**原因**：WSL2 使用独立的虚拟网络，Windows 的 `127.0.0.1` 无法直接访问 WSL2 内的服务。
+
+**解决方案：**
+
+1. 修改 PostgreSQL 配置允许远程连接：
+```bash
+# postgresql.conf
+listen_addresses = '*'
+
+# pg_hba.conf 添加
+host    all             all             0.0.0.0/0               scram-sha-256
+```
+
+2. 重启 PostgreSQL 服务
+
+3. 获取 WSL2 的 IP 地址：
+```bash
+hostname -I
+```
+
+4. 在 pgAdmin 中使用 WSL2 的 IP 地址连接（而非 `127.0.0.1`）
+
+5. （可选）配置 Windows 端口转发，实现通过 `127.0.0.1` 访问：
+```powershell
+# 在 Windows PowerShell（管理员）中执行
+netsh interface portproxy add v4tov4 listenport=5432 listenaddress=127.0.0.1 connectport=5432 connectaddress=<WSL_IP>
+
+# 查看端口转发规则
+netsh interface portproxy show all
+
+# 删除端口转发规则
+netsh interface portproxy delete v4tov4 listenport=5432 listenaddress=127.0.0.1
+```
+
+> **注意**：WSL2 的 IP 地址每次重启可能会变化，端口转发规则需要重新配置。
 
 ## 10. 安全建议
 
