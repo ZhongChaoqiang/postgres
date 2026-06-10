@@ -5325,6 +5325,13 @@ rewrite_embedding_funcexpr(FuncExpr *funcexpr, Query *query)
 	}
 	
 	ReleaseSysCache(proc_tuple);
+
+	/* Also recursively walk function args for embedding operators inside */
+	foreach(lc, funcexpr->args)
+	{
+		lfirst(lc) = rewrite_embedding_walker((Node *) lfirst(lc), query);
+	}
+
 	return (Node *) funcexpr;
 }
 
@@ -5439,6 +5446,13 @@ rewrite_embedding_walker(Node *node, Query *query)
 	{
 		RelabelType *rt = (RelabelType *) node;
 		rt->arg = (Expr *) rewrite_embedding_walker((Node *) rt->arg, query);
+		return node;
+	}
+
+	if (IsA(node, CoerceViaIO))
+	{
+		CoerceViaIO *cvio = (CoerceViaIO *) node;
+		cvio->arg = (Expr *) rewrite_embedding_walker((Node *) cvio->arg, query);
 		return node;
 	}
 

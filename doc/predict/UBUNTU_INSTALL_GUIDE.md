@@ -268,6 +268,12 @@ Success. You can now start the database server using:
     pg_ctl -D /var/lib/postgresql/18/main -l logfile start
 ```
 
+> **注意**：启动数据库必须使用 postgres 用户执行，不能以 root 或其他用户运行：
+> ```bash
+> sudo -u postgres pg_ctl -D /var/lib/postgresql/18/main -l /var/log/postgresql/logfile start
+> ```
+> PostgreSQL 出于安全考虑拒绝以 root 身份运行，且数据目录 `/var/lib/postgresql/18/main` 的 owner 是 postgres 用户。
+
 ### 4.3 设置用户密码
 
 安装完成后，postgres 用户默认没有密码，建议设置密码：
