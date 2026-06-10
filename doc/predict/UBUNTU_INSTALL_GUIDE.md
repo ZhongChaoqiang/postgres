@@ -82,11 +82,32 @@ sudo apt-get install -y \
     libsystemd0 \
     ssl-cert \
     postgresql-common \
-    postgresql-client-common
+    postgresql-client-common \
+    python3 \
+    python3-pip
 ```
 
 > **注意**：本安装包已内置 pgvector，无需额外安装 `postgresql-18-pgvector`。
 > 如果系统已安装官方 `postgresql-18-pgvector` 包，请先卸载，否则会因 ABI 不兼容导致 vector 扩展无法加载。
+
+### 2.4 Python 依赖（EMBEDDING 功能必需）
+
+如果需要使用 `jolix_embedding` 扩展的 `st_embedding` 函数（文本向量化），需安装 `sentence-transformers`：
+
+```bash
+# 全局安装（推荐，确保 postgres 用户可访问）
+sudo -H pip3 install sentence-transformers
+
+# 或使用用户级安装（需确保 postgres 用户也能访问）
+pip3 install sentence-transformers
+```
+
+> **重要**：`sentence-transformers` 必须对 `postgres` 系统用户可见。如果使用用户级安装（`pip3 install --user`），包会安装到当前用户的 `~/.local/lib/` 下，`postgres` 用户无法访问。建议使用 `sudo -H pip3 install` 全局安装。
+>
+> 验证安装：
+> ```bash
+> sudo -u postgres python3 -c "import sentence_transformers; print('OK:', sentence_transformers.__version__)"
+> ```
 
 ## 3. 安装步骤
 
@@ -610,26 +631,34 @@ FROM docs ORDER BY distance;
 
 #### 6.3.3 EMBEDDINGS 列（结构化数据向量化）
 
-EMBEDDINGS 列使用 `ft_transformer_embedding` 对多列结构化数据生成向量：
+EMBEDDINGS 列使用 `ft_transformer_embedding` 对多列结构化数据生成向量，支持在 CREATE TABLE 中直接定义：
 
 ```sql
--- 列级语法
+-- 列级语法（在 CREATE TABLE 中定义）
 CREATE TABLE customers (
     id int PRIMARY KEY,
     age int,
-    income float,
+    income float8,
     category text,
-    demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
+    demographic vector EMBEDDINGS AS (ft_transformer_embedding(age, income, category))
 ) WITH (vector_len = 384);
 
-INSERT INTO customers VALUES (1, 25, 50000, 'student');
-INSERT INTO customers VALUES (2, 40, 120000, 'professional');
+INSERT INTO customers (id, age, income, category) VALUES (1, 25, 50000, 'student');
+INSERT INTO customers (id, age, income, category) VALUES (2, 40, 120000, 'professional');
 
 -- 相似性查询
 SELECT id, age, income, category,
        round((demographic <=> (SELECT demographic FROM customers WHERE id = 1))::numeric, 4) AS distance
 FROM customers WHERE id != 1 ORDER BY distance;
 ```
+
+也可以直接调用 `ft_transformer_embedding` 函数：
+
+```sql
+SELECT vector_dims(ft_transformer_embedding(25, 50000.0, 'student'::text)) AS dims;
+```
+
+> **注意**：`ft_transformer_embedding` 与 `st_embedding` 共用 `sentence-transformers` 依赖，需确保已按 2.4 节安装。
 
 #### 6.3.4 CREATE EMBEDDINGS 语句（对已有表添加向量列）
 
@@ -851,7 +880,42 @@ FATAL: could not create any TCP/IP sockets
 2. 修改 `postgresql.conf` 中的 `port` 配置
 3. 停止占用端口的进程
 
-### 9.6 依赖缺失
+### 9.6 EMBEDDING 功能报错：could not create model directory
+
+```
+ERROR: could not create model directory: /usr/local/pgsql/models
+```
+
+**原因**：`jolix_embedding` 扩展需要 `/usr/local/pgsql/models` 目录来缓存下载的 embedding 模型，但该目录不存在或权限不足。
+
+**解决方案：**
+```bash
+# 创建模型目录并设置权限
+sudo mkdir -p /usr/local/pgsql/models
+sudo chown postgres:postgres /usr/local/pgsql/models
+```
+
+> **注意**：从 18.3-1 版本起，deb 包的 postinst 脚本会自动创建该目录。如果使用旧版本安装包，需手动创建。
+
+### 9.7 EMBEDDING 功能报错：could not import sentence_transformers module
+
+```
+ERROR: could not import sentence_transformers module
+HINT: Install sentence-transformers: pip install sentence-transformers
+```
+
+**原因**：`sentence-transformers` 未安装，或仅安装在当前用户目录下，`postgres` 系统用户无法访问。
+
+**解决方案：**
+```bash
+# 全局安装（推荐）
+sudo -H pip3 install sentence-transformers
+
+# 验证 postgres 用户可访问
+sudo -u postgres python3 -c "import sentence_transformers; print('OK')"
+```
+
+### 9.8 依赖缺失
 
 ```
 dpkg: dependency problems prevent configuration of postgresql-18:
@@ -875,7 +939,7 @@ sudo dpkg --force-overwrite -i /var/cache/apt/archives/postgresql-client-common_
 sudo dpkg --configure -a
 ```
 
-### 9.7 与 postgresql-common 文件冲突
+### 9.9 与 postgresql-common 文件冲突
 
 ```
 dpkg: error processing archive .../postgresql-client-common_238_all.deb (--unpack):
@@ -893,7 +957,7 @@ sudo dpkg --force-overwrite -i /var/cache/apt/archives/postgresql-client-common_
 sudo dpkg --configure -a
 ```
 
-### 9.8 与官方 PostgreSQL 包冲突
+### 9.10 与官方 PostgreSQL 包冲突
 
 **解决方案：**
 ```bash
@@ -907,7 +971,7 @@ sudo dpkg -i --force-overwrite libpq5_18.3-1_amd64.deb \
     postgresql-18_18.3-1_amd64.deb
 ```
 
-### 9.9 WSL2 环境下 pgAdmin 无法连接
+### 9.11 WSL2 环境下 pgAdmin 无法连接
 
 ```
 connection failed: connection to server at "127.0.0.1", port 5432 failed:
@@ -1000,6 +1064,7 @@ netsh interface portproxy delete v4tov4 listenport=5432 listenaddress=127.0.0.1
 | `/usr/share/postgresql/18/` | 数据文件 |
 | `/usr/share/postgresql/18/extension/` | 扩展定义文件 |
 | `/var/lib/postgresql/18/main/` | 数据目录 |
+| `/usr/local/pgsql/models/` | Embedding 模型缓存目录 |
 | `/var/log/postgresql/` | 日志目录 |
 | `/var/run/postgresql/` | 运行时目录 |
 

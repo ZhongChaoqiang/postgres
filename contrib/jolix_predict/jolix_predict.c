@@ -43,6 +43,7 @@
 #include "utils/typcache.h"
 #include "utils/array.h"
 #include "catalog/pg_class.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/predict.h"
 #include "utils/timestamp.h"
@@ -1463,8 +1464,10 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 	if (table_name != NULL)
 	{
 		Oid			relid;
+		RangeVar   *rv;
 
-		relid = RelnameGetRelid(table_name);
+		rv = makeRangeVarFromNameList(stringToQualifiedNameList(table_name, NULL));
+		relid = RangeVarGetRelid(rv, NoLock, true);
 		if (OidIsValid(relid))
 			rag_table = relid;
 	}

@@ -505,7 +505,17 @@ predict_trigger(PG_FUNCTION_ARGS)
 				char	   *saved_current_table = NULL;
 				const char *relname_str;
 
-				relname_str = RelationGetRelationName(rel);
+				/* Use schema-qualified name to support tables in non-public schemas */
+				{
+					Oid			namespaceId = RelationGetNamespace(rel);
+					char	   *nspname = get_namespace_name(namespaceId);
+					const char *relname = RelationGetRelationName(rel);
+
+					if (nspname)
+						relname_str = psprintf("%s.%s", nspname, relname);
+					else
+						relname_str = relname;
+				}
 				{
 					const char *cur_val = GetConfigOption("jolix_predict.current_table", true, false);
 					if (cur_val && strlen(cur_val) > 0)

@@ -3859,6 +3859,8 @@ columnDef:	ColId Typename opt_column_storage opt_column_compression create_gener
 								n->is_embeddings = true;
 								n->is_embedding = false;
 								n->generated = c->generated_kind;
+								n->embeddings_func = (List *) c->raw_expr;
+								n->embeddings_cols = c->keys;
 							}
 							else
 							{
@@ -3959,6 +3961,20 @@ opt_embedding_clause:
 					n->raw_expr = $4;
 					n->cooked_expr = NULL;
 					n->generated_kind = ATTRIBUTE_GENERATED_EMBEDDING;
+					n->location = @1;
+
+					$$ = (Node *) n;
+				}
+			| EMBEDDINGS AS '(' func_name '(' columnList ')' ')' opt_stored_keyword
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_EMBEDDINGS;
+					n->generated_when = ATTRIBUTE_IDENTITY_ALWAYS;
+					n->raw_expr = (Node *) $4;
+					n->keys = $6;
+					n->cooked_expr = NULL;
+					n->generated_kind = ATTRIBUTE_GENERATED_EMBEDDINGS;
 					n->location = @1;
 
 					$$ = (Node *) n;
