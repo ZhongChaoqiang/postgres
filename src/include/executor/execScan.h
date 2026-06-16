@@ -16,6 +16,7 @@
 #include "miscadmin.h"
 #include "executor/executor.h"
 #include "nodes/execnodes.h"
+#include "utils/predict.h"
 
 /*
  * ExecScanFetch -- check interrupts & fetch next potential tuple
@@ -165,6 +166,7 @@ ExecScanExtended(ScanState *node,
 				 ProjectionInfo *projInfo)
 {
 	ExprContext *econtext = node->ps.ps_ExprContext;
+	TupleTableSlot *slot;
 
 	/* interrupt checks are in ExecScanFetch */
 
@@ -175,7 +177,13 @@ ExecScanExtended(ScanState *node,
 	if (!qual && !projInfo)
 	{
 		ResetExprContext(econtext);
-		return ExecScanFetch(node, epqstate, accessMtd, recheckMtd);
+		slot = ExecScanFetch(node, epqstate, accessMtd, recheckMtd);
+
+		/* On-demand prediction for async predict columns */
+		if (!TupIsNull(slot) && node->ss_currentRelation != NULL)
+			ExecPredictOnDemand(node->ss_currentRelation, slot);
+
+		return slot;
 	}
 
 	/*
@@ -190,8 +198,6 @@ ExecScanExtended(ScanState *node,
 	 */
 	for (;;)
 	{
-		TupleTableSlot *slot;
-
 		slot = ExecScanFetch(node, epqstate, accessMtd, recheckMtd);
 
 		/*
@@ -212,6 +218,13 @@ ExecScanExtended(ScanState *node,
 		 * place the current tuple into the expr context
 		 */
 		econtext->ecxt_scantuple = slot;
+
+		/*
+		 * On-demand prediction: if this table has async predict columns and
+		 * the predict column is NULL, compute the prediction immediately.
+		 */
+		if (node->ss_currentRelation != NULL)
+			ExecPredictOnDemand(node->ss_currentRelation, slot);
 
 		/*
 		 * check that the current tuple satisfies the qual-clause

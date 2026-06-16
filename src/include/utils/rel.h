@@ -340,8 +340,8 @@ typedef enum StdRdOptIndexCleanup
 /* StdRdOptions->predict_timing values */
 typedef enum StdRdOptPredictTiming
 {
-	STDRD_OPTION_PREDICT_TIMING_DEFERRED = 0,
-	STDRD_OPTION_PREDICT_TIMING_IMMEDIATE,
+	STDRD_OPTION_PREDICT_TIMING_DEFERRED = 0,	/* deferred mode (default): on-demand SELECT + background worker */
+	STDRD_OPTION_PREDICT_TIMING_IMMEDIATE,		/* immediate mode: compute at INSERT/UPDATE time */
 } StdRdOptPredictTiming;
 
 /* StdRdOptions->vector_index values */

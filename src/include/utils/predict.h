@@ -14,9 +14,13 @@
 #define PREDICT_H
 
 #include "postgres.h"
+#include "executor/tuptable.h"
 
 extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid, const char *colname);
 
 extern Datum embeddings_trigger(PG_FUNCTION_ARGS);
+
+/* On-demand prediction for async predict columns during SELECT */
+extern void ExecPredictOnDemand(struct RelationData *rel, TupleTableSlot *slot);
 
 #endif							/* PREDICT_H */

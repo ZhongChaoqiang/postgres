@@ -624,6 +624,323 @@ predict_trigger(PG_FUNCTION_ARGS)
 	return PointerGetDatum(newtuple);
 }
 
+/*
+ * ExecPredictOnDemand - On-demand prediction for deferred predict columns
+ *
+ * When a SELECT query scans a table with predict_timing = deferred and encounters
+ * a tuple where a predict column is NULL, this function computes the prediction
+ * immediately, updates the slot with the predicted value, and persists the
+ * prediction to the table via SPI.
+ */
+void
+ExecPredictOnDemand(Relation rel, TupleTableSlot *slot)
+{
+	static bool in_predict_on_demand = false;
+	TupleDesc	tupdesc;
+	StdRdOptions   *relopts;
+	StdRdOptPredictTiming predict_timing;
+	int			attnum;
+	bool		any_predict_null = false;
+	int		   *null_predict_attnums;
+	int		   *null_predict_predict_attnums;	/* _predict column attnums */
+	int			n_null_predict = 0;
+	HeapTuple	tuple;
+	int		   *modify_attnums;
+	Datum	   *modify_values;
+	bool	   *modify_nulls;
+	int			nmodify = 0;
+	MemoryContext oldcontext;
+	MemoryContext predict_context;
+
+	if (rel == NULL || slot == NULL || TupIsNull(slot))
+		return;
+
+	/* Prevent recursive entry (SPI UPDATE can trigger another scan) */
+	if (in_predict_on_demand)
+		return;
+
+	in_predict_on_demand = true;
+
+	tupdesc = RelationGetDescr(rel);
+
+	/* Quick check: does this relation have predict columns? */
+	if (tupdesc->constr == NULL || !tupdesc->constr->has_generated_predict)
+	{
+		in_predict_on_demand = false;
+		return;
+	}
+
+	/* Check predict_timing */
+	relopts = (StdRdOptions *) rel->rd_options;
+	predict_timing = STDRD_OPTION_PREDICT_TIMING_DEFERRED;
+	if (relopts != NULL)
+		predict_timing = relopts->predict_timing;
+
+	/* Only do on-demand prediction for deferred mode */
+	if (predict_timing != STDRD_OPTION_PREDICT_TIMING_DEFERRED)
+	{
+		in_predict_on_demand = false;
+		return;
+	}
+
+	/* First pass: find all NULL predict columns */
+	null_predict_attnums = (int *) palloc(sizeof(int) * tupdesc->natts);
+	null_predict_predict_attnums = (int *) palloc(sizeof(int) * tupdesc->natts);
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+		bool		isnull;
+		char	   *predict_colname;
+		AttrNumber	predict_attnum;
+
+		if (attr->attisdropped || !attr->attpredict)
+			continue;
+
+		/* Check if the predict column is NULL */
+		slot_getattr(slot, attnum, &isnull);
+		if (!isnull)
+			continue;
+
+		/* Find the _predict companion column */
+		predict_colname = psprintf("%s_predict", NameStr(attr->attname));
+		predict_attnum = find_column_by_name(tupdesc, predict_colname);
+		pfree(predict_colname);
+
+		null_predict_attnums[n_null_predict] = attnum;
+		null_predict_predict_attnums[n_null_predict] = predict_attnum;
+		n_null_predict++;
+		any_predict_null = true;
+	}
+
+	if (!any_predict_null)
+	{
+		pfree(null_predict_attnums);
+		pfree(null_predict_predict_attnums);
+		in_predict_on_demand = false;
+		return;
+	}
+
+	/* Allocate arrays for tuple modification (predict col + _predict col per null predict) */
+	modify_attnums = (int *) palloc(sizeof(int) * n_null_predict * 2);
+	modify_values = (Datum *) palloc(sizeof(Datum) * n_null_predict * 2);
+	modify_nulls = (bool *) palloc(sizeof(bool) * n_null_predict * 2);
+
+	predict_context = AllocSetContextCreate(CurrentMemoryContext,
+											"predict_on_demand",
+											ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(predict_context);
+
+	/* Get the heap tuple from the slot */
+	if (!TupIsNull(slot))
+	{
+		/*
+		 * Ensure the slot's tuple is deformed so we can access all attributes
+		 * via tts_values/tts_isnull arrays.
+		 */
+		slot_getallattrs(slot);
+	}
+
+	tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+	/* Compute predictions for each NULL predict column */
+	for (int i = 0; i < n_null_predict; i++)
+	{
+		int			predict_attnum = null_predict_attnums[i];
+		int			companion_attnum = null_predict_predict_attnums[i];
+		Form_pg_attribute predict_attr = TupleDescAttr(tupdesc, predict_attnum - 1);
+
+		if (predict_attr->attgenerated == ATTRIBUTE_GENERATED_PREDICT)
+		{
+			Expr	   *expr;
+			EState	   *estate;
+			ExprState  *exprstate;
+			ExprContext *econtext;
+			TupleTableSlot *eval_slot;
+			Datum		val;
+			bool		val_isnull;
+			char	   *saved_current_table = NULL;
+			const char *relname_str;
+
+			/* Build schema-qualified table name */
+			{
+				Oid			namespaceId = RelationGetNamespace(rel);
+				char	   *nspname = get_namespace_name(namespaceId);
+				const char *relname = RelationGetRelationName(rel);
+
+				if (nspname)
+					relname_str = psprintf("%s.%s", nspname, relname);
+				else
+					relname_str = relname;
+			}
+
+			/* Save and set current_table GUC */
+			{
+				const char *cur_val = GetConfigOption("jolix_predict.current_table", true, false);
+				if (cur_val && strlen(cur_val) > 0)
+					saved_current_table = pstrdup(cur_val);
+			}
+			SetConfigOption("jolix_predict.current_table", relname_str,
+							PGC_USERSET, PGC_S_SESSION);
+
+			PG_TRY();
+			{
+				expr = (Expr *) build_column_default(rel, predict_attnum);
+				if (expr != NULL)
+				{
+					estate = CreateExecutorState();
+					exprstate = ExecPrepareExpr(expr, estate);
+
+					eval_slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+					ExecStoreHeapTuple(tuple, eval_slot, false);
+
+					econtext = GetPerTupleExprContext(estate);
+					econtext->ecxt_scantuple = eval_slot;
+
+					val = ExecEvalExpr(exprstate, econtext, &val_isnull);
+
+					if (!val_isnull)
+					{
+						Datum		predict_datum;
+
+						predict_datum = datumCopy(val, predict_attr->attbyval, predict_attr->attlen);
+
+						/* Set predict column value */
+						modify_attnums[nmodify] = predict_attnum;
+						modify_values[nmodify] = predict_datum;
+						modify_nulls[nmodify] = false;
+						nmodify++;
+
+						/* Set _predict companion column value */
+						if (companion_attnum != InvalidAttrNumber)
+						{
+							modify_attnums[nmodify] = companion_attnum;
+							modify_values[nmodify] = datumCopy(val, predict_attr->attbyval, predict_attr->attlen);
+							modify_nulls[nmodify] = false;
+							nmodify++;
+						}
+					}
+
+					ExecDropSingleTupleTableSlot(eval_slot);
+					FreeExecutorState(estate);
+				}
+			}
+			PG_CATCH();
+			{
+				if (saved_current_table)
+					SetConfigOption("jolix_predict.current_table", saved_current_table,
+									PGC_USERSET, PGC_S_SESSION);
+				else
+					SetConfigOption("jolix_predict.current_table", "",
+									PGC_USERSET, PGC_S_SESSION);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+
+			/* Restore current_table GUC */
+			if (saved_current_table)
+			{
+				SetConfigOption("jolix_predict.current_table", saved_current_table,
+								PGC_USERSET, PGC_S_SESSION);
+				pfree(saved_current_table);
+			}
+			else
+				SetConfigOption("jolix_predict.current_table", "",
+								PGC_USERSET, PGC_S_SESSION);
+		}
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* If we computed any predictions, update the slot and persist to table */
+	if (nmodify > 0)
+	{
+		HeapTuple	modified_tuple;
+
+		/* Create a modified tuple with predicted values */
+		modified_tuple = heap_modify_tuple_by_cols(tuple, tupdesc, nmodify,
+												   modify_attnums, modify_values, modify_nulls);
+
+		/* Update the slot with the modified tuple */
+		ExecForceStoreHeapTuple(modified_tuple, slot, false);
+
+		/* Persist the prediction to the table via SPI */
+		PG_TRY();
+		{
+			int			ret;
+			StringInfoData query;
+			const char *relname;
+			const char *rel_quoted;
+
+			ret = SPI_connect();
+			if (ret != SPI_OK_CONNECT)
+			{
+				elog(LOG, "predict_on_demand: SPI_connect failed (%d)", ret);
+			}
+			else
+			{
+				/*
+				 * Build UPDATE statement to persist the prediction.
+				 * We update both the predict column and _predict column.
+				 */
+				relname = RelationGetRelationName(rel);
+				rel_quoted = quote_identifier(relname);
+
+				initStringInfo(&query);
+				appendStringInfo(&query, "UPDATE %s SET ", rel_quoted);
+
+				for (int i = 0; i < nmodify; i++)
+				{
+					Form_pg_attribute mod_attr = TupleDescAttr(tupdesc, modify_attnums[i] - 1);
+					Oid			typoutput;
+					bool		typIsVarlena;
+					char	   *val_str;
+
+					if (i > 0)
+						appendStringInfoString(&query, ", ");
+
+					getTypeOutputInfo(mod_attr->atttypid, &typoutput, &typIsVarlena);
+					val_str = OidOutputFunctionCall(typoutput, modify_values[i]);
+
+					appendStringInfo(&query, "%s = %s",
+									 quote_identifier(NameStr(mod_attr->attname)),
+									 quote_literal_cstr(val_str));
+					pfree(val_str);
+				}
+
+				appendStringInfo(&query, " WHERE ctid = '(%u,%u)'",
+								 ItemPointerGetBlockNumber(&tuple->t_self),
+								 ItemPointerGetOffsetNumber(&tuple->t_self));
+
+				ret = SPI_execute(query.data, false, 0);
+				pfree(query.data);
+
+				if (ret != SPI_OK_UPDATE)
+					elog(LOG, "predict_on_demand: SPI_execute UPDATE failed (%d)", ret);
+
+				SPI_finish();
+			}
+		}
+		PG_CATCH();
+		{
+			elog(LOG, "predict_on_demand: failed to persist prediction, continuing with in-memory value");
+			FlushErrorState();
+			/* Try to disconnect SPI if we're in an error state */
+			SPI_finish();
+		}
+		PG_END_TRY();
+	}
+
+	MemoryContextDelete(predict_context);
+	pfree(null_predict_attnums);
+	pfree(null_predict_predict_attnums);
+	pfree(modify_attnums);
+	pfree(modify_values);
+	pfree(modify_nulls);
+
+	in_predict_on_demand = false;
+}
+
 PG_FUNCTION_INFO_V1(llm_predict);
 PG_FUNCTION_INFO_V1(llm_rag_predict);
 

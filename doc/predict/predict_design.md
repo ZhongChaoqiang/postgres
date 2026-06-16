@@ -148,14 +148,33 @@ INSERT/UPDATE → BEFORE触发器 → predict_trigger
     ├── INSERT 时：
     │   ├── PREDICT列为NULL + immediate → 计算表达式 → 保存到predict列和_predict列
     │   ├── PREDICT列非NULL → 保留用户值 → 保存到_actual列
-    │   └── PREDICT列为NULL + deferred → 不计算，等待async worker
+    │   └── PREDICT列为NULL + deferred → 不计算，等待SELECT时按需推理或async worker
     │
     └── UPDATE 时：
         ├── PREDICT列被修改 → 保存新值到_actual列
         └── PREDICT列未被修改 + immediate → 重新计算表达式
 ```
 
-### 4.2 表达式计算方式
+### 4.2 deferred 模式下的 SELECT 按需推理流程
+
+```
+SELECT → ExecScanExtended → ExecPredictOnDemand
+    │
+    ├── 检查关系是否有 deferred predict 列
+    │
+    ├── 检查当前元组的 predict 列是否为 NULL
+    │
+    ├── 如果 predict 列为 NULL：
+    │   ├── 获取 PREDICT AS 表达式
+    │   ├── 执行表达式计算推理值
+    │   ├── 修改 slot 中的 predict 列和 _predict 列值
+    │   └── 通过 SPI 执行 UPDATE 持久化推理结果
+    │
+    └── 如果 predict 列非 NULL：
+        └── 直接返回（无需推理）
+```
+
+### 4.3 表达式计算方式
 
 在触发器中使用 `build_column_default` + `ExecPrepareExpr` + `ExecEvalExpr` 的方式计算内联表达式，而不是通过 SPI 执行 SQL 查询。这避免了 BEFORE INSERT 触发器中 ctid 无效的问题。
 
@@ -166,9 +185,21 @@ INSERT/UPDATE → BEFORE触发器 → predict_trigger
 | 模式 | 值 | 触发时机 | 处理方式 |
 |------|-----|---------|---------|
 | **immediate** | 立即预测 | INSERT/UPDATE 时 | 触发器实时调用预测表达式 |
-| **deferred** | 延迟预测（默认） | 后台异步处理 | Worker 进程批量处理 |
+| **deferred** | 延迟预测（默认） | SELECT 时按需推理 + 后台异步处理 | SELECT 时自动推理并持久化，同时后台 Worker 批量处理 |
 
-### 5.2 数据结构
+### 5.2 deferred 模式的按需推理机制
+
+当 `predict_timing = deferred` 时，系统采用双重推理策略：
+
+1. **按需推理（On-Demand）**：当 SELECT 查询访问到 predict 列为 NULL 的行时，立即执行推理表达式，将结果返回给查询并持久化到表中
+2. **后台推理（Background Worker）**：异步预测 Worker 定期扫描表，处理 predict 列为 NULL 的行
+
+按需推理的优势：
+- 用户无需等待后台 Worker 处理，SELECT 时即可获得推理结果
+- 推理结果自动持久化，后续查询无需重复推理
+- 与后台 Worker 互补，确保所有行最终都被处理
+
+### 5.3 数据结构
 
 ```c
 typedef enum StdRdOptPredictTiming
@@ -187,7 +218,7 @@ typedef struct StdRdOptions
 
 ### 6.1 概述
 
-异步预测模块（Async Predict Worker）是一个后台工作进程，用于异步处理 `predict_timing = deferred` 的 PREDICT 列预测任务。
+异步预测模块（Async Predict Worker）是一个后台工作进程，用于异步处理 `predict_timing = deferred` 的 PREDICT 列预测任务。与按需推理机制互补，确保所有 predict 列为 NULL 的行最终都被处理。
 
 ### 6.2 配置参数
 
@@ -223,12 +254,14 @@ typedef struct StdRdOptions
 | `src/backend/catalog/heap.c` | 系统表插入，跳过IMMUTABLE检查 |
 | `src/backend/executor/nodeModifyTable.c` | 跳过predict列的ExecComputeStoredGenerated |
 | `src/backend/rewrite/rewriteHandler.c` | 允许predict列接受INSERT/UPDATE的用户值 |
-| `src/backend/utils/adt/predict.c` | 预测触发器函数实现 |
+| `src/backend/utils/adt/predict.c` | 预测触发器函数实现，ExecPredictOnDemand按需推理 |
 | `src/backend/postmaster/async_predict.c` | 异步预测后台工作进程 |
-| `src/backend/access/common/reloptions.c` | predict_timing表选项定义 |
+| `src/backend/access/common/reloptions.c` | predict_timing表选项定义（async/immediate） |
 | `src/include/catalog/pg_attribute.h` | attpredict和atthidden字段定义 |
 | `src/include/nodes/parsenodes.h` | ColumnDef.is_predict和is_hidden字段定义 |
 | `src/include/utils/rel.h` | StdRdOptions.predict_timing字段定义 |
+| `src/include/utils/predict.h` | ExecPredictOnDemand函数声明 |
+| `src/include/executor/execScan.h` | ExecScanExtended中调用ExecPredictOnDemand |
 | `contrib/jolix_predict/` | jolix_predict扩展（LLM推理函数） |
 
 ## 8. jolix_predict 扩展

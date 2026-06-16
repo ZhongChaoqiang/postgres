@@ -112,7 +112,7 @@ INSERT INTO pred_multi (product, description) VALUES ('Database', 'Production da
 INSERT INTO pred_multi (product, description) VALUES ('Dashboard', 'Feature request: dark mode');
 SELECT id, product, description, priority FROM pred_multi;
 
-\echo '--- 2.5 PREDICT 列 - 延迟推理（predict_timing = deferred）---'
+\echo '--- 2.5 PREDICT 列 - 延迟推理（predict_timing = deferred，SELECT 时按需推理）---'
 DROP TABLE IF EXISTS pred_deferred CASCADE;
 CREATE TABLE pred_deferred (
     id serial PRIMARY KEY,
@@ -123,28 +123,34 @@ CREATE TABLE pred_deferred (
     )) STORED
 ) WITH (predict_timing = deferred);
 
-\echo '--- 2.5.1 插入数据（answer 列应为 NULL，等待 async worker 处理）---'
+\echo '--- 2.5.1 插入数据（answer 列应为 NULL，等待 deferred worker 或 SELECT 时按需推理）---'
 INSERT INTO pred_deferred (question) VALUES ('What is Java?');
 INSERT INTO pred_deferred (question) VALUES ('What is Linux?');
+
+\echo '--- 2.5.2 SELECT 时按需推理（deferred 模式下，SELECT 会自动触发推理）---'
 SELECT id, question, answer FROM pred_deferred;
 
-\echo '--- 2.5.2 验证 predict_timing 选项值 ---'
+\echo '--- 2.5.3 验证 predict_timing 选项值 ---'
 SELECT c.relname, reloptions
 FROM pg_class c
 WHERE c.relname = 'pred_deferred';
 
-\echo '--- 2.5.3 设置 async worker 参数（缩短扫描间隔以便测试）---'
+\echo '--- 2.5.4 验证推理结果已持久化（再次查询应直接返回结果，不再触发推理）---'
+SELECT id, question, answer FROM pred_deferred;
+
+\echo '--- 2.5.5 设置 async worker 参数（缩短扫描间隔以便测试）---'
 ALTER SYSTEM SET async_predict_naptime = 5;
 ALTER SYSTEM SET async_predict_enabled = true;
 SELECT pg_reload_conf();
 
-\echo '--- 2.5.4 等待 async worker 处理（等待约 10 秒）---'
+\echo '--- 2.5.6 等待 async worker 处理（等待约 10 秒）---'
 SELECT pg_sleep(10);
 
-\echo '--- 2.5.5 检查 async worker 是否已处理 ---'
+\echo '--- 2.5.7 检查 async worker 是否已处理 ---'
+INSERT INTO pred_deferred (question) VALUES ('What is Python?');
 SELECT id, question, answer FROM pred_deferred;
 
-\echo '--- 2.5.6 恢复 async worker 默认参数 ---'
+\echo '--- 2.5.8 恢复 async worker 默认参数 ---'
 ALTER SYSTEM RESET async_predict_naptime;
 SELECT pg_reload_conf();
 
