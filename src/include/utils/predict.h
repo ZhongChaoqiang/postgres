@@ -20,7 +20,10 @@ extern PGDLLIMPORT Oid get_embedding_function_oid(Oid relid, const char *colname
 
 extern Datum embeddings_trigger(PG_FUNCTION_ARGS);
 
-/* On-demand prediction for async predict columns during SELECT */
-extern void ExecPredictOnDemand(struct RelationData *rel, TupleTableSlot *slot);
+/* On-demand prediction for deferred predict columns during SELECT.
+ * infer_predict controls whether to actually perform inference (SELECT INFER)
+ * or skip it (plain SELECT, the default). */
+extern void ExecPredictOnDemand(struct RelationData *rel, TupleTableSlot *slot,
+								bool infer_predict);
 
 #endif							/* PREDICT_H */

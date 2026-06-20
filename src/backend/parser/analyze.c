@@ -1386,6 +1386,9 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 
 	qry->commandType = CMD_SELECT;
 
+	/* INFER keyword for deferred predict on-demand inference */
+	qry->inferPredict = stmt->inferPredict;
+
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
 	{

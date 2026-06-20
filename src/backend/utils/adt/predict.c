@@ -633,7 +633,7 @@ predict_trigger(PG_FUNCTION_ARGS)
  * prediction to the table via SPI.
  */
 void
-ExecPredictOnDemand(Relation rel, TupleTableSlot *slot)
+ExecPredictOnDemand(Relation rel, TupleTableSlot *slot, bool infer_predict)
 {
 	static bool in_predict_on_demand = false;
 	TupleDesc	tupdesc;
@@ -678,6 +678,13 @@ ExecPredictOnDemand(Relation rel, TupleTableSlot *slot)
 
 	/* Only do on-demand prediction for deferred mode */
 	if (predict_timing != STDRD_OPTION_PREDICT_TIMING_DEFERRED)
+	{
+		in_predict_on_demand = false;
+		return;
+	}
+
+	/* Only infer when the user explicitly requested it via SELECT INFER */
+	if (!infer_predict)
 	{
 		in_predict_on_demand = false;
 		return;

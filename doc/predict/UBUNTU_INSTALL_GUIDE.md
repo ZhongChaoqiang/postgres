@@ -332,7 +332,7 @@ log_statement = 'mod'
 #### 4.4.2 编辑 pg_hba.conf（客户端认证）
 
 ```bash
-sudo nano /var/lib/postgresql/18/main/pg_hba.conf
+sudo vi /var/lib/postgresql/18/main/pg_hba.conf
 ```
 
 示例配置：

@@ -224,6 +224,9 @@ typedef struct Query
 
 	List	   *distinctClause; /* a list of SortGroupClause's */
 
+	/* INFER keyword specified in SELECT (for deferred predict) */
+	bool		inferPredict pg_node_attr(query_jumble_ignore);
+
 	List	   *sortClause;		/* a list of SortGroupClause's */
 
 	Node	   *limitOffset;	/* # of result tuples to skip (int8 expr) */
@@ -2200,6 +2203,9 @@ typedef struct SelectStmt
 	bool		groupDistinct;	/* Is this GROUP BY DISTINCT? */
 	Node	   *havingClause;	/* HAVING conditional-expression */
 	List	   *windowClause;	/* WINDOW window_name AS (...), ... */
+
+	/* INFER keyword specified in SELECT (for deferred predict) */
+	bool		inferPredict;
 
 	/*
 	 * In a "leaf" node representing a VALUES list, the above fields are all

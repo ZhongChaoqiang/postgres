@@ -155,16 +155,21 @@ INSERT/UPDATE → BEFORE触发器 → predict_trigger
         └── PREDICT列未被修改 + immediate → 重新计算表达式
 ```
 
-### 4.2 deferred 模式下的 SELECT 按需推理流程
+### 4.2 deferred 模式下的 SELECT INFER 按需推理流程
 
 ```
-SELECT → ExecScanExtended → ExecPredictOnDemand
+SELECT [INFER] → ExecScanExtended → ExecPredictOnDemand(rel, slot, infer_predict)
+    │
+    ├── 检查 infer_predict 标志（来自 SELECT INFER 关键字）
+    │   └── 如果未指定 INFER（默认）→ 跳过推理，直接返回
     │
     ├── 检查关系是否有 deferred predict 列
     │
+    ├── 检查 predict_timing == DEFERRED
+    │
     ├── 检查当前元组的 predict 列是否为 NULL
     │
-    ├── 如果 predict 列为 NULL：
+    ├── 如果 predict 列为 NULL 且 infer_predict == true：
     │   ├── 获取 PREDICT AS 表达式
     │   ├── 执行表达式计算推理值
     │   ├── 修改 slot 中的 predict 列和 _predict 列值
@@ -173,6 +178,8 @@ SELECT → ExecScanExtended → ExecPredictOnDemand
     └── 如果 predict 列非 NULL：
         └── 直接返回（无需推理）
 ```
+
+**推理执行时机**：推理在 WHERE 条件检查之后、投影之前执行，确保 `SELECT INFER ... WHERE sentiment IS NULL` 能正确找到未推理的行。
 
 ### 4.3 表达式计算方式
 
@@ -185,17 +192,18 @@ SELECT → ExecScanExtended → ExecPredictOnDemand
 | 模式 | 值 | 触发时机 | 处理方式 |
 |------|-----|---------|---------|
 | **immediate** | 立即预测 | INSERT/UPDATE 时 | 触发器实时调用预测表达式 |
-| **deferred** | 延迟预测（默认） | SELECT 时按需推理 + 后台异步处理 | SELECT 时自动推理并持久化，同时后台 Worker 批量处理 |
+| **deferred** | 延迟预测（默认） | SELECT INFER 时按需推理 + 后台异步处理 | 默认 SELECT 跳过推理，SELECT INFER 触发推理并持久化，后台 Worker 批量处理 |
 
 ### 5.2 deferred 模式的按需推理机制
 
 当 `predict_timing = deferred` 时，系统采用双重推理策略：
 
-1. **按需推理（On-Demand）**：当 SELECT 查询访问到 predict 列为 NULL 的行时，立即执行推理表达式，将结果返回给查询并持久化到表中
+1. **按需推理（On-Demand）**：当用户执行 `SELECT INFER` 查询访问到 predict 列为 NULL 的行时，立即执行推理表达式，将结果返回给查询并持久化到表中。默认 `SELECT`（不带 INFER）跳过推理，直接返回当前值
 2. **后台推理（Background Worker）**：异步预测 Worker 定期扫描表，处理 predict 列为 NULL 的行
 
 按需推理的优势：
-- 用户无需等待后台 Worker 处理，SELECT 时即可获得推理结果
+- 用户通过 `SELECT INFER` 显式控制是否触发推理，避免意外触发耗时操作
+- 默认 `SELECT` 快速返回当前数据状态，适合查看未推理行数等场景
 - 推理结果自动持久化，后续查询无需重复推理
 - 与后台 Worker 互补，确保所有行最终都被处理
 

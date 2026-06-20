@@ -167,6 +167,7 @@ ExecScanExtended(ScanState *node,
 {
 	ExprContext *econtext = node->ps.ps_ExprContext;
 	TupleTableSlot *slot;
+	bool		infer_predict = node->ps.state->es_infer_predict;
 
 	/* interrupt checks are in ExecScanFetch */
 
@@ -179,9 +180,9 @@ ExecScanExtended(ScanState *node,
 		ResetExprContext(econtext);
 		slot = ExecScanFetch(node, epqstate, accessMtd, recheckMtd);
 
-		/* On-demand prediction for async predict columns */
+		/* On-demand prediction for deferred predict columns */
 		if (!TupIsNull(slot) && node->ss_currentRelation != NULL)
-			ExecPredictOnDemand(node->ss_currentRelation, slot);
+			ExecPredictOnDemand(node->ss_currentRelation, slot, infer_predict);
 
 		return slot;
 	}
@@ -220,13 +221,6 @@ ExecScanExtended(ScanState *node,
 		econtext->ecxt_scantuple = slot;
 
 		/*
-		 * On-demand prediction: if this table has async predict columns and
-		 * the predict column is NULL, compute the prediction immediately.
-		 */
-		if (node->ss_currentRelation != NULL)
-			ExecPredictOnDemand(node->ss_currentRelation, slot);
-
-		/*
 		 * check that the current tuple satisfies the qual-clause
 		 *
 		 * check for non-null qual here to avoid a function call to ExecQual()
@@ -235,6 +229,15 @@ ExecScanExtended(ScanState *node,
 		 */
 		if (qual == NULL || ExecQual(qual, econtext))
 		{
+			/*
+			 * On-demand prediction: if this table has deferred predict columns
+			 * and the predict column is NULL, compute the prediction now (after
+			 * qual check, before projection) so that SELECT INFER ... WHERE
+			 * sentiment IS NULL works correctly.
+			 */
+			if (node->ss_currentRelation != NULL)
+				ExecPredictOnDemand(node->ss_currentRelation, slot, infer_predict);
+
 			/*
 			 * Found a satisfactory scan tuple.
 			 */

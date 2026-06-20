@@ -858,6 +858,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 
 	estate->es_plannedstmt = plannedstmt;
 	estate->es_part_prune_infos = plannedstmt->partPruneInfos;
+	estate->es_infer_predict = plannedstmt->inferPredict;
 
 	/*
 	 * Perform runtime "initial" pruning to identify which child subplans,

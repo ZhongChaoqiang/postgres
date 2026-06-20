@@ -765,6 +765,9 @@ typedef struct EState
 	 */
 	List	   *es_insert_pending_result_relations;
 	List	   *es_insert_pending_modifytables;
+
+	/* INFER keyword specified for current query (for deferred predict) */
+	bool		es_infer_predict;
 } EState;
 
 

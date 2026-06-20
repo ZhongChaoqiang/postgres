@@ -136,6 +136,9 @@ typedef struct PlannedStmt
 	ParseLoc	stmt_location;
 	/* length in bytes; 0 means "rest of string" */
 	ParseLoc	stmt_len;
+
+	/* INFER keyword specified in SELECT (for deferred predict) */
+	bool		inferPredict;
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
