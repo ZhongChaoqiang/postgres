@@ -275,3 +275,10 @@ LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION cleanup_predict_history() IS
 'Manually clean up expired history records from jolix_llm_history table based on jolix_predict.history_retention_days GUC parameter. Returns the number of rows deleted. Set history_retention_days=0 to keep history forever (default is 7 days).';
+
+CREATE FUNCTION limix_infer() RETURNS text
+AS 'jolix_predict', 'limix_infer'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION limix_infer() IS
+'Limix local inference function (zero-parameter, no external LLM required): uses vector similarity search (k-NN) to find similar historical rows in the same table, then infers the prediction based on their PREDICT column values. All configuration is through table WITH parameters: limix_model (default: limix-2m), limix_task (default: classification), limix_topn (default: 5). Task types: classification (weighted majority vote), regression (weighted average), anomaly (distance threshold), extraction (nearest neighbor copy).';

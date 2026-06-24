@@ -1,7 +1,7 @@
 -- ================================================================
 -- PostgreSQL 18.3 综合回归测试脚本
--- 覆盖: PREDICT / EMBEDDING / EMBEDDINGS / RAG / st_embedding / ft_transformer_embedding
--- 日期: 2026-06-10
+-- 覆盖: PREDICT / EMBEDDING / EMBEDDINGS / RAG / st_embedding / ft_transformer_embedding / limix_infer
+-- 日期: 2026-06-10（基础功能），2026-06-20（新增 limix_infer）
 -- ================================================================
 -- 使用方法:
 --   psql -h localhost -p 5433 -U postgres -d postgres -f regression_test.sql
@@ -590,10 +590,99 @@ SELECT id, content, answer FROM test_schema.rag_test WHERE id = 3;
 SET search_path TO public;
 
 -- ================================================================
--- 第10部分: 清理
+-- 第10部分: limix_infer 本地推理测试
 -- ================================================================
 \echo '============================================================'
-\echo '第10部分: 清理'
+\echo '第10部分: limix_infer 本地推理测试'
+\echo '============================================================'
+
+\echo '--- 10.1 验证 limix_infer 函数注册 ---'
+SELECT proname FROM pg_proc WHERE proname = 'limix_infer';
+
+\echo '--- 10.2 设置嵌入模型 ---'
+SET jolix_embedding.model_name = 'sentence-transformers/all-MiniLM-L6-v2';
+
+\echo '--- 10.3 分类任务 (classification) ---'
+DROP TABLE IF EXISTS limix_test_class CASCADE;
+CREATE TABLE limix_test_class (
+    name text EMBEDDING AS (st_embedding(name)),
+    category text PREDICT AS (limix_infer())
+) WITH (predict_timing=immediate, limix_task='classification', limix_topn=3, vector_len=384);
+
+INSERT INTO limix_test_class (name, category) VALUES ('apple', 'fruit');
+INSERT INTO limix_test_class (name, category) VALUES ('banana', 'fruit');
+INSERT INTO limix_test_class (name, category) VALUES ('cherry', 'fruit');
+INSERT INTO limix_test_class (name, category) VALUES ('dog', 'animal');
+INSERT INTO limix_test_class (name, category) VALUES ('cat', 'animal');
+INSERT INTO limix_test_class (name) VALUES ('grape');
+SELECT name, category FROM limix_test_class WHERE name='grape';
+
+\echo '--- 10.4 回归任务 (regression) ---'
+DROP TABLE IF EXISTS limix_test_reg CASCADE;
+CREATE TABLE limix_test_reg (
+    feature text EMBEDDING AS (st_embedding(feature)),
+    value text PREDICT AS (limix_infer())
+) WITH (predict_timing=immediate, limix_task='regression', limix_topn=3, vector_len=384);
+
+INSERT INTO limix_test_reg (feature, value) VALUES ('one', '1');
+INSERT INTO limix_test_reg (feature, value) VALUES ('five', '5');
+INSERT INTO limix_test_reg (feature, value) VALUES ('ten', '10');
+INSERT INTO limix_test_reg (feature, value) VALUES ('twenty', '20');
+INSERT INTO limix_test_reg (feature) VALUES ('fifteen');
+SELECT feature, value FROM limix_test_reg WHERE feature='fifteen';
+
+\echo '--- 10.5 异常检测任务 (anomaly) ---'
+DROP TABLE IF EXISTS limix_test_anom CASCADE;
+CREATE TABLE limix_test_anom (
+    sensor text EMBEDDING AS (st_embedding(sensor)),
+    status text PREDICT AS (limix_infer())
+) WITH (predict_timing=immediate, limix_task='anomaly', limix_topn=3, vector_len=384);
+
+INSERT INTO limix_test_anom (sensor, status) VALUES ('apple', 'normal');
+INSERT INTO limix_test_anom (sensor, status) VALUES ('banana', 'normal');
+INSERT INTO limix_test_anom (sensor, status) VALUES ('cherry', 'normal');
+INSERT INTO limix_test_anom (sensor) VALUES ('dog');
+SELECT sensor, status FROM limix_test_anom WHERE sensor='dog';
+
+\echo '--- 10.6 提取任务 (extraction) ---'
+DROP TABLE IF EXISTS limix_test_ext CASCADE;
+CREATE TABLE limix_test_ext (
+    source text EMBEDDING AS (st_embedding(source)),
+    target text PREDICT AS (limix_infer())
+) WITH (predict_timing=immediate, limix_task='extraction', limix_topn=1, vector_len=384);
+
+INSERT INTO limix_test_ext (source, target) VALUES ('apple', 'red');
+INSERT INTO limix_test_ext (source) VALUES ('apple');
+SELECT target FROM limix_test_ext WHERE source='apple' AND target IS NOT NULL LIMIT 1;
+
+\echo '--- 10.7 边界条件：空表返回NULL ---'
+DROP TABLE IF EXISTS limix_test_empty CASCADE;
+CREATE TABLE limix_test_empty (
+    name text EMBEDDING AS (st_embedding(name)),
+    label text PREDICT AS (limix_infer())
+) WITH (predict_timing=immediate, limix_task='classification', limix_topn=3, vector_len=384);
+INSERT INTO limix_test_empty (name) VALUES ('test1');
+SELECT label IS NULL FROM limix_test_empty WHERE name='test1';
+
+\echo '--- 10.8 边界条件：默认任务（未设置limix_task）---'
+DROP TABLE IF EXISTS limix_test_default CASCADE;
+CREATE TABLE limix_test_default (
+    name text EMBEDDING AS (st_embedding(name)),
+    label text PREDICT AS (limix_infer())
+) WITH (predict_timing=immediate, limix_topn=3, vector_len=384);
+INSERT INTO limix_test_default (name, label) VALUES ('apple', 'A');
+INSERT INTO limix_test_default (name, label) VALUES ('banana', 'A');
+INSERT INTO limix_test_default (name) VALUES ('grape');
+SELECT label FROM limix_test_default WHERE name='grape';
+
+\echo '--- 10.9 WITH参数验证 ---'
+SELECT reloptions FROM pg_class WHERE relname='limix_test_reg';
+
+-- ================================================================
+-- 第11部分: 清理
+-- ================================================================
+\echo '============================================================'
+\echo '第11部分: 清理'
 \echo '============================================================'
 
 DROP TABLE IF EXISTS pred_basic CASCADE;
@@ -609,6 +698,12 @@ DROP TABLE IF EXISTS embd_meta CASCADE;
 DROP TABLE IF EXISTS embd_multi CASCADE;
 DROP TABLE IF EXISTS embd_hybrid CASCADE;
 DROP TABLE IF EXISTS rag_demo CASCADE;
+DROP TABLE IF EXISTS limix_test_class CASCADE;
+DROP TABLE IF EXISTS limix_test_reg CASCADE;
+DROP TABLE IF EXISTS limix_test_anom CASCADE;
+DROP TABLE IF EXISTS limix_test_ext CASCADE;
+DROP TABLE IF EXISTS limix_test_empty CASCADE;
+DROP TABLE IF EXISTS limix_test_default CASCADE;
 DROP SCHEMA IF EXISTS test_schema CASCADE;
 
 SELECT clear_predict_history();

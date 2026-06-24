@@ -524,6 +524,111 @@ predict_trigger(PG_FUNCTION_ARGS)
 				SetConfigOption("jolix_predict.current_table", relname_str,
 								PGC_USERSET, PGC_S_SESSION);
 
+				/* Set limix_current_vector GUC for limix_infer() */
+				{
+					int		emb_attnum;
+
+					for (emb_attnum = 1; emb_attnum <= tupdesc->natts; emb_attnum++)
+					{
+						Form_pg_attribute emb_attr = TupleDescAttr(tupdesc, emb_attnum - 1);
+
+						if (emb_attr->attisdropped)
+							continue;
+						/*
+						 * Look for the hidden _embedding vector column.
+						 * For EMBEDDING AS (...) syntax, the visible column is text
+						 * and the hidden colname_embedding column is vector type.
+						 * For EMBEDDINGS AS (...) syntax, the column itself is vector.
+						 * We need the vector column to pass to limix_infer.
+						 */
+						if (emb_attr->attembedding || emb_attr->attembeddings)
+						{
+							/*
+							 * For EMBEDDING columns, the vector is in the hidden
+							 * _embedding column. For EMBEDDINGS columns, the column
+							 * itself is the vector.
+							 */
+							if (emb_attr->attembedding)
+							{
+								/* Find the hidden _embedding vector column */
+								char   *hidden_colname = psprintf("%s_embedding",
+																  NameStr(emb_attr->attname));
+								AttrNumber hidden_attnum;
+
+								hidden_attnum = get_attnum(RelationGetRelid(rel),
+														   hidden_colname);
+								pfree(hidden_colname);
+
+								if (AttributeNumberIsValid(hidden_attnum))
+								{
+									bool	emb_isnull;
+									Datum	emb_datum;
+									Form_pg_attribute hidden_attr;
+
+									hidden_attr = TupleDescAttr(tupdesc, hidden_attnum - 1);
+									emb_datum = heap_getattr(newtuple, hidden_attnum,
+															 tupdesc, &emb_isnull);
+									if (!emb_isnull)
+									{
+										Oid		typoutput;
+										bool	typIsVarlena;
+										char   *vec_str;
+
+										getTypeOutputInfo(hidden_attr->atttypid,
+														  &typoutput, &typIsVarlena);
+										vec_str = OidOutputFunctionCall(typoutput,
+																		emb_datum);
+										SetConfigOption("jolix_predict.limix_current_vector",
+														vec_str,
+														PGC_USERSET, PGC_S_SESSION);
+										pfree(vec_str);
+									}
+									else
+									{
+										SetConfigOption("jolix_predict.limix_current_vector",
+														"", PGC_USERSET, PGC_S_SESSION);
+									}
+								}
+								else
+								{
+									SetConfigOption("jolix_predict.limix_current_vector",
+													"", PGC_USERSET, PGC_S_SESSION);
+								}
+							}
+							else
+							{
+								/* EMBEDDINGS column - the column itself is vector */
+								bool	emb_isnull;
+								Datum	emb_datum;
+
+								emb_datum = heap_getattr(newtuple, emb_attnum,
+														 tupdesc, &emb_isnull);
+								if (!emb_isnull)
+								{
+									Oid		typoutput;
+									bool	typIsVarlena;
+									char   *vec_str;
+
+									getTypeOutputInfo(emb_attr->atttypid,
+													  &typoutput, &typIsVarlena);
+									vec_str = OidOutputFunctionCall(typoutput,
+																	emb_datum);
+									SetConfigOption("jolix_predict.limix_current_vector",
+													vec_str,
+													PGC_USERSET, PGC_S_SESSION);
+									pfree(vec_str);
+								}
+								else
+								{
+									SetConfigOption("jolix_predict.limix_current_vector",
+													"", PGC_USERSET, PGC_S_SESSION);
+								}
+							}
+							break;
+						}
+					}
+				}
+
 				PG_TRY();
 				{
 					expr = (Expr *) build_column_default(rel, attnum);
@@ -552,6 +657,8 @@ predict_trigger(PG_FUNCTION_ARGS)
 				}
 				PG_CATCH();
 				{
+					SetConfigOption("jolix_predict.limix_current_vector", "",
+									PGC_USERSET, PGC_S_SESSION);
 					if (saved_current_table)
 						SetConfigOption("jolix_predict.current_table", saved_current_table,
 										PGC_USERSET, PGC_S_SESSION);
@@ -561,6 +668,9 @@ predict_trigger(PG_FUNCTION_ARGS)
 					PG_RE_THROW();
 				}
 				PG_END_TRY();
+
+				SetConfigOption("jolix_predict.limix_current_vector", "",
+								PGC_USERSET, PGC_S_SESSION);
 
 				if (saved_current_table)
 				{

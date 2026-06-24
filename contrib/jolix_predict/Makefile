@@ -7,7 +7,8 @@ EXTENSION = jolix_predict
 DATA = jolix_predict--1.0.sql
 PGFILEDESC = "jolix_predict - LLM inference functions for PostgreSQL"
 
-override CPPFLAGS := $(LIBCURL_CPPFLAGS) $(CPPFLAGS)
+# SHLIB_LINK must be set BEFORE including PGXS
+SHLIB_LINK = -lcurl
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -19,5 +20,3 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
-
-SHLIB_LINK += $(LIBCURL_LDFLAGS) $(LIBCURL_LDLIBS)

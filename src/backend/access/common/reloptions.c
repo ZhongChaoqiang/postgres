@@ -417,6 +417,15 @@ static relopt_int intRelOpts[] =
 		},
 		-1, -1, INT_MAX
 	},
+	{
+		{
+			"limix_topn",
+			"Number of similar rows to retrieve for limix_infer function (k-NN k value).",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		5, 1, 100
+	},
 
 	/* list terminator */
 	{{NULL}}
@@ -655,6 +664,24 @@ static relopt_string stringRelOpts[] =
 		{
 			"embedding_function",
 			"Embedding function name for EMBEDDING columns",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		0, false, NULL, NULL, NULL
+	},
+	{
+		{
+			"limix_model",
+			"Local inference model name for limix_infer function.",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		0, false, NULL, NULL, NULL
+	},
+	{
+		{
+			"limix_task",
+			"Task type for limix_infer: classification, regression, extraction, anomaly.",
 			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
 		},
@@ -2034,7 +2061,13 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"ef_construction", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, ef_construction)},
 		{"embedding_function", RELOPT_TYPE_STRING,
-		offsetof(StdRdOptions, embedding_function_offset)}
+		offsetof(StdRdOptions, embedding_function_offset)},
+		{"limix_topn", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, limix_topn)},
+		{"limix_model", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, limix_model_offset)},
+		{"limix_task", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, limix_task_offset)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

@@ -18565,6 +18565,7 @@ bare_label_keyword:
 			| INDENT
 			| INDEX
 			| INDEXES
+			| INFER
 			| INHERIT
 			| INHERITS
 			| INITIALLY

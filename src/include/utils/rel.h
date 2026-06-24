@@ -384,6 +384,9 @@ typedef struct StdRdOptions
 	int			m;			/* max connections per layer for hnsw vector index, -1 = not set */
 	int			ef_construction; /* size of dynamic candidate list for hnsw, -1 = not set */
 	int			embedding_function_offset;	/* offset of embedding function name string */
+	int			limix_topn;	/* number of similar rows for limix_infer k-NN, default 5 */
+	int			limix_model_offset;	/* offset of limix model name string */
+	int			limix_task_offset;	/* offset of limix task type string */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
