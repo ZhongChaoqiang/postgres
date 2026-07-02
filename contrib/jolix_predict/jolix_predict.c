@@ -65,7 +65,7 @@ static int jolix_predict_llm_timeout = 60;
 static char *jolix_predict_current_table = NULL;
 static char *jolix_predict_llm_history_table = NULL;
 static int jolix_llm_history_retention_days = 7;
-static char *jolix_predict_limix_current_vector = NULL;
+static char *jolix_predict_ldm_current_vector = NULL;
 
 #define MAX_HISTORY_CONTENT_LEN 4096
 #define HISTORY_CLEANUP_INTERVAL 3600
@@ -219,10 +219,10 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomStringVariable("jolix_predict.limix_current_vector",
-							   "Current EMBEDDINGS vector for limix_infer (set automatically by trigger)",
+	DefineCustomStringVariable("jolix_predict.ldm_current_vector",
+							   "Current EMBEDDINGS vector for ldm_infer (set automatically by trigger)",
 							   NULL,
-							   &jolix_predict_limix_current_vector,
+							   &jolix_predict_ldm_current_vector,
 							   "",
 							   PGC_USERSET,
 							   0,
@@ -1625,22 +1625,27 @@ llm_rag_infer(PG_FUNCTION_ARGS)
 }
 
 /* ========================================================================
- * Limix local inference functions (k-NN based, no external LLM required)
+ * Ldm local inference functions (k-NN based, no external LLM required)
  * ======================================================================== */
 
 /* Neighbor structure for k-NN results */
-typedef struct LimixNeighbor
+typedef struct LdmNeighbor
 {
 	char   *predict_value;		/* PREDICT column value */
 	double	distance;			/* distance from search vector */
-} LimixNeighbor;
+} LdmNeighbor;
 
 /*
  * find_embeddings_column_name - Find the first EMBEDDING/EMBEDDINGS column name
  *
- * Checks both attembedding and attembeddings fields, since limix_infer
+ * Checks both attembedding and attembeddings fields, since ldm_infer
  * works with either EMBEDDING AS (...) or EMBEDDINGS AS (...) syntax.
- * Returns the hidden _embedding vector column name (e.g., "name_embedding").
+ *
+ * For EMBEDDING AS (single-column): the visible text column has attembedding=true,
+ * and the vector is stored in the hidden "{col}_embedding" column.
+ *
+ * For EMBEDDINGS AS (multi-column): the column itself is the hidden vector column
+ * with attembeddings=true, so we return its name directly.
  */
 static char *
 find_embeddings_column_name(Oid relid)
@@ -1649,38 +1654,35 @@ find_embeddings_column_name(Oid relid)
 	TupleDesc	tupdesc;
 	int			attnum;
 	char	   *colname = NULL;
-	char	   *visible_colname = NULL;
 
 	rel = relation_open(relid, AccessShareLock);
 	tupdesc = RelationGetDescr(rel);
 
-	/* First pass: find the visible EMBEDDING/EMBEDDINGS column */
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 		if (attr->attisdropped)
 			continue;
-		if (attr->attembedding || attr->attembeddings)
+
+		if (attr->attembedding)
 		{
-			visible_colname = pstrdup(NameStr(attr->attname));
+			/* EMBEDDING AS: visible text column, vector is in hidden {col}_embedding */
+			char   *hidden_colname = psprintf("%s_embedding", NameStr(attr->attname));
+			AttrNumber hidden_attnum = get_attnum(relid, hidden_colname);
+
+			if (AttributeNumberIsValid(hidden_attnum))
+				colname = hidden_colname;
+			else
+				pfree(hidden_colname);
 			break;
 		}
-	}
-
-	if (visible_colname != NULL)
-	{
-		/* Look for the hidden _embedding column that stores the vector */
-		char   *hidden_colname = psprintf("%s_embedding", visible_colname);
-		AttrNumber hidden_attnum;
-
-		hidden_attnum = get_attnum(relid, hidden_colname);
-		if (AttributeNumberIsValid(hidden_attnum))
-			colname = hidden_colname;
-		else
-			pfree(hidden_colname);
-
-		pfree(visible_colname);
+		else if (attr->attembeddings)
+		{
+			/* EMBEDDINGS AS: column itself is the hidden vector column */
+			colname = pstrdup(NameStr(attr->attname));
+			break;
+		}
 	}
 
 	relation_close(rel, AccessShareLock);
@@ -1719,13 +1721,13 @@ find_predict_column_name(Oid relid)
 }
 
 /*
- * get_limix_reloption_string - Read a string reloption from table's StdRdOptions
+ * get_ldm_reloption_string - Read a string reloption from table's StdRdOptions
  *
  * String reloptions are stored as offsets in StdRdOptions. The actual string
  * data is appended after the struct. If offset is 0, returns default_val.
  */
 static char *
-get_limix_reloption_string(Oid relid, int offset_field, const char *default_val)
+get_ldm_reloption_string(Oid relid, int offset_field, const char *default_val)
 {
 	Relation	rel;
 	StdRdOptions *relopts;
@@ -1743,10 +1745,10 @@ get_limix_reloption_string(Oid relid, int offset_field, const char *default_val)
 	relopts = (StdRdOptions *) rel->rd_options;
 
 	/* Determine which offset field to read */
-	if (offset_field == offsetof(StdRdOptions, limix_model_offset))
-		offset = relopts->limix_model_offset;
-	else if (offset_field == offsetof(StdRdOptions, limix_task_offset))
-		offset = relopts->limix_task_offset;
+	if (offset_field == offsetof(StdRdOptions, ldm_model_offset))
+		offset = relopts->ldm_model_offset;
+	else if (offset_field == offsetof(StdRdOptions, ldm_task_offset))
+		offset = relopts->ldm_task_offset;
 	else
 	{
 		relation_close(rel, AccessShareLock);
@@ -1769,10 +1771,10 @@ get_limix_reloption_string(Oid relid, int offset_field, const char *default_val)
 }
 
 /*
- * get_limix_topn - Read limix_topn from table's StdRdOptions
+ * get_ldm_topn - Read ldm_topn from table's StdRdOptions
  */
 static int
-get_limix_topn(Oid relid)
+get_ldm_topn(Oid relid)
 {
 	Relation	rel;
 	StdRdOptions *relopts;
@@ -1783,7 +1785,7 @@ get_limix_topn(Oid relid)
 	if (rel->rd_options != NULL)
 	{
 		relopts = (StdRdOptions *) rel->rd_options;
-		topn = relopts->limix_topn;
+		topn = relopts->ldm_topn;
 	}
 
 	relation_close(rel, AccessShareLock);
@@ -1794,12 +1796,12 @@ get_limix_topn(Oid relid)
 }
 
 /*
- * do_limix_similarity_search - Execute vector similarity search via SPI
+ * do_ldm_similarity_search - Execute vector similarity search via SPI
  *
- * Returns an array of LimixNeighbor structs with predict values and distances.
+ * Returns an array of LdmNeighbor structs with predict values and distances.
  */
-static LimixNeighbor *
-do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
+static LdmNeighbor *
+do_ldm_similarity_search(Oid table_oid, const char *embeddings_colname,
 						   const char *predict_colname,
 						   Datum search_vector_datum,
 						   int topn, int *num_neighbors)
@@ -1808,7 +1810,7 @@ do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
 	char		   *relname;
 	char		   *vector_str;
 	StringInfo		query_buf;
-	LimixNeighbor  *neighbors = NULL;
+	LdmNeighbor  *neighbors = NULL;
 
 	*num_neighbors = 0;
 
@@ -1819,7 +1821,7 @@ do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
 	if (ret != SPI_OK_CONNECT)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
-				 errmsg("limix_infer: SPI_connect failed")));
+				 errmsg("ldm_infer: SPI_connect failed")));
 
 	/* Build similarity search query with distance */
 	query_buf = makeStringInfo();
@@ -1850,7 +1852,7 @@ do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
 	{
 		int i;
 
-		neighbors = (LimixNeighbor *) palloc(sizeof(LimixNeighbor) * SPI_processed);
+		neighbors = (LdmNeighbor *) palloc(sizeof(LdmNeighbor) * SPI_processed);
 
 		for (i = 0; i < (int) SPI_processed; i++)
 		{
@@ -1880,13 +1882,13 @@ do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
 }
 
 /*
- * limix_classify - Weighted majority vote for classification
+ * ldm_classify - Weighted majority vote for classification
  *
  * Weight = 1 / (distance + epsilon). The class with the highest
  * total weight wins.
  */
 static char *
-limix_classify(LimixNeighbor *neighbors, int num_neighbors)
+ldm_classify(LdmNeighbor *neighbors, int num_neighbors)
 {
 	double	epsilon = 1e-6;
 	char  **labels;
@@ -1943,10 +1945,10 @@ limix_classify(LimixNeighbor *neighbors, int num_neighbors)
 }
 
 /*
- * limix_regress - Weighted average for regression
+ * ldm_regress - Weighted average for regression
  */
 static char *
-limix_regress(LimixNeighbor *neighbors, int num_neighbors)
+ldm_regress(LdmNeighbor *neighbors, int num_neighbors)
 {
 	double	epsilon = 1e-6;
 	double	weighted_sum = 0.0;
@@ -1972,13 +1974,16 @@ limix_regress(LimixNeighbor *neighbors, int num_neighbors)
 }
 
 /*
- * limix_anomaly_detect - Distance threshold based anomaly detection
+ * ldm_anomaly_detect - Distance threshold based anomaly detection
  *
- * If the average distance to neighbors is more than 3x the nearest
- * neighbor distance, classify as anomaly.
+ * Classify as anomaly if either:
+ * 1. Average distance to neighbors exceeds absolute threshold (0.5),
+ *    meaning the input is far from all training data.
+ * 2. Average distance is more than 3x the nearest neighbor distance,
+ *    meaning the input is close to one neighbor but far from others.
  */
 static char *
-limix_anomaly_detect(LimixNeighbor *neighbors, int num_neighbors)
+ldm_anomaly_detect(LdmNeighbor *neighbors, int num_neighbors)
 {
 	double	avg_distance = 0.0;
 	int		i;
@@ -1991,18 +1996,22 @@ limix_anomaly_detect(LimixNeighbor *neighbors, int num_neighbors)
 
 	avg_distance /= num_neighbors;
 
-	/* If average distance is much larger than nearest neighbor, it's anomalous */
+	/* Absolute threshold: input is far from all training data */
+	if (avg_distance > 0.5)
+		return pstrdup("anomaly");
+
+	/* Relative threshold: input is close to one but far from others */
 	if (avg_distance > neighbors[0].distance * 3.0)
 		return pstrdup("anomaly");
-	else
-		return pstrdup("normal");
+
+	return pstrdup("normal");
 }
 
 /*
- * limix_extract - Nearest neighbor copy for extraction
+ * ldm_extract - Nearest neighbor copy for extraction
  */
 static char *
-limix_extract(LimixNeighbor *neighbors, int num_neighbors)
+ldm_extract(LdmNeighbor *neighbors, int num_neighbors)
 {
 	if (num_neighbors == 0)
 		return NULL;
@@ -2012,10 +2021,10 @@ limix_extract(LimixNeighbor *neighbors, int num_neighbors)
 }
 
 /*
- * limix_infer - Local k-NN inference function (zero parameters)
+ * ldm_infer - Local k-NN inference function (zero parameters)
  *
  * Uses vector similarity search to find similar historical rows,
- * then applies k-NN algorithm based on limix_task:
+ * then applies k-NN algorithm based on ldm_task:
  *   classification -> weighted majority vote
  *   regression     -> weighted average
  *   anomaly        -> distance threshold
@@ -2023,10 +2032,10 @@ limix_extract(LimixNeighbor *neighbors, int num_neighbors)
  *
  * No external LLM API is required. All inference is done locally.
  */
-PG_FUNCTION_INFO_V1(limix_infer);
+PG_FUNCTION_INFO_V1(ldm_infer);
 
 Datum
-limix_infer(PG_FUNCTION_ARGS)
+ldm_infer(PG_FUNCTION_ARGS)
 {
 	char		   *table_name;
 	Oid				table_oid;
@@ -2035,7 +2044,7 @@ limix_infer(PG_FUNCTION_ARGS)
 	char		   *task;
 	int				topn;
 	Datum			search_vector_datum;
-	LimixNeighbor  *neighbors;
+	LdmNeighbor  *neighbors;
 	int				num_neighbors;
 	char		   *result;
 
@@ -2044,8 +2053,8 @@ limix_infer(PG_FUNCTION_ARGS)
 		strlen(jolix_predict_current_table) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("limix_infer: cannot determine current table"),
-				 errhint("limix_infer must be used in a PREDICT column expression.")));
+				 errmsg("ldm_infer: cannot determine current table"),
+				 errhint("ldm_infer must be used in a PREDICT column expression.")));
 
 	table_name = pstrdup(jolix_predict_current_table);
 
@@ -2060,7 +2069,7 @@ limix_infer(PG_FUNCTION_ARGS)
 	if (!OidIsValid(table_oid))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("limix_infer: table \"%s\" not found", table_name)));
+				 errmsg("ldm_infer: table \"%s\" not found", table_name)));
 
 	/* 2. Auto-detect EMBEDDINGS column name */
 	embeddings_colname = find_embeddings_column_name(table_oid);
@@ -2069,7 +2078,7 @@ limix_infer(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("table \"%s\" does not have an EMBEDDINGS column",
 						table_name),
-				 errhint("limix_infer requires a table with an EMBEDDINGS column.")));
+				 errhint("ldm_infer requires a table with an EMBEDDINGS column.")));
 
 	/* 3. Auto-detect PREDICT column name */
 	predict_colname = find_predict_column_name(table_oid);
@@ -2080,14 +2089,14 @@ limix_infer(PG_FUNCTION_ARGS)
 						table_name)));
 
 	/* 4. Read WITH parameters */
-	task = get_limix_reloption_string(table_oid,
-									  offsetof(StdRdOptions, limix_task_offset),
+	task = get_ldm_reloption_string(table_oid,
+									  offsetof(StdRdOptions, ldm_task_offset),
 									  "classification");
-	topn = get_limix_topn(table_oid);
+	topn = get_ldm_topn(table_oid);
 
 	/* 5. Get search vector from GUC (set by predict_trigger) */
-	if (jolix_predict_limix_current_vector != NULL &&
-		strlen(jolix_predict_limix_current_vector) > 0)
+	if (jolix_predict_ldm_current_vector != NULL &&
+		strlen(jolix_predict_ldm_current_vector) > 0)
 	{
 		/* Parse vector string from GUC back to vector Datum */
 		Oid			vector_oid;
@@ -2102,7 +2111,7 @@ limix_infer(PG_FUNCTION_ARGS)
 
 		getTypeInputInfo(vector_oid, &typinput, &typioparam);
 		search_vector_datum = OidInputFunctionCall(typinput,
-												   jolix_predict_limix_current_vector,
+												   jolix_predict_ldm_current_vector,
 												   typioparam, -1);
 	}
 	else
@@ -2117,7 +2126,7 @@ limix_infer(PG_FUNCTION_ARGS)
 		if (ret != SPI_OK_CONNECT)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_EXCEPTION),
-					 errmsg("limix_infer: SPI_connect failed for vector fallback")));
+					 errmsg("ldm_infer: SPI_connect failed for vector fallback")));
 
 		query_buf = makeStringInfo();
 		appendStringInfo(query_buf,
@@ -2139,7 +2148,7 @@ limix_infer(PG_FUNCTION_ARGS)
 				SPI_finish();
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("limix_infer: EMBEDDINGS column \"%s\" is NULL",
+						 errmsg("ldm_infer: EMBEDDINGS column \"%s\" is NULL",
 								embeddings_colname)));
 			}
 		}
@@ -2148,7 +2157,7 @@ limix_infer(PG_FUNCTION_ARGS)
 			SPI_finish();
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("limix_infer: could not get search vector from table \"%s\"",
+					 errmsg("ldm_infer: could not get search vector from table \"%s\"",
 							table_name)));
 		}
 
@@ -2156,29 +2165,29 @@ limix_infer(PG_FUNCTION_ARGS)
 	}
 
 	/* 6. Vector similarity search */
-	neighbors = do_limix_similarity_search(
+	neighbors = do_ldm_similarity_search(
 		table_oid, embeddings_colname, predict_colname,
 		search_vector_datum, topn, &num_neighbors);
 
 	if (num_neighbors == 0)
 	{
 		ereport(WARNING,
-				(errmsg("limix_infer: no historical data found in table \"%s\"",
+				(errmsg("ldm_infer: no historical data found in table \"%s\"",
 						table_name)));
 		PG_RETURN_NULL();
 	}
 
 	/* 7. Select inference algorithm based on task */
 	if (strcmp(task, "classification") == 0)
-		result = limix_classify(neighbors, num_neighbors);
+		result = ldm_classify(neighbors, num_neighbors);
 	else if (strcmp(task, "regression") == 0)
-		result = limix_regress(neighbors, num_neighbors);
+		result = ldm_regress(neighbors, num_neighbors);
 	else if (strcmp(task, "anomaly") == 0)
-		result = limix_anomaly_detect(neighbors, num_neighbors);
+		result = ldm_anomaly_detect(neighbors, num_neighbors);
 	else if (strcmp(task, "extraction") == 0)
-		result = limix_extract(neighbors, num_neighbors);
+		result = ldm_extract(neighbors, num_neighbors);
 	else
-		result = limix_classify(neighbors, num_neighbors);	/* default */
+		result = ldm_classify(neighbors, num_neighbors);	/* default */
 
 	/* 8. Return result */
 	if (result == NULL)

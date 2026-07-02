@@ -1,10 +1,10 @@
-# Limix 推理函数设计文档
+# Ldm 推理函数设计文档
 
 ## 1. 概述
 
 ### 1.1 功能简介
 
-`limix_infer` 是一个**本地推理函数**，基于向量相似度（k-NN）检索历史样本数据进行推理。它利用当前表的 EMBEDDINGS 向量列进行相似度搜索，检索出与当前行最相关的历史数据行，然后根据相似行的 PREDICT 列值直接推理出当前行的预测结果。**无需调用外部 LLM API**，推理完全在本地完成。
+`ldm_infer` 是一个**本地推理函数**，基于向量相似度（k-NN）检索历史样本数据进行推理。它利用当前表的 EMBEDDINGS 向量列进行相似度搜索，检索出与当前行最相关的历史数据行，然后根据相似行的 PREDICT 列值直接推理出当前行的预测结果。**无需调用外部 LLM API**，推理完全在本地完成。
 
 ### 1.2 设计目标
 
@@ -21,17 +21,17 @@
 |------|---------|----------------|---------|
 | `llm_infer` | 外部 LLM API | 是 | 通用 LLM 推理 |
 | `llm_rag_infer` | 外部 LLM API + RAG | 是 | 文档问答、知识检索 |
-| **`limix_infer`** | **本地 k-NN 推理** | **否** | **基于历史数据的分类/预测** |
+| **`ldm_infer`** | **本地 k-NN 推理** | **否** | **基于历史数据的分类/预测** |
 
 **核心区别**：
 - `llm_infer` / `llm_rag_infer`：需要外部 LLM API，有网络延迟和成本
-- `limix_infer`：纯本地推理，零延迟，零成本，基于向量相似度直接推理
+- `ldm_infer`：纯本地推理，零延迟，零成本，基于向量相似度直接推理
 
 ### 1.4 推理算法
 
-`limix_infer` 采用基于向量相似度的 k-NN（k-Nearest Neighbors）推理算法：
+`ldm_infer` 采用基于向量相似度的 k-NN（k-Nearest Neighbors）推理算法：
 
-| limix_task | 推理算法 | 说明 |
+| ldm_task | 推理算法 | 说明 |
 |-----------|---------|------|
 | `classification` | 加权多数投票 | 距离越近的邻居权重越大，取票数最多的类别 |
 | `regression` | 加权平均 | 距离越近的邻居权重越大，取加权平均值 |
@@ -51,30 +51,30 @@
 
 ### 2.1 设计原则
 
-**零参数 API**：`limix_infer()` 无需任何参数，一切自动推断：
+**零参数 API**：`ldm_infer()` 无需任何参数，一切自动推断：
 
-- **推理算法**：根据 `limix_task` 自动选择 k-NN 变体
+- **推理算法**：根据 `ldm_task` 自动选择 k-NN 变体
 - **搜索向量**：自动取表中第一个 EMBEDDINGS 列的值
 - **PREDICT 列名**：自动检测当前表的 PREDICT 列
-- **模型名**：通过 WITH 参数 `limix_model` 设置，默认 `'limix-2m'`
-- **任务类别**：通过 WITH 参数 `limix_task` 设置，默认 `'classification'`
-- **检索数量**：通过 WITH 参数 `limix_topn` 设置，默认 `5`
+- **模型名**：通过 WITH 参数 `ldm_model` 设置，默认 `'ldm-2m'`
+- **任务类别**：通过 WITH 参数 `ldm_task` 设置，默认 `'classification'`
+- **检索数量**：通过 WITH 参数 `ldm_topn` 设置，默认 `5`
 
 ### 2.2 函数签名
 
 ```sql
-limix_infer() RETURNS text
+ldm_infer() RETURNS text
 ```
 
 ### 2.3 表级 WITH 参数
 
-所有 limix 配置通过 CREATE TABLE 的 WITH 子句设置：
+所有 ldm 配置通过 CREATE TABLE 的 WITH 子句设置：
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `limix_model` | text | `'limix-2m'` | 本地推理模型名称（预留，当前版本使用 k-NN） |
-| `limix_task` | text | `'classification'` | 任务类别：`classification`、`regression`、`extraction`、`anomaly` |
-| `limix_topn` | integer | `5` | 检索的相似行数量（k-NN 的 k 值） |
+| `ldm_model` | text | `'ldm-2m'` | 本地推理模型名称（预留，当前版本使用 k-NN） |
+| `ldm_task` | text | `'classification'` | 任务类别：`classification`、`regression`、`extraction`、`anomaly` |
+| `ldm_topn` | integer | `5` | 检索的相似行数量（k-NN 的 k 值） |
 
 ### 2.4 自动推断机制
 
@@ -84,18 +84,18 @@ limix_infer() RETURNS text
 | EMBEDDINGS 列名 | 查询 `pg_attribute` 中 `attembeddings=true` 的列 | 取第一个 EMBEDDINGS 列 |
 | PREDICT 列名 | 查询 `pg_attribute` 中 `attpredict=true` 的列 | 取第一个 PREDICT 列 |
 | 搜索向量 | 从当前行 EMBEDDINGS 列取值 | 触发器中向量已计算 |
-| 推理算法 | 根据 `limix_task` 自动选择 | 见 1.4 节 |
+| 推理算法 | 根据 `ldm_task` 自动选择 | 见 1.4 节 |
 
-### 2.5 limix_task 与推理算法
+### 2.5 ldm_task 与推理算法
 
-| limix_task 值 | 推理算法 | 输出格式 | 说明 |
+| ldm_task 值 | 推理算法 | 输出格式 | 说明 |
 |---------------|---------|---------|------|
 | `classification` | 加权多数投票 | 类别名称文本 | 距离越近权重越大，取票数最多的类别 |
 | `regression` | 加权平均 | 数值文本 | 距离越近权重越大，取加权平均值 |
 | `extraction` | 最近邻复制 | 最近邻的 PREDICT 值 | 直接取最相似行的预测结果 |
 | `anomaly` | 距离阈值判定 | `normal` 或 `anomaly` | 平均距离超过阈值则异常 |
 
-当 `limix_task` 未设置（NULL 或空字符串）时，默认使用 `classification`。
+当 `ldm_task` 未设置（NULL 或空字符串）时，默认使用 `classification`。
 
 ### 2.6 使用示例
 
@@ -107,7 +107,7 @@ CREATE TABLE customer_segments (
     income float,
     category text,
     demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category)),
-    segment text PREDICT AS (limix_infer())
+    segment text PREDICT AS (ldm_infer())
 ) WITH (predict_timing = immediate, vector_len = 384);
 
 -- 2. 先插入一些有 segment 值的历史数据（作为样本）
@@ -126,14 +126,14 @@ INSERT INTO customer_segments (age, income, category) VALUES (32, 48000, 'A');
 ### 2.7 更多场景示例
 
 ```sql
--- 异常检测（指定 limix_task）
+-- 异常检测（指定 ldm_task）
 CREATE TABLE anomaly_detection (
     id serial PRIMARY KEY,
     metric_name text,
     value float,
     metric_vec EMBEDDINGS AS (ft_transformer_embedding(metric_name, value)),
-    is_anomaly text PREDICT AS (limix_infer())
-) WITH (predict_timing = immediate, vector_len = 384, limix_task = 'anomaly');
+    is_anomaly text PREDICT AS (ldm_infer())
+) WITH (predict_timing = immediate, vector_len = 384, ldm_task = 'anomaly');
 
 -- 回归预测
 CREATE TABLE price_predictions (
@@ -142,8 +142,8 @@ CREATE TABLE price_predictions (
     rooms int,
     location text,
     feature_vec EMBEDDINGS AS (ft_transformer_embedding(area, rooms, location)),
-    price float PREDICT AS (limix_infer()::float)
-) WITH (predict_timing = immediate, vector_len = 384, limix_task = 'regression');
+    price float PREDICT AS (ldm_infer()::float)
+) WITH (predict_timing = immediate, vector_len = 384, ldm_task = 'regression');
 
 -- 优先级判定（自定义 topn）
 CREATE TABLE ticket_priorities (
@@ -152,8 +152,8 @@ CREATE TABLE ticket_priorities (
     severity text,
     description text,
     ticket_vec EMBEDDINGS AS (ft_transformer_embedding(product, severity, description)),
-    priority text PREDICT AS (limix_infer())
-) WITH (predict_timing = immediate, vector_len = 384, limix_topn = 10);
+    priority text PREDICT AS (ldm_infer())
+) WITH (predict_timing = immediate, vector_len = 384, ldm_topn = 10);
 ```
 
 ## 3. 架构设计
@@ -171,7 +171,7 @@ BEFORE 触发器 (predict_trigger)
     └── 2. 计算 PREDICT 列
             │
             ▼
-        limix_infer() 函数调用（零参数，本地推理）
+        ldm_infer() 函数调用（零参数，本地推理）
             │
             ├── a. 获取当前表名（GUC: jolix_predict.current_table）
             │
@@ -181,7 +181,7 @@ BEFORE 触发器 (predict_trigger)
             │
             ├── d. 从当前行 EMBEDDINGS 列获取搜索向量
             │
-            ├── e. 读取 WITH 参数：limix_model, limix_task, limix_topn
+            ├── e. 读取 WITH 参数：ldm_model, ldm_task, ldm_topn
             │
             ├── f. 向量相似度搜索（SPI 查询）
             │   │
@@ -189,11 +189,11 @@ BEFORE 触发器 (predict_trigger)
             │   │  FROM table_name
             │   │  WHERE predict_col IS NOT NULL
             │   │  ORDER BY distance
-            │   │  LIMIT limix_topn
+            │   │  LIMIT ldm_topn
             │   │
             │   └── 返回 topn 行相似数据及其距离
             │
-            ├── g. 本地 k-NN 推理（根据 limix_task 选择算法）
+            ├── g. 本地 k-NN 推理（根据 ldm_task 选择算法）
             │   │
             │   │  classification → 加权多数投票
             │   │  regression     → 加权平均
@@ -216,13 +216,13 @@ INSERT INTO customer_segments (age, income, category) VALUES (32, 48000, 'A');
     │
     ├── Step 2: predict_trigger 计算 segment 预测值
     │   │
-    │   └── 评估 PREDICT 表达式: limix_infer()
+    │   └── 评估 PREDICT 表达式: ldm_infer()
     │       │
     │       ├── 2a. 获取表名: customer_segments (from GUC)
     │       ├── 2b. 自动检测 EMBEDDINGS 列: demographic (attembeddings=true)
     │       ├── 2c. 自动检测 PREDICT 列: segment (attpredict=true)
     │       ├── 2d. 从当前行取搜索向量: demographic = [0.12, -0.34, ...]
-    │       ├── 2e. 读取 WITH 参数: limix_task='classification', limix_topn=5
+    │       ├── 2e. 读取 WITH 参数: ldm_task='classification', ldm_topn=5
     │       ├── 2f. SPI 查询相似行:
     │       │   SELECT segment, demographic <=> '[0.12,...]' AS distance
     │       │   FROM customer_segments
@@ -254,7 +254,7 @@ llm_infer / llm_rag_infer:
     用户编写提示词 → 调用外部 LLM API → 等待响应 → 结果
     └── 需要网络 ──────────────────────┘  └── 有延迟和成本 ──┘
 
-limix_infer:
+ldm_infer:
     当前行向量 → 本地 k-NN 搜索 → 加权推理 → 结果
     └── 纯本地计算，零网络延迟 ──────────────────────┘
 ```
@@ -354,9 +354,9 @@ find_predict_column_name(Oid relid)
 在触发器上下文中，EMBEDDINGS 列的值已在 newtuple 中计算完成。通过进程本地变量传递：
 
 ```c
-/* 进程本地变量，用于在触发器和 limix_infer 之间传递数据 */
-static Datum limix_current_vector = (Datum) 0;
-static bool  limix_current_vector_isnull = true;
+/* 进程本地变量，用于在触发器和 ldm_infer 之间传递数据 */
+static Datum ldm_current_vector = (Datum) 0;
+static bool  ldm_current_vector_isnull = true;
 ```
 
 在 predict_trigger 中设置：
@@ -373,19 +373,19 @@ if (embeddings_attnum > 0)
 {
     vector_datum = heap_getattr(newtuple, embeddings_attnum,
                                 trigger_tuple_desc, &isnull);
-    limix_current_vector = isnull ? (Datum) 0 : vector_datum;
-    limix_current_vector_isnull = isnull;
+    ldm_current_vector = isnull ? (Datum) 0 : vector_datum;
+    ldm_current_vector_isnull = isnull;
 }
 else
 {
-    limix_current_vector_isnull = true;
+    ldm_current_vector_isnull = true;
 }
 
-/* 执行 PREDICT 表达式求值（调用 limix_infer()） */
+/* 执行 PREDICT 表达式求值（调用 ldm_infer()） */
 predict_value = ExecEvalExprSwitchContext(pred_expr, econtext, &isnull);
 
 /* 清理 */
-limix_current_vector_isnull = true;
+ldm_current_vector_isnull = true;
 ```
 
 ### 4.4 向量相似度搜索
@@ -393,14 +393,14 @@ limix_current_vector_isnull = true;
 通过 SPI 执行向量相似度搜索，同时获取距离值用于加权推理：
 
 ```c
-typedef struct LimixNeighbor
+typedef struct LdmNeighbor
 {
     char   *predict_value;   /* PREDICT 列的值 */
     double  distance;        /* 与搜索向量的距离 */
-} LimixNeighbor;
+} LdmNeighbor;
 
-static LimixNeighbor *
-do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
+static LdmNeighbor *
+do_ldm_similarity_search(Oid table_oid, const char *embeddings_colname,
                            const char *predict_colname,
                            Datum search_vector_datum,
                            int topn, int *num_neighbors)
@@ -409,7 +409,7 @@ do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
     char           *relname;
     char           *vector_str;
     StringInfo      query_buf;
-    LimixNeighbor  *neighbors;
+    LdmNeighbor  *neighbors;
 
     vector_str = vector_datum_to_string(search_vector_datum);
     relname = get_rel_name(table_oid);
@@ -446,7 +446,7 @@ do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
     if (ret == SPI_OK_SELECT && SPI_processed > 0)
     {
         int i;
-        neighbors = (LimixNeighbor *) palloc(sizeof(LimixNeighbor) * SPI_processed);
+        neighbors = (LdmNeighbor *) palloc(sizeof(LdmNeighbor) * SPI_processed);
 
         for (i = 0; i < (int) SPI_processed; i++)
         {
@@ -481,7 +481,7 @@ do_limix_similarity_search(Oid table_oid, const char *embeddings_colname,
 
 ```c
 static char *
-limix_classify(LimixNeighbor *neighbors, int num_neighbors)
+ldm_classify(LdmNeighbor *neighbors, int num_neighbors)
 {
     /* 使用距离的倒数作为权重，距离越近权重越大 */
     /* 权重 = 1 / (distance + epsilon)，epsilon 防止除零 */
@@ -545,7 +545,7 @@ limix_classify(LimixNeighbor *neighbors, int num_neighbors)
 
 ```c
 static char *
-limix_regress(LimixNeighbor *neighbors, int num_neighbors)
+ldm_regress(LdmNeighbor *neighbors, int num_neighbors)
 {
     double  epsilon = 1e-6;
     double  weighted_sum = 0.0;
@@ -575,7 +575,7 @@ limix_regress(LimixNeighbor *neighbors, int num_neighbors)
 
 ```c
 static char *
-limix_anomaly_detect(LimixNeighbor *neighbors, int num_neighbors)
+ldm_anomaly_detect(LdmNeighbor *neighbors, int num_neighbors)
 {
     double  avg_distance = 0.0;
     int     i;
@@ -604,7 +604,7 @@ limix_anomaly_detect(LimixNeighbor *neighbors, int num_neighbors)
 
 ```c
 static char *
-limix_extract(LimixNeighbor *neighbors, int num_neighbors)
+ldm_extract(LdmNeighbor *neighbors, int num_neighbors)
 {
     if (num_neighbors == 0)
         return NULL;
@@ -624,8 +624,8 @@ static relopt_int intRelOpts[] =
     /* 现有选项... */
     {
         {
-            "limix_topn",
-            "Number of similar rows to retrieve for limix_infer function (k-NN k value).",
+            "ldm_topn",
+            "Number of similar rows to retrieve for ldm_infer function (k-NN k value).",
             RELOPT_KIND_HEAP,
             ShareUpdateExclusiveLock
         },
@@ -638,18 +638,18 @@ static relopt_string stringRelOpts[] =
     /* 现有选项... */
     {
         {
-            "limix_model",
-            "Local inference model name for limix_infer function.",
+            "ldm_model",
+            "Local inference model name for ldm_infer function.",
             RELOPT_KIND_HEAP,
             ShareUpdateExclusiveLock
         },
-        "limix-2m",   /* 默认值 */
+        "ldm-2m",   /* 默认值 */
         true,
     },
     {
         {
-            "limix_task",
-            "Task type for limix_infer: classification, regression, extraction, anomaly.",
+            "ldm_task",
+            "Task type for ldm_infer: classification, regression, extraction, anomaly.",
             RELOPT_KIND_HEAP,
             ShareUpdateExclusiveLock
         },
@@ -667,19 +667,19 @@ typedef struct StdRdOptions
     StdRdOptPredictTiming predict_timing;
     int         vector_len;
     /* ... 现有字段 ... */
-    int         limix_topn;         /* limix_infer 检索相似行数量 */
-    int         limix_model_offset; /* limix_model 字符串偏移量 */
-    int         limix_task_offset;  /* limix_task 字符串偏移量 */
+    int         ldm_topn;         /* ldm_infer 检索相似行数量 */
+    int         ldm_model_offset; /* ldm_model 字符串偏移量 */
+    int         ldm_task_offset;  /* ldm_task 字符串偏移量 */
 } StdRdOptions;
 ```
 
 ### 4.10 主函数实现框架
 
 ```c
-PG_FUNCTION_INFO_V1(limix_infer);
+PG_FUNCTION_INFO_V1(ldm_infer);
 
 Datum
-limix_infer(PG_FUNCTION_ARGS)
+ldm_infer(PG_FUNCTION_ARGS)
 {
     char           *table_name;
     Oid             table_oid;
@@ -688,7 +688,7 @@ limix_infer(PG_FUNCTION_ARGS)
     char           *task;
     int             topn;
     Datum           search_vector_datum;
-    LimixNeighbor  *neighbors;
+    LdmNeighbor  *neighbors;
     int             num_neighbors;
     char           *result;
 
@@ -697,8 +697,8 @@ limix_infer(PG_FUNCTION_ARGS)
         strlen(jolix_predict_current_table) == 0)
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("limix_infer: cannot determine current table"),
-                 errhint("limix_infer must be used in a PREDICT column expression.")));
+                 errmsg("ldm_infer: cannot determine current table"),
+                 errhint("ldm_infer must be used in a PREDICT column expression.")));
 
     table_name = pstrdup(jolix_predict_current_table);
     table_oid = RelnameGetRelid(table_name);
@@ -706,7 +706,7 @@ limix_infer(PG_FUNCTION_ARGS)
     if (!OidIsValid(table_oid))
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("limix_infer: table \"%s\" not found", table_name)));
+                 errmsg("ldm_infer: table \"%s\" not found", table_name)));
 
     /* 2. 自动检测 EMBEDDINGS 列名 */
     embeddings_colname = find_embeddings_column_name(table_oid);
@@ -715,7 +715,7 @@ limix_infer(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("table \"%s\" does not have an EMBEDDINGS column",
                         table_name),
-                 errhint("limix_infer requires a table with an EMBEDDINGS column.")));
+                 errhint("ldm_infer requires a table with an EMBEDDINGS column.")));
 
     /* 3. 自动检测 PREDICT 列名 */
     predict_colname = find_predict_column_name(table_oid);
@@ -726,13 +726,13 @@ limix_infer(PG_FUNCTION_ARGS)
                         table_name)));
 
     /* 4. 读取 WITH 参数 */
-    task = get_limix_task(table_oid);    /* 默认 "classification" */
-    topn = get_limix_topn(table_oid);    /* 默认 5 */
+    task = get_ldm_task(table_oid);    /* 默认 "classification" */
+    topn = get_ldm_topn(table_oid);    /* 默认 5 */
 
     /* 5. 获取搜索向量 */
-    if (!limix_current_vector_isnull)
+    if (!ldm_current_vector_isnull)
     {
-        search_vector_datum = limix_current_vector;
+        search_vector_datum = ldm_current_vector;
     }
     else
     {
@@ -740,18 +740,18 @@ limix_infer(PG_FUNCTION_ARGS)
         if (search_vector_datum == (Datum) 0)
             ereport(ERROR,
                     (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                     errmsg("limix_infer: could not get search vector")));
+                     errmsg("ldm_infer: could not get search vector")));
     }
 
     /* 6. 向量相似度搜索 */
-    neighbors = do_limix_similarity_search(
+    neighbors = do_ldm_similarity_search(
         table_oid, embeddings_colname, predict_colname,
         search_vector_datum, topn, &num_neighbors);
 
     if (num_neighbors == 0)
     {
         ereport(WARNING,
-                (errmsg("limix_infer: no historical data found in table \"%s\"",
+                (errmsg("ldm_infer: no historical data found in table \"%s\"",
                         table_name)));
         PG_RETURN_NULL();
     }
@@ -759,24 +759,24 @@ limix_infer(PG_FUNCTION_ARGS)
     /* 7. 根据 task 选择推理算法 */
     if (strcmp(task, "classification") == 0)
     {
-        result = limix_classify(neighbors, num_neighbors);
+        result = ldm_classify(neighbors, num_neighbors);
     }
     else if (strcmp(task, "regression") == 0)
     {
-        result = limix_regress(neighbors, num_neighbors);
+        result = ldm_regress(neighbors, num_neighbors);
     }
     else if (strcmp(task, "anomaly") == 0)
     {
-        result = limix_anomaly_detect(neighbors, num_neighbors);
+        result = ldm_anomaly_detect(neighbors, num_neighbors);
     }
     else if (strcmp(task, "extraction") == 0)
     {
-        result = limix_extract(neighbors, num_neighbors);
+        result = ldm_extract(neighbors, num_neighbors);
     }
     else
     {
         /* 默认使用分类 */
-        result = limix_classify(neighbors, num_neighbors);
+        result = ldm_classify(neighbors, num_neighbors);
     }
 
     /* 8. 返回结果 */
@@ -792,13 +792,13 @@ limix_infer(PG_FUNCTION_ARGS)
 ### 5.1 jolix_predict--1.0.sql 新增
 
 ```sql
--- Limix 本地推理函数：基于向量相似度的 k-NN 推理（零参数，无需外部 LLM）
-CREATE FUNCTION limix_infer() RETURNS text
-AS 'jolix_predict', 'limix_infer'
+-- Ldm 本地推理函数：基于向量相似度的 k-NN 推理（零参数，无需外部 LLM）
+CREATE FUNCTION ldm_infer() RETURNS text
+AS 'jolix_predict', 'ldm_infer'
 LANGUAGE C VOLATILE;
 
-COMMENT ON FUNCTION limix_infer() IS
-'Limix local inference function (zero-parameter, no external LLM required): uses vector similarity search (k-NN) to find similar historical rows in the same table, then infers the prediction based on their PREDICT column values. All configuration is through table WITH parameters: limix_model (default: limix-2m), limix_task (default: classification), limix_topn (default: 5). Task types: classification (weighted majority vote), regression (weighted average), anomaly (distance threshold), extraction (nearest neighbor copy).';
+COMMENT ON FUNCTION ldm_infer() IS
+'Ldm local inference function (zero-parameter, no external LLM required): uses vector similarity search (k-NN) to find similar historical rows in the same table, then infers the prediction based on their PREDICT column values. All configuration is through table WITH parameters: ldm_model (default: ldm-2m), ldm_task (default: classification), ldm_topn (default: 5). Task types: classification (weighted majority vote), regression (weighted average), anomaly (distance threshold), extraction (nearest neighbor copy).';
 ```
 
 ## 6. 错误处理
@@ -807,7 +807,7 @@ COMMENT ON FUNCTION limix_infer() IS
 
 | 场景 | 错误码 | 错误信息 | 提示 |
 |------|--------|---------|------|
-| 无法确定当前表 | OBJECT_NOT_IN_PREREQUISITE_STATE | limix_infer: cannot determine current table | 必须在 PREDICT 列表达式中使用 |
+| 无法确定当前表 | OBJECT_NOT_IN_PREREQUISITE_STATE | ldm_infer: cannot determine current table | 必须在 PREDICT 列表达式中使用 |
 | 表没有 EMBEDDINGS 列 | OBJECT_NOT_IN_PREREQUISITE_STATE | table "X" does not have an EMBEDDINGS column | 需要表有 EMBEDDINGS 列 |
 | 表没有 PREDICT 列 | OBJECT_NOT_IN_PREREQUISITE_STATE | table "X" does not have a PREDICT column | 需要表有 PREDICT 列 |
 | 无法获取搜索向量 | OBJECT_NOT_IN_PREREQUISITE_STATE | could not get search vector | 检查 EMBEDDINGS 列是否有值 |
@@ -845,20 +845,20 @@ COMMENT ON FUNCTION limix_infer() IS
 ### 7.4 触发器时序保证
 
 - EMBEDDINGS 列在 PREDICT 列之前计算（触发器内部处理顺序）
-- 搜索向量通过进程本地变量从触发器传递给 limix_infer，无需额外查询
+- 搜索向量通过进程本地变量从触发器传递给 ldm_infer，无需额外查询
 
 ## 8. 扩展方向
 
 ### 8.1 短期扩展
 
 - **距离权重函数**：支持不同的权重函数（高斯、逆距离、均匀）
-- **相似度阈值**：增加 WITH 参数 `limix_similarity_threshold`，过滤过于不相似的邻居
-- **指定 EMBEDDINGS 列**：增加 WITH 参数 `limix_embeddings_col`，支持多 EMBEDDINGS 列场景
-- **异常检测阈值**：增加 WITH 参数 `limix_anomaly_threshold`，自定义异常判定阈值
+- **相似度阈值**：增加 WITH 参数 `ldm_similarity_threshold`，过滤过于不相似的邻居
+- **指定 EMBEDDINGS 列**：增加 WITH 参数 `ldm_embeddings_col`，支持多 EMBEDDINGS 列场景
+- **异常检测阈值**：增加 WITH 参数 `ldm_anomaly_threshold`，自定义异常判定阈值
 
 ### 8.2 长期扩展
 
-- **本地 ML 模型**：`limix_model` 参数支持加载本地 ML 模型（如 ONNX、LightGBM）
+- **本地 ML 模型**：`ldm_model` 参数支持加载本地 ML 模型（如 ONNX、LightGBM）
 - **增量学习**：新数据自动加入训练集，模型持续优化
 - **特征重要性**：分析各特征列对推理结果的贡献度
 - **置信度输出**：返回推理结果的置信度分数
@@ -868,12 +868,12 @@ COMMENT ON FUNCTION limix_infer() IS
 
 | 文件路径 | 功能说明 |
 |---------|----------|
-| `contrib/jolix_predict/jolix_predict.c` | 新增 `limix_infer` 函数实现及 k-NN 推理算法 |
-| `contrib/jolix_predict/jolix_predict--1.0.sql` | 新增 `limix_infer()` 函数 SQL 定义和注释 |
-| `src/backend/access/common/reloptions.c` | 新增 `limix_topn`、`limix_model`、`limix_task` 表选项 |
-| `src/include/utils/rel.h` | `StdRdOptions` 新增 limix 相关字段 |
-| `src/backend/utils/adt/predict.c` | 触发器中传递 EMBEDDINGS 向量给 limix_infer |
-| `doc/predict/limix_infer_design.md` | 本设计文档 |
+| `contrib/jolix_predict/jolix_predict.c` | 新增 `ldm_infer` 函数实现及 k-NN 推理算法 |
+| `contrib/jolix_predict/jolix_predict--1.0.sql` | 新增 `ldm_infer()` 函数 SQL 定义和注释 |
+| `src/backend/access/common/reloptions.c` | 新增 `ldm_topn`、`ldm_model`、`ldm_task` 表选项 |
+| `src/include/utils/rel.h` | `StdRdOptions` 新增 ldm 相关字段 |
+| `src/backend/utils/adt/predict.c` | 触发器中传递 EMBEDDINGS 向量给 ldm_infer |
+| `doc/predict/ldm_infer_design.md` | 本设计文档 |
 
 ## 10. 测试用例
 
@@ -881,17 +881,17 @@ COMMENT ON FUNCTION limix_infer() IS
 
 ```sql
 -- 创建测试表（零参数用法）
-CREATE TABLE test_limix_segments (
+CREATE TABLE test_ldm_segments (
     id serial PRIMARY KEY,
     age int,
     income float,
     category text,
     demographic EMBEDDINGS AS (ft_transformer_embedding(age, income, category)),
-    segment text PREDICT AS (limix_infer())
+    segment text PREDICT AS (ldm_infer())
 ) WITH (predict_timing = immediate, vector_len = 384);
 
 -- 插入样本数据
-INSERT INTO test_limix_segments (age, income, category, segment) VALUES
+INSERT INTO test_ldm_segments (age, income, category, segment) VALUES
     (30, 50000, 'A', 'Premium'),
     (25, 30000, 'B', 'Standard'),
     (40, 75000, 'C', 'VIP'),
@@ -899,72 +899,72 @@ INSERT INTO test_limix_segments (age, income, category, segment) VALUES
     (22, 28000, 'B', 'Basic');
 
 -- 插入新数据（自动推理）
-INSERT INTO test_limix_segments (age, income, category) VALUES (32, 48000, 'A');
+INSERT INTO test_ldm_segments (age, income, category) VALUES (32, 48000, 'A');
 
 -- 验证推理结果
-SELECT id, age, income, category, segment FROM test_limix_segments WHERE id > 5;
+SELECT id, age, income, category, segment FROM test_ldm_segments WHERE id > 5;
 -- segment 应为 'Premium'（加权多数投票）
 ```
 
 ### 10.2 异常检测
 
 ```sql
-CREATE TABLE test_limix_anomaly (
+CREATE TABLE test_ldm_anomaly (
     id serial PRIMARY KEY,
     metric_name text,
     value float,
     metric_vec EMBEDDINGS AS (ft_transformer_embedding(metric_name, value)),
-    is_anomaly text PREDICT AS (limix_infer())
-) WITH (predict_timing = immediate, vector_len = 384, limix_task = 'anomaly');
+    is_anomaly text PREDICT AS (ldm_infer())
+) WITH (predict_timing = immediate, vector_len = 384, ldm_task = 'anomaly');
 
-INSERT INTO test_limix_anomaly (metric_name, value, is_anomaly) VALUES
+INSERT INTO test_ldm_anomaly (metric_name, value, is_anomaly) VALUES
     ('cpu', 45.0, 'normal'),
     ('cpu', 52.0, 'normal'),
     ('memory', 60.0, 'normal');
 
-INSERT INTO test_limix_anomaly (metric_name, value) VALUES ('cpu', 99.5);
+INSERT INTO test_ldm_anomaly (metric_name, value) VALUES ('cpu', 99.5);
 -- is_anomaly 应为 'anomaly'（距离过远）
 ```
 
 ### 10.3 回归预测
 
 ```sql
-CREATE TABLE test_limix_regression (
+CREATE TABLE test_ldm_regression (
     id serial PRIMARY KEY,
     area float,
     rooms int,
     location text,
     feature_vec EMBEDDINGS AS (ft_transformer_embedding(area, rooms, location)),
-    price float PREDICT AS (limix_infer()::float)
-) WITH (predict_timing = immediate, vector_len = 384, limix_task = 'regression');
+    price float PREDICT AS (ldm_infer()::float)
+) WITH (predict_timing = immediate, vector_len = 384, ldm_task = 'regression');
 
-INSERT INTO test_limix_regression (area, rooms, location, price) VALUES
+INSERT INTO test_ldm_regression (area, rooms, location, price) VALUES
     (80.0, 2, 'downtown', 500000),
     (120.0, 3, 'suburb', 350000),
     (60.0, 1, 'downtown', 400000);
 
-INSERT INTO test_limix_regression (area, rooms, location) VALUES (90.0, 2, 'downtown');
+INSERT INTO test_ldm_regression (area, rooms, location) VALUES (90.0, 2, 'downtown');
 -- price 应接近 450000-500000（加权平均）
 ```
 
 ### 10.4 自定义 topn
 
 ```sql
-CREATE TABLE test_limix_custom_topn (
+CREATE TABLE test_ldm_custom_topn (
     id serial PRIMARY KEY,
     product text,
     severity text,
     description text,
     ticket_vec EMBEDDINGS AS (ft_transformer_embedding(product, severity, description)),
-    priority text PREDICT AS (limix_infer())
-) WITH (predict_timing = immediate, vector_len = 384, limix_topn = 10);
+    priority text PREDICT AS (ldm_infer())
+) WITH (predict_timing = immediate, vector_len = 384, ldm_topn = 10);
 
-INSERT INTO test_limix_custom_topn (product, severity, description, priority) VALUES
+INSERT INTO test_ldm_custom_topn (product, severity, description, priority) VALUES
     ('Database', 'P1', 'Production database is down', 'critical'),
     ('API', 'P2', 'API response time increased', 'high'),
     ('UI', 'P3', 'Button color is wrong', 'low');
 
-INSERT INTO test_limix_custom_topn (product, severity, description) VALUES
+INSERT INTO test_ldm_custom_topn (product, severity, description) VALUES
     ('Database', 'P2', 'Replication lag detected');
 -- priority 应为 'high' 或 'critical'（与相似样本一致）
 ```
@@ -972,33 +972,33 @@ INSERT INTO test_limix_custom_topn (product, severity, description) VALUES
 ### 10.5 无历史数据测试
 
 ```sql
-CREATE TABLE test_limix_empty (
+CREATE TABLE test_ldm_empty (
     id serial PRIMARY KEY,
     feature1 text,
     feature2 int,
     feat_vec EMBEDDINGS AS (ft_transformer_embedding(feature1, feature2)),
-    label text PREDICT AS (limix_infer())
+    label text PREDICT AS (ldm_infer())
 ) WITH (predict_timing = immediate, vector_len = 384);
 
-INSERT INTO test_limix_empty (feature1, feature2) VALUES ('test', 100);
+INSERT INTO test_ldm_empty (feature1, feature2) VALUES ('test', 100);
 -- 应返回 WARNING 提示无历史数据，segment 为 NULL
 ```
 
 ### 10.6 信息提取（最近邻）
 
 ```sql
-CREATE TABLE test_limix_extract (
+CREATE TABLE test_ldm_extract (
     id serial PRIMARY KEY,
     source_text text,
     source_vec EMBEDDINGS AS (ft_transformer_embedding(source_text)),
-    summary text PREDICT AS (limix_infer())
-) WITH (predict_timing = immediate, vector_len = 384, limix_task = 'extraction');
+    summary text PREDICT AS (ldm_infer())
+) WITH (predict_timing = immediate, vector_len = 384, ldm_task = 'extraction');
 
-INSERT INTO test_limix_extract (source_text, summary) VALUES
+INSERT INTO test_ldm_extract (source_text, summary) VALUES
     ('PostgreSQL is a powerful open source database', 'database'),
     ('Python is a popular programming language', 'language');
 
-INSERT INTO test_limix_extract (source_text) VALUES ('MySQL is an open source database');
+INSERT INTO test_ldm_extract (source_text) VALUES ('MySQL is an open source database');
 -- summary 应为 'database'（最近邻复制）
 ```
 

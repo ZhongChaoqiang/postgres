@@ -524,7 +524,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 				SetConfigOption("jolix_predict.current_table", relname_str,
 								PGC_USERSET, PGC_S_SESSION);
 
-				/* Set limix_current_vector GUC for limix_infer() */
+				/* Set ldm_current_vector GUC for ldm_infer() */
 				{
 					int		emb_attnum;
 
@@ -539,7 +539,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 						 * For EMBEDDING AS (...) syntax, the visible column is text
 						 * and the hidden colname_embedding column is vector type.
 						 * For EMBEDDINGS AS (...) syntax, the column itself is vector.
-						 * We need the vector column to pass to limix_infer.
+						 * We need the vector column to pass to ldm_infer.
 						 */
 						if (emb_attr->attembedding || emb_attr->attembeddings)
 						{
@@ -578,20 +578,20 @@ predict_trigger(PG_FUNCTION_ARGS)
 														  &typoutput, &typIsVarlena);
 										vec_str = OidOutputFunctionCall(typoutput,
 																		emb_datum);
-										SetConfigOption("jolix_predict.limix_current_vector",
+										SetConfigOption("jolix_predict.ldm_current_vector",
 														vec_str,
 														PGC_USERSET, PGC_S_SESSION);
 										pfree(vec_str);
 									}
 									else
 									{
-										SetConfigOption("jolix_predict.limix_current_vector",
+										SetConfigOption("jolix_predict.ldm_current_vector",
 														"", PGC_USERSET, PGC_S_SESSION);
 									}
 								}
 								else
 								{
-									SetConfigOption("jolix_predict.limix_current_vector",
+									SetConfigOption("jolix_predict.ldm_current_vector",
 													"", PGC_USERSET, PGC_S_SESSION);
 								}
 							}
@@ -613,14 +613,14 @@ predict_trigger(PG_FUNCTION_ARGS)
 													  &typoutput, &typIsVarlena);
 									vec_str = OidOutputFunctionCall(typoutput,
 																	emb_datum);
-									SetConfigOption("jolix_predict.limix_current_vector",
+									SetConfigOption("jolix_predict.ldm_current_vector",
 													vec_str,
 													PGC_USERSET, PGC_S_SESSION);
 									pfree(vec_str);
 								}
 								else
 								{
-									SetConfigOption("jolix_predict.limix_current_vector",
+									SetConfigOption("jolix_predict.ldm_current_vector",
 													"", PGC_USERSET, PGC_S_SESSION);
 								}
 							}
@@ -657,7 +657,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 				}
 				PG_CATCH();
 				{
-					SetConfigOption("jolix_predict.limix_current_vector", "",
+					SetConfigOption("jolix_predict.ldm_current_vector", "",
 									PGC_USERSET, PGC_S_SESSION);
 					if (saved_current_table)
 						SetConfigOption("jolix_predict.current_table", saved_current_table,
@@ -669,7 +669,7 @@ predict_trigger(PG_FUNCTION_ARGS)
 				}
 				PG_END_TRY();
 
-				SetConfigOption("jolix_predict.limix_current_vector", "",
+				SetConfigOption("jolix_predict.ldm_current_vector", "",
 								PGC_USERSET, PGC_S_SESSION);
 
 				if (saved_current_table)

@@ -419,8 +419,8 @@ static relopt_int intRelOpts[] =
 	},
 	{
 		{
-			"limix_topn",
-			"Number of similar rows to retrieve for limix_infer function (k-NN k value).",
+			"ldm_topn",
+			"Number of similar rows to retrieve for ldm_infer function (k-NN k value).",
 			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
 		},
@@ -671,8 +671,8 @@ static relopt_string stringRelOpts[] =
 	},
 	{
 		{
-			"limix_model",
-			"Local inference model name for limix_infer function.",
+			"ldm_model",
+			"Local inference model name for ldm_infer function.",
 			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
 		},
@@ -680,8 +680,8 @@ static relopt_string stringRelOpts[] =
 	},
 	{
 		{
-			"limix_task",
-			"Task type for limix_infer: classification, regression, extraction, anomaly.",
+			"ldm_task",
+			"Task type for ldm_infer: classification, regression, extraction, anomaly.",
 			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
 		},
@@ -2062,12 +2062,12 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, ef_construction)},
 		{"embedding_function", RELOPT_TYPE_STRING,
 		offsetof(StdRdOptions, embedding_function_offset)},
-		{"limix_topn", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, limix_topn)},
-		{"limix_model", RELOPT_TYPE_STRING,
-		offsetof(StdRdOptions, limix_model_offset)},
-		{"limix_task", RELOPT_TYPE_STRING,
-		offsetof(StdRdOptions, limix_task_offset)}
+		{"ldm_topn", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, ldm_topn)},
+		{"ldm_model", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, ldm_model_offset)},
+		{"ldm_task", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, ldm_task_offset)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

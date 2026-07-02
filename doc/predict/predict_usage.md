@@ -113,28 +113,28 @@ SELECT llm_infer(
 - 内容超过 4096 字符会自动截断
 - 设置 `jolix_predict.llm_history_table = ''` 可禁用自动记录
 
-### 3.2 limix_infer 函数
+### 3.2 ldm_infer 函数
 
-LimiX 本地推理函数（零参数），基于向量相似度（k-NN）检索历史样本数据进行推理。利用当前表的 EMBEDDING 向量列搜索相似行，根据相似行的 PREDICT 列值直接推理出当前行的预测结果。**无需调用外部 LLM API**，推理完全在本地完成。
+LDM 本地推理函数（零参数），基于向量相似度（k-NN）检索历史样本数据进行推理。利用当前表的 EMBEDDING 向量列搜索相似行，根据相似行的 PREDICT 列值直接推理出当前行的预测结果。**无需调用外部 LLM API**，推理完全在本地完成。
 
 ```sql
 -- 零参数调用，全自动本地推理
-segment text PREDICT AS (limix_infer())
+segment text PREDICT AS (ldm_infer())
 ```
 
 **函数签名**：
 
 ```sql
-limix_infer() RETURNS text
+ldm_infer() RETURNS text
 ```
 
 **表级 WITH 参数**：
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `limix_model` | text | `'limix-2m'` | 本地推理模型名称（预留） |
-| `limix_task` | text | `'classification'` | 任务类别：`classification`、`regression`、`extraction`、`anomaly` |
-| `limix_topn` | integer | `5` | 检索的相似行数量（k-NN 的 k 值） |
+| `ldm_model` | text | `'ldm-2m'` | 本地推理模型名称（预留） |
+| `ldm_task` | text | `'classification'` | 任务类别：`classification`、`regression`、`extraction`、`anomaly` |
+| `ldm_topn` | integer | `5` | 检索的相似行数量（k-NN 的 k 值） |
 
 **自动推断机制**：
 
@@ -143,10 +143,10 @@ limix_infer() RETURNS text
 | 当前表名 | GUC: `jolix_predict.current_table`（由 PREDICT 触发器自动设置，支持 schema 限定名） |
 | EMBEDDING 列名 | 自动检测 `pg_attribute` 中 `attembedding=true` 或 `attembeddings=true` 的第一个列，返回隐藏的 `_embedding` 向量列名 |
 | PREDICT 列名 | 自动检测 `pg_attribute` 中 `attpredict=true` 的第一个列 |
-| 搜索向量 | GUC: `jolix_predict.limix_current_vector`（由 PREDICT 触发器自动设置） |
-| 推理算法 | 根据 `limix_task` 自动选择 k-NN 变体 |
+| 搜索向量 | GUC: `jolix_predict.ldm_current_vector`（由 PREDICT 触发器自动设置） |
+| 推理算法 | 根据 `ldm_task` 自动选择 k-NN 变体 |
 
-**limix_task 与推理算法**：
+**ldm_task 与推理算法**：
 
 | task 值 | 推理算法 | 输出格式 |
 |---------|---------|---------|
@@ -157,69 +157,69 @@ limix_infer() RETURNS text
 
 **在 PREDICT 列中使用（EMBEDDING AS 语法）**：
 
-limix_infer 支持两种向量列语法：`EMBEDDING AS`（单列嵌入，生成隐藏的 `_embedding` 列）和 `EMBEDDINGS AS`（多列组合向量）。
+ldm_infer 支持两种向量列语法：`EMBEDDING AS`（单列嵌入，生成隐藏的 `_embedding` 列）和 `EMBEDDINGS AS`（多列组合向量）。
 
 ```sql
 -- 分类任务：使用 EMBEDDING AS 语法（单列嵌入）
-CREATE TABLE limix_test_class (
+CREATE TABLE ldm_test_class (
     name text EMBEDDING AS (st_embedding(name)),
-    category text PREDICT AS (limix_infer())
-) WITH (predict_timing=immediate, limix_task='classification', limix_topn=3, vector_len=384);
+    category text PREDICT AS (ldm_infer())
+) WITH (predict_timing=immediate, ldm_task='classification', ldm_topn=3, vector_len=384);
 
 -- 插入训练数据
-INSERT INTO limix_test_class (name, category) VALUES ('apple', 'fruit');
-INSERT INTO limix_test_class (name, category) VALUES ('banana', 'fruit');
-INSERT INTO limix_test_class (name, category) VALUES ('dog', 'animal');
+INSERT INTO ldm_test_class (name, category) VALUES ('apple', 'fruit');
+INSERT INTO ldm_test_class (name, category) VALUES ('banana', 'fruit');
+INSERT INTO ldm_test_class (name, category) VALUES ('dog', 'animal');
 
 -- 插入新数据（自动推理，本地 k-NN，无需 LLM）
-INSERT INTO limix_test_class (name) VALUES ('grape');
+INSERT INTO ldm_test_class (name) VALUES ('grape');
 -- category 列自动推理为 'fruit'（grape 与 apple/banana 向量最近）
 ```
 
 ```sql
 -- 回归任务
-CREATE TABLE limix_test_reg (
+CREATE TABLE ldm_test_reg (
     feature text EMBEDDING AS (st_embedding(feature)),
-    value text PREDICT AS (limix_infer())
-) WITH (predict_timing=immediate, limix_task='regression', limix_topn=3, vector_len=384);
+    value text PREDICT AS (ldm_infer())
+) WITH (predict_timing=immediate, ldm_task='regression', ldm_topn=3, vector_len=384);
 
-INSERT INTO limix_test_reg (feature, value) VALUES ('one', '1');
-INSERT INTO limix_test_reg (feature, value) VALUES ('five', '5');
-INSERT INTO limix_test_reg (feature, value) VALUES ('ten', '10');
-INSERT INTO limix_test_reg (feature, value) VALUES ('twenty', '20');
-INSERT INTO limix_test_reg (feature) VALUES ('fifteen');
+INSERT INTO ldm_test_reg (feature, value) VALUES ('one', '1');
+INSERT INTO ldm_test_reg (feature, value) VALUES ('five', '5');
+INSERT INTO ldm_test_reg (feature, value) VALUES ('ten', '10');
+INSERT INTO ldm_test_reg (feature, value) VALUES ('twenty', '20');
+INSERT INTO ldm_test_reg (feature) VALUES ('fifteen');
 -- value 自动推理为 12.6212（介于 ten=10 和 twenty=20 之间的加权平均）
 ```
 
 ```sql
 -- 异常检测任务
-CREATE TABLE limix_test_anom (
+CREATE TABLE ldm_test_anom (
     sensor text EMBEDDING AS (st_embedding(sensor)),
-    status text PREDICT AS (limix_infer())
-) WITH (predict_timing=immediate, limix_task='anomaly', limix_topn=3, vector_len=384);
+    status text PREDICT AS (ldm_infer())
+) WITH (predict_timing=immediate, ldm_task='anomaly', ldm_topn=3, vector_len=384);
 ```
 
 ```sql
 -- 提取任务（最近邻复制，topn=1）
-CREATE TABLE limix_test_ext (
+CREATE TABLE ldm_test_ext (
     source text EMBEDDING AS (st_embedding(source)),
-    target text PREDICT AS (limix_infer())
-) WITH (predict_timing=immediate, limix_task='extraction', limix_topn=1, vector_len=384);
+    target text PREDICT AS (ldm_infer())
+) WITH (predict_timing=immediate, ldm_task='extraction', ldm_topn=1, vector_len=384);
 ```
 
-**直接调用 limix_infer（不通过 PREDICT 列）**：
+**直接调用 ldm_infer（不通过 PREDICT 列）**：
 
 ```sql
 -- 手动设置 GUC 参数后直接调用
-SET jolix_predict.current_table='limix_test_class';
-SET jolix_predict.limix_current_vector='[0.5,0.3,0.2]';
-SELECT limix_infer();
+SET jolix_predict.current_table='ldm_test_class';
+SET jolix_predict.ldm_current_vector='[0.5,0.3,0.2]';
+SELECT ldm_infer();
 -- 返回基于 k-NN 的推理结果
 ```
 
 **边界行为**：
 - 空表（无训练数据）：返回 NULL，输出 WARNING
-- 未设置 `limix_task`：默认使用 `classification`
+- 未设置 `ldm_task`：默认使用 `classification`
 - 向量列为 NULL：跳过该行，不参与 k-NN 检索
 
 ### 3.3 llm_rag_infer 函数
@@ -702,9 +702,9 @@ SET jolix_embedding.ft_model_name = 'sentence-transformers/all-mpnet-base-v2';
 | `vector_len` | integer | 384 | 向量维度（需与嵌入函数输出匹配） |
 | `vector_index` | enum | hnsw | 向量索引类型（ivfflat/hnsw） |
 | `vector_distance` | enum | vector_cosine_ops | 向量距离类型 |
-| `limix_model` | text | `limix-2m` | limix_infer 本地推理模型名称（预留） |
-| `limix_task` | text | `classification` | limix_infer 任务类别：`classification`/`regression`/`extraction`/`anomaly` |
-| `limix_topn` | integer | `5` | limix_infer 检索的相似行数量（k-NN 的 k 值） |
+| `ldm_model` | text | `ldm-2m` | ldm_infer 本地推理模型名称（预留） |
+| `ldm_task` | text | `classification` | ldm_infer 任务类别：`classification`/`regression`/`extraction`/`anomaly` |
+| `ldm_topn` | integer | `5` | ldm_infer 检索的相似行数量（k-NN 的 k 值） |
 
 ## 8. GUC 参数
 
@@ -718,7 +718,7 @@ SET jolix_embedding.ft_model_name = 'sentence-transformers/all-mpnet-base-v2';
 | `jolix_predict.llm_timeout` | integer | 请求超时（秒） |
 | `jolix_predict.llm_history_table` | string | 默认历史记录表名（默认default，空字符串禁用自动记录） |
 | `jolix_predict.current_table` | string | 当前表名（内部使用，支持 schema 限定名） |
-| `jolix_predict.limix_current_vector` | string | limix_infer 搜索向量（内部使用，由 PREDICT 触发器自动设置） |
+| `jolix_predict.ldm_current_vector` | string | ldm_infer 搜索向量（内部使用，由 PREDICT 触发器自动设置） |
 | `jolix_predict.history_retention_days` | integer | 历史记录保留天数（默认7，0=永不过期） |
 
 ### 8.2 jolix_embedding 参数
