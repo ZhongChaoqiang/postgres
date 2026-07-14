@@ -305,6 +305,76 @@ jolix_predict 扩展提供大语言模型（LLM）推理功能，允许用户在
 | `system_prompt` | `set_llm_config(p_system_prompt := '...')` | 系统提示词默认值 |
 | `user_input` | `set_llm_config(p_prompt_template := '...')` | 用户输入默认值 |
 
+### 8.5 RAG 上下文自动包含 PREDICT 列的隐藏伴生列
+
+#### 8.5.1 设计目标
+
+当 `llm_rag_infer` 通过 EMBEDDING 列检索相似记录并构建 RAG 上下文时，会自动将所有 PREDICT 列的隐藏伴生列（`{col}_actual`、`{col}_predict`）一并包含在上下文中，并在头部添加说明文字，告知 LLM 这些字段的含义：
+
+- 以 `_actual` 结尾的字段表示用户真实输入
+- 以 `_predict` 结尾的字段表示 LLM 推理结果
+
+这样 LLM 既能看到用户原始问题/内容，也能看到历史推理结果，从而生成更准确、更有上下文感知的回答。
+
+#### 8.5.2 实现细节
+
+`do_rag_retrieval()` 函数（位于 `contrib/jolix_predict/jolix_predict.c`）的执行流程：
+
+1. **发现 PREDICT 列**：通过 `relation_open` 打开表，遍历 `pg_attribute`，统计 `attpredict = true` 的列。
+2. **定位隐藏伴生列**：对每个 PREDICT 列 `{col}`，通过 `get_attnum()` 查找 `{col}_actual` 和 `{col}_predict` 两个隐藏列的 attnum。
+3. **显式查询隐藏列**：由于 `SELECT *` 会跳过 `atthidden = true` 的列，因此在 SELECT 语句中显式添加这些隐藏列：
+   ```sql
+   SELECT *, answer_actual, answer_predict, ...
+   FROM rag_table
+   ORDER BY embedding_col <=> $1::vector
+   LIMIT rag_topn
+   ```
+4. **构建上下文文本**：遍历 SPI 查询结果，将每列的 `列名: 值` 格式追加到上下文。若检测到存在伴生列，在上下文头部添加说明：
+   ```
+   Retrieved context:
+   Note: Fields ending in "_actual" represent the user's actual input.
+         Fields ending in "_predict" represent the LLM's inferred value.
+
+   --- Result 1 ---
+   id: 1
+   content: PostgreSQL is an advanced open source database.
+   answer: PostgreSQL is an open source database.
+   answer_actual: PostgreSQL is an open source database.
+   answer_predict: PostgreSQL is a powerful RDBMS.
+   ...
+   ```
+5. **过滤规则**：
+   - 跳过 `attisdropped` 的列
+   - 跳过 `attembedding` 的列（EMBEDDING 列本身）
+   - 跳过名为 `_embedding`、`_predict`、`_actual` 的列（避免与伴生列混淆）
+   - 跳过值为 NULL 的列（未推理的 `_predict` 列不会出现在上下文中）
+
+#### 8.5.3 兼容性
+
+- 若表中没有 PREDICT 列，或 PREDICT 列没有对应的隐藏伴生列，则跳过说明头部，行为与旧版本完全一致。
+- 若某些 `_predict` 列为 NULL（尚未异步推理完成），该字段不会出现在上下文中，不影响其他字段。
+- 内存管理：所有动态分配的列名数组在函数返回前通过 `pfree` 释放，避免内存泄漏。
+
+#### 8.5.4 示例
+
+```sql
+CREATE TABLE rag_knowledge (
+    id serial PRIMARY KEY,
+    content text EMBEDDING AS (st_embedding(content)),
+    answer text PREDICT AS (llm_rag_infer(
+        'Answer questions based on the provided context. Reply in one short sentence.',
+        content
+    ))
+) WITH (predict_timing = immediate, vector_len = 384);
+```
+
+当插入新问题触发 `llm_rag_infer` 时，`do_rag_retrieval` 会：
+1. 用 `st_embedding` 计算问题的向量
+2. 检索最相似的 Top-N 记录
+3. 构建包含 `answer_actual`、`answer_predict` 的上下文
+4. 添加说明头部
+5. 将完整上下文与问题一起发送给 LLM
+
 ---
-**文档版本**: 1.1  
-**最后更新**: 2026-05-23
+**文档版本**: 1.2  
+**最后更新**: 2026-07-08

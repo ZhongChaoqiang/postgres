@@ -473,6 +473,63 @@ WHERE sentiment = 'positive'
 ORDER BY review_emb <=> 'great performance'
 LIMIT 3;
 
+\echo '--- 5.5 RAG 上下文自动包含 _actual/_predict 隐藏列验证 ---'
+-- 验证 llm_rag_infer 在构建 RAG 上下文时会显式查询并包含 PREDICT 列的
+-- 隐藏伴生列（{col}_actual、{col}_predict），并在上下文头部添加说明。
+-- 使用确定性 PREDICT 表达式 upper() 避免 LLM 调用，便于断言 _predict 值。
+DROP TABLE IF EXISTS rag_ctx_test CASCADE;
+CREATE TABLE rag_ctx_test (
+    id serial PRIMARY KEY,
+    content text EMBEDDING AS (st_embedding(content)) STORED,
+    answer text PREDICT AS (upper(content)) STORED
+) WITH (predict_timing = immediate, vector_len = 384);
+
+INSERT INTO rag_ctx_test (content) VALUES
+    ('PostgreSQL is an advanced open source database.'),
+    ('The st_embedding function converts text to vectors.');
+
+-- 5.5.1 验证隐藏伴生列存在
+SELECT attname, atthidden, attpredict
+FROM pg_attribute
+WHERE attrelid = 'rag_ctx_test'::regclass
+  AND attname IN ('answer', 'answer_actual', 'answer_predict')
+ORDER BY attname;
+
+-- 5.5.2 验证 _actual 列已填充（INSERT 时由触发器写入用户输入）
+SELECT id, content, answer, answer_actual, answer_predict
+FROM rag_ctx_test ORDER BY id;
+
+-- 5.5.3 验证 _predict 列已填充（PREDICT 表达式 upper(content) 的结果）
+-- answer_predict 应等于 upper(content)
+SELECT id,
+       content,
+       answer,
+       answer_actual,
+       answer_predict,
+       (answer_predict = upper(content)) AS predict_matches_upper
+FROM rag_ctx_test ORDER BY id;
+
+-- 5.5.4 验证 llm_rag_infer 调用成功（RAG 上下文构建包含 _actual/_predict 列）
+-- 设置 dummy LLM URL，预期调用失败但 RAG 上下文构建应成功
+SET jolix_predict.llm_api_url = 'http://127.0.0.1:19999';
+SET jolix_predict.llm_model = 'test-model';
+SET jolix_predict.current_table = 'rag_ctx_test';
+SET jolix_predict.llm_timeout = 5;
+
+-- 调用 llm_rag_infer，预期因 LLM URL 无效返回 NULL，但不应崩溃
+-- 这验证了 do_rag_retrieval 能正确处理包含 _actual/_predict 列的查询
+SELECT llm_rag_infer(
+    'Answer based on context.',
+    'What is PostgreSQL?'
+) AS rag_result;
+
+RESET jolix_predict.llm_api_url;
+RESET jolix_predict.llm_model;
+RESET jolix_predict.current_table;
+RESET jolix_predict.llm_timeout;
+
+DROP TABLE IF EXISTS rag_ctx_test CASCADE;
+
 -- ================================================================
 -- 第6部分: 向量距离操作符测试
 -- ================================================================

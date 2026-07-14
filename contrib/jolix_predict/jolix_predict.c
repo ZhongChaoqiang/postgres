@@ -1309,6 +1309,15 @@ do_rag_retrieval(Oid rag_table, const char *user_input,
 	StringInfo	query_buf;
 	Datum		embedding_datum;
 	char	   *embedding_str;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			attnum;
+	char	  **actual_colnames = NULL;
+	char	  **predict_colnames = NULL;
+	int			num_predict_cols = 0;
+	bool		has_companion_cols = false;
+	int			i;
+	int			idx;
 
 	embedding_colname = find_embedding_column_name(rag_table);
 	if (embedding_colname == NULL)
@@ -1325,6 +1334,76 @@ do_rag_retrieval(Oid rag_table, const char *user_input,
 
 	relname = get_rel_name(rag_table);
 
+	/*
+	 * Discover PREDICT columns and their hidden _actual/_predict companion
+	 * columns so we can include them in the RAG context. SELECT * skips
+	 * hidden columns, so we must add them explicitly to the query.
+	 */
+	rel = relation_open(rag_table, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+
+	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+		if (attr->attisdropped)
+			continue;
+		if (attr->attpredict)
+			num_predict_cols++;
+	}
+
+	if (num_predict_cols > 0)
+	{
+		actual_colnames = (char **) palloc0(num_predict_cols * sizeof(char *));
+		predict_colnames = (char **) palloc0(num_predict_cols * sizeof(char *));
+		idx = 0;
+		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+			const char *predict_colname;
+			char	   *actual_hidden_name;
+			char	   *predict_hidden_name;
+			AttrNumber	actual_attnum;
+			AttrNumber	predict_attnum;
+
+			if (attr->attisdropped)
+				continue;
+			if (!attr->attpredict)
+				continue;
+
+			predict_colname = NameStr(attr->attname);
+			actual_hidden_name = psprintf("%s_actual", predict_colname);
+			predict_hidden_name = psprintf("%s_predict", predict_colname);
+
+			actual_attnum = get_attnum(rag_table, actual_hidden_name);
+			predict_attnum = get_attnum(rag_table, predict_hidden_name);
+
+			if (AttributeNumberIsValid(actual_attnum))
+			{
+				actual_colnames[idx] = actual_hidden_name;
+				has_companion_cols = true;
+			}
+			else
+			{
+				pfree(actual_hidden_name);
+			}
+
+			if (AttributeNumberIsValid(predict_attnum))
+			{
+				predict_colnames[idx] = predict_hidden_name;
+				has_companion_cols = true;
+			}
+			else
+			{
+				pfree(predict_hidden_name);
+			}
+
+			idx++;
+		}
+	}
+
+	relation_close(rel, AccessShareLock);
+
 	ret = SPI_connect();
 	if (ret != SPI_OK_CONNECT)
 	{
@@ -1337,8 +1416,18 @@ do_rag_retrieval(Oid rag_table, const char *user_input,
 	}
 
 	query_buf = makeStringInfo();
+	appendStringInfoString(query_buf, "SELECT *");
+	for (i = 0; i < num_predict_cols; i++)
+	{
+		if (actual_colnames[i] != NULL)
+			appendStringInfo(query_buf, ", %s",
+							 quote_identifier(actual_colnames[i]));
+		if (predict_colnames[i] != NULL)
+			appendStringInfo(query_buf, ", %s",
+							 quote_identifier(predict_colnames[i]));
+	}
 	appendStringInfo(query_buf,
-					 "SELECT * FROM %s ORDER BY %s <=> $1::vector LIMIT %d",
+					 " FROM %s ORDER BY %s <=> $1::vector LIMIT %d",
 					 quote_identifier(relname),
 					 quote_identifier(embedding_hidden_colname),
 					 rag_topn);
@@ -1358,10 +1447,15 @@ do_rag_retrieval(Oid rag_table, const char *user_input,
 	if (ret == SPI_OK_SELECT && SPI_processed > 0)
 	{
 		StringInfo	rag_buf = makeStringInfo();
-		int			i;
 		TupleDesc	spi_tupdesc = SPI_tuptable->tupdesc;
 
 		appendStringInfoString(rag_buf, "Retrieved context:\n");
+		if (has_companion_cols)
+		{
+			appendStringInfoString(rag_buf,
+								   "Note: Fields ending in \"_actual\" represent the user's actual input. "
+								   "Fields ending in \"_predict\" represent the LLM's inferred value.\n");
+		}
 
 		for (i = 0; i < (int) SPI_processed; i++)
 		{
@@ -1414,6 +1508,25 @@ do_rag_retrieval(Oid rag_table, const char *user_input,
 	pfree(embedding_str);
 	pfree(relname);
 	pfree(query_buf->data);
+
+	if (actual_colnames != NULL)
+	{
+		for (i = 0; i < num_predict_cols; i++)
+		{
+			if (actual_colnames[i] != NULL)
+				pfree(actual_colnames[i]);
+		}
+		pfree(actual_colnames);
+	}
+	if (predict_colnames != NULL)
+	{
+		for (i = 0; i < num_predict_cols; i++)
+		{
+			if (predict_colnames[i] != NULL)
+				pfree(predict_colnames[i]);
+		}
+		pfree(predict_colnames);
+	}
 
 	return rag_context;
 }

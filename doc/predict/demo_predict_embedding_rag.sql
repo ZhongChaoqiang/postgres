@@ -144,6 +144,52 @@ WHERE rag_answer IS NOT NULL
 ORDER BY id;
 
 -- ============================================
+-- 5.5 RAG 上下文自动包含 _actual/_predict 隐藏列
+-- ============================================
+-- 当 llm_rag_infer 检索相似记录构建 RAG 上下文时，会自动：
+--   1. 显式查询所有 PREDICT 列的隐藏伴生列（{col}_actual、{col}_predict）
+--   2. 在 RAG 上下文头部添加说明，告知 LLM 字段含义：
+--      - 以 _actual 结尾的字段表示用户真实输入
+--      - 以 _predict 结尾的字段表示 LLM 推理结果
+--
+-- 这样 LLM 既能看到用户原始问题/内容，也能看到历史推理结果，
+-- 从而生成更准确的回答。
+--
+-- 下面的查询展示 enriched_reviews 表中 PREDICT 列的隐藏伴生列：
+SELECT id,
+       product_name,
+       left(review_text, 40) AS review_preview,
+       sentiment,
+       sentiment_actual,           -- PREDICT 列 sentiment 的隐藏 _actual 列
+       sentiment_predict,          -- PREDICT 列 sentiment 的隐藏 _predict 列
+       rag_answer,
+       rag_answer_actual,          -- PREDICT 列 rag_answer 的隐藏 _actual 列
+       rag_answer_predict          -- PREDICT 列 rag_answer 的隐藏 _predict 列
+FROM enriched_reviews
+ORDER BY id
+LIMIT 5;
+
+-- 在 llm_rag_infer 内部，构建的 RAG 上下文格式如下（示意）：
+--   Retrieved context:
+--   Note: Fields ending in "_actual" represent the user's actual input.
+--         Fields ending in "_predict" represent the LLM's inferred value.
+--
+--   --- Result 1 ---
+--   id: 1
+--   product_name: iPhone 15 Pro
+--   review_text: The camera quality is outstanding ...
+--   sentiment: positive
+--   sentiment_actual: positive
+--   rag_answer: <NULL>
+--   rag_answer_actual: <NULL>
+--   ...
+--
+-- 说明：
+-- * SELECT * 默认跳过所有隐藏列，因此 do_rag_retrieval 显式将这些列加入查询
+-- * 若表中没有 PREDICT 列或没有伴生列，则跳过说明头部，保持兼容
+-- * 若某条记录的 _predict 列为 NULL（尚未推理），该字段不会出现在上下文中
+
+-- ============================================
 -- 6. PREDICT 列直接推理（情感分析）验证
 -- ============================================
 
