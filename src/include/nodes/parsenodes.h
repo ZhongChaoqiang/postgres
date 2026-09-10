@@ -3479,6 +3479,23 @@ typedef struct DropEmbeddingsStmt
 	bool		concurrent;
 } DropEmbeddingsStmt;
 
+/* ----------------------
+ *		Create Timeseries Vector Table Statement
+ * ----------------------
+ */
+typedef struct TsVectorStmt
+{
+	NodeTag		type;
+	char	   *vec_table_name;	/* name of the vector table to create */
+	RangeVar   *source_table;	/* source hypertable */
+	char	   *bucket_interval;	/* time bucket interval as string, e.g. '1 hour' */
+	char	   *vector_column;	/* name of the vector column */
+	char	   *vectorize_func;	/* name of the vectorize function */
+	List	   *carry_columns;	/* list of column names to carry from source (List of String) */
+	List	   *options;			/* WITH options (list of DefElem) */
+	bool		if_not_exists;	/* skip if vector table already exists */
+} TsVectorStmt;
+
 typedef struct IndexStmt
 {
 	NodeTag		type;

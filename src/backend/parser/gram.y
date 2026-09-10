@@ -284,7 +284,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		ConstraintsSetStmt CopyStmt CreateAsStmt CreateCastStmt
 		CreateDomainStmt CreateExtensionStmt CreateGroupStmt CreateOpClassStmt
 		CreateOpFamilyStmt AlterOpFamilyStmt CreatePLangStmt
-		CreateSchemaStmt CreateSeqStmt CreateStmt CreateStatsStmt EmbeddingsStmt CreateTableSpaceStmt
+		CreateSchemaStmt CreateSeqStmt CreateStmt CreateStatsStmt EmbeddingsStmt TsVectorStmt CreateTableSpaceStmt
 		CreateFdwStmt CreateForeignServerStmt CreateForeignTableStmt
 		CreateAssertionStmt CreateTransformStmt CreateTrigStmt CreateEventTrigStmt
 		CreateUserStmt CreateUserMappingStmt CreateRoleStmt CreatePolicyStmt
@@ -526,6 +526,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				columnref having_clause func_table xmltable array_expr
 				OptWhereClause operator_def_arg
 %type <list>	opt_column_and_period_list
+%type <list>	opt_carry_columns
 %type <list>	rowsfrom_item rowsfrom_list opt_col_def_list
 %type <boolean> opt_ordinality opt_without_overlaps
 %type <list>	ExclusionConstraintList ExclusionConstraintElem
@@ -707,7 +708,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	BACKWARD BEFORE BEGIN_P BETWEEN BIGINT BINARY BIT
 	BOOLEAN_P BOTH BREADTH BY
 
-	CACHE CALL CALLED CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
+	CACHE CALL CALLED CARRY CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
 	CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 	COMMITTED COMPRESSION CONCURRENTLY CONDITIONAL CONFIGURATION CONFLICT
@@ -778,14 +779,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
 	TABLE TABLES TABLESAMPLE TABLESPACE TARGET TEMP TEMPLATE TEMPORARY TEXT_P THEN
-	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
+	TIES TIME TIME_BUCKET TIMESERIES TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
 	TREAT TRIGGER TRIM TRUE_P
 	TRUNCATE TRUSTED TYPE_P TYPES_P
 
 	UESCAPE UNBOUNDED UNCONDITIONAL UNCOMMITTED UNENCRYPTED UNION UNIQUE UNKNOWN
 	UNLISTEN UNLOGGED UNTIL UPDATE USER USING
 
-	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
+	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING VECTOR VECTORIZE VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
 
 	WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
 
@@ -1056,6 +1057,7 @@ stmt:
 			| CreateSubscriptionStmt
 			| CreateStatsStmt
 			| EmbeddingsStmt
+			| TsVectorStmt
 			| CreateTableSpaceStmt
 			| CreateTransformStmt
 			| CreateTrigStmt
@@ -8341,9 +8343,49 @@ DropEmbeddingsStmt:
 					n->vecname = $5;
 					n->relation = $7;
 					n->if_exists = true;
-					n->concurrent = false;
+				n->concurrent = false;
+				$$ = (Node *) n;
+			}
+	;
+
+TsVectorStmt:
+			CREATE TIMESERIES VECTOR TABLE name FROM qualified_name
+			TIME_BUCKET Sconst VECTORIZE '(' ColId ')' USING ColId
+			opt_carry_columns opt_reloptions
+				{
+					TsVectorStmt *n = makeNode(TsVectorStmt);
+					n->vec_table_name = $5;
+					n->source_table = $7;
+					n->bucket_interval = $9;
+					n->vector_column = $12;
+					n->vectorize_func = $15;
+					n->carry_columns = $16;
+					n->options = $17;
+					n->if_not_exists = false;
 					$$ = (Node *) n;
 				}
+		| CREATE TIMESERIES VECTOR TABLE IF_P NOT EXISTS name FROM qualified_name
+			TIME_BUCKET Sconst VECTORIZE '(' ColId ')' USING ColId
+			opt_carry_columns opt_reloptions
+				{
+					TsVectorStmt *n = makeNode(TsVectorStmt);
+					n->vec_table_name = $8;
+					n->source_table = $10;
+					n->bucket_interval = $12;
+					n->vector_column = $15;
+					n->vectorize_func = $18;
+					n->carry_columns = $19;
+					n->options = $20;
+					n->if_not_exists = true;
+					$$ = (Node *) n;
+				}
+		;
+
+opt_carry_columns:
+			CARRY '(' columnList ')'
+				{ $$ = $3; }
+			| /*EMPTY*/
+				{ $$ = NIL; }
 		;
 
 IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
@@ -17871,6 +17913,7 @@ unreserved_keyword:
 			| CACHE
 			| CALL
 			| CALLED
+			| CARRY
 			| CASCADE
 			| CASCADED
 			| CATALOG_P
@@ -18139,6 +18182,8 @@ unreserved_keyword:
 			| TEMPORARY
 			| TEXT_P
 			| TIES
+			| TIMESERIES
+			| TIME_BUCKET
 			| TRANSACTION
 			| TRANSFORM
 			| TRIGGER
@@ -18162,6 +18207,8 @@ unreserved_keyword:
 			| VALIDATOR
 			| VALUE_P
 			| VARYING
+			| VECTOR
+			| VECTORIZE
 			| VERSION_P
 			| VIEW
 			| VIEWS
@@ -18430,6 +18477,7 @@ bare_label_keyword:
 			| CACHE
 			| CALL
 			| CALLED
+			| CARRY
 			| CASCADE
 			| CASCADED
 			| CASE
@@ -18790,7 +18838,9 @@ bare_label_keyword:
 			| THEN
 			| TIES
 			| TIME
+			| TIMESERIES
 			| TIMESTAMP
+			| TIME_BUCKET
 			| TRAILING
 			| TRANSACTION
 			| TRANSFORM
@@ -18823,6 +18873,8 @@ bare_label_keyword:
 			| VALUES
 			| VARCHAR
 			| VARIADIC
+			| VECTOR
+			| VECTORIZE
 			| VERBOSE
 			| VERSION_P
 			| VIEW

@@ -60,6 +60,7 @@ OBJS = \
 	tablespace.o \
 	trigger.o \
 	tsearchcmds.o \
+	tsvectorcmds.o \
 	typecmds.o \
 	user.o \
 	vacuum.o \
