@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * tsvector_funcs.c
- *    Timeseries vector helper functions: ts2v and timeseries_vector_run.
+ *    Timeseries vector helper functions: ts2v_moment and timeseries_vector_run.
  *
  * These functions are provided as a loadable shared library because the
  * return type `vector` (from pgvector) is not available at bootstrap time
@@ -16,6 +16,8 @@
  */
 
 #include "postgres.h"
+
+#include <math.h>
 
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
@@ -49,14 +51,39 @@ typedef struct Vector
 } Vector;
 
 /* ====================================================================
- * ts2v: Convert a float8[] array to a vector of specified dimension.
+ * ts2v_moment: Convert a float8[] array (a time series) to a vector of the
+ * requested dimension using moment-based feature extraction.
  *
- * Applies min-max normalization to the input values, then pads by
- * repeating the pattern cyclically to fill the target dimension.
+ * Statistical moments describe the shape of the distribution of the
+ * values regardless of order within the window:
+ *
+ *   1. mean       -- 1st raw moment (location)
+ *   2. stddev     -- sqrt of the 2nd central moment (scale)
+ *   3. skewness   -- 3rd standardized moment (asymmetry)
+ *   4. kurtosis   -- 4th standardized moment (tailedness)
+ *   5..8.         -- 5th..8th standardized moments (higher-order shape)
+ *
+ * Standardized moments are translation/scale invariant, so they are
+ * comparable across time slices with different levels and units.
+ *
+ * Each feature is bounded to [-1, 1] with the soft-sign transform
+ * f(v) = v / (1 + |v|); the bounded feature vector is then cyclically
+ * repeated to fill the requested vector_len.
  * ==================================================================== */
-PG_FUNCTION_INFO_V1(ts2v);
+
+#define MOMENT_MAX_ORDER	8		/* highest standardized moment order */
+#define MOMENT_NFEATURES	8		/* mean + stddev + orders 3..8 */
+
+/* Bounded, monotonic, sign-preserving normalization to (-1, 1). */
+static inline float
+softsign(double v)
+{
+	return (float) (v / (1.0 + fabs(v)));
+}
+
+PG_FUNCTION_INFO_V1(ts2v_moment);
 Datum
-ts2v(PG_FUNCTION_ARGS)
+ts2v_moment(PG_FUNCTION_ARGS)
 {
 	ArrayType  *arr;
 	int			target_dim;
@@ -65,8 +92,13 @@ ts2v(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 	int			nvalues;
 	int			i;
-	float	   *input;
-	float		min_val, max_val, range;
+	int			k;
+	double	   *x;
+	double		mean = 0.0;
+	double		var = 0.0;
+	double		std;
+	double		mom[MOMENT_MAX_ORDER + 1];
+	float		feat[MOMENT_NFEATURES];
 
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
@@ -88,46 +120,67 @@ ts2v(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("input array must not be empty")));
 
-	/* Extract float values */
-	input = (float *) palloc(nvalues * sizeof(float));
+	x = (double *) palloc(nvalues * sizeof(double));
+	for (i = 0; i < nvalues; i++)
+		x[i] = nulls[i] ? 0.0 : DatumGetFloat8(values[i]);
+
+	/* 1st raw moment: mean */
+	for (i = 0; i < nvalues; i++)
+		mean += x[i];
+	mean /= nvalues;
+
+	/* 2nd central moment: variance, then stddev */
 	for (i = 0; i < nvalues; i++)
 	{
-		input[i] = nulls[i] ? 0.0f : (float) DatumGetFloat8(values[i]);
-	}
+		double		d = x[i] - mean;
 
-	/* Min-max normalization to [0, 1] */
-	min_val = max_val = input[0];
-	for (i = 1; i < nvalues; i++)
-	{
-		if (input[i] < min_val)
-			min_val = input[i];
-		if (input[i] > max_val)
-			max_val = input[i];
+		var += d * d;
 	}
-	range = max_val - min_val;
-	if (range > 0)
+	var /= nvalues;
+	std = sqrt(var);
+
+	/* Mean and stddev describe location and scale. */
+	feat[0] = softsign(mean);
+	feat[1] = softsign(std);
+
+	/* 3rd..8th standardized moments describe shape (skewness, kurtosis, ...). */
+	if (std > 0.0)
 	{
+		for (k = 0; k <= MOMENT_MAX_ORDER; k++)
+			mom[k] = 0.0;
+
 		for (i = 0; i < nvalues; i++)
-			input[i] = (input[i] - min_val) / range;
+		{
+			double		z = (x[i] - mean) / std;
+			double		p = 1.0;
+
+			for (k = 0; k <= MOMENT_MAX_ORDER; k++)
+			{
+				mom[k] += p;
+				p *= z;
+			}
+		}
+
+		for (k = 3; k <= MOMENT_MAX_ORDER; k++)
+			feat[k - 1] = softsign(mom[k] / nvalues);
 	}
 	else
 	{
-		/* All values are the same; set to 0.5 (midpoint) */
-		for (i = 0; i < nvalues; i++)
-			input[i] = 0.5f;
+		/* Constant series: no shape variation, higher moments are zero. */
+		for (k = 2; k < MOMENT_NFEATURES; k++)
+			feat[k] = 0.0f;
 	}
 
-	/* Allocate and fill the result vector */
+	/* Allocate and fill the result vector, repeating features cyclically. */
 	result = (Vector *) palloc0(VECTOR_SIZE(target_dim));
 	SET_VARSIZE(result, VECTOR_SIZE(target_dim));
 	result->dim = target_dim;
 	result->unused = 0;
 
-	/* Pad by repeating the normalized pattern cyclically */
 	for (i = 0; i < target_dim; i++)
-		result->x[i] = input[i % nvalues];
+		result->x[i] = feat[i % MOMENT_NFEATURES];
 
-	pfree(input);
+	pfree(x);
 	pfree(values);
 	pfree(nulls);
 
@@ -211,7 +264,7 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 		vector_column = isnull ? pstrdup("embedding") : TextDatumGetCString(d);
 
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
-		vectorize_func = isnull ? pstrdup("ts2v") : TextDatumGetCString(d);
+		vectorize_func = isnull ? pstrdup("ts2v_moment") : TextDatumGetCString(d);
 
 		/* carry_columns is TEXT[] */
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);

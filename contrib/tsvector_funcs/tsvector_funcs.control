@@ -1,5 +1,5 @@
 # contrib/tsvector_funcs/tsvector_funcs.control
-comment = 'timeseries vector helper functions (ts2v, timeseries_vector_run)'
+comment = 'timeseries vector helper functions (ts2v_moment, timeseries_vector_run)'
 default_version = '1.0'
 module_pathname = '$libdir/tsvector_funcs'
 relocatable = true

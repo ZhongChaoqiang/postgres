@@ -31,7 +31,7 @@
 | 源表（Source Table） | 原始的 TimescaleDB 超表，存储时序数据 |
 | 向量表（Vector Table） | 新创建的表，存储时间片的向量数据和元信息 |
 | 时间片（Time Slice） | 固定时间间隔的数据窗口，如 1 小时、1 天 |
-| 向量化函数 | 将时序数据转换为向量的函数，如 `ts2v`、`ft_transformer_embedding` |
+| 向量化函数 | 将时序数据转换为向量的函数，如 `ts2v_moment`、`ft_transformer_embedding` |
 
 ## 2. 语法设计
 
@@ -55,19 +55,19 @@ USING vectorize_function
 | `source_hypertable` | 源超表名称 | `sensor_data` |
 | `bucket_interval` | 时间片间隔 | `'1 hour'`、`'30 minutes'` |
 | `vector_column_name` | 向量表中存储向量的列名 | `embedding` |
-| `vectorize_function` | 向量化函数名 | `ts2v`、`ft_transformer_embedding` |
+| `vectorize_function` | 向量化函数名 | `ts2v_moment`、`ft_transformer_embedding` |
 | `CARRY (columns)` | 从源表携带的属性列（用于 GROUP BY） | `CARRY (sensor_id, location)` |
 | `WITH (options)` | 表级选项 | `vector_len = 384, scan_interval = '5 min'` |
 
 ### 2.2 语法示例
 
 ```sql
--- 基本示例：按 1 小时分片，使用 ts2v 函数向量化
+-- 基本示例：按 1 小时分片，使用 ts2v_moment 函数向量化
 CREATE TIMESERIES VECTOR TABLE sensor_vectors
 FROM sensor_data
 TIME_BUCKET '1 hour'
 VECTORIZE (embedding)
-USING ts2v
+USING ts2v_moment
 CARRY (sensor_id, location)
 WITH (vector_len = 384, scan_interval = '5 min');
 ```
@@ -127,7 +127,7 @@ graph TB
     subgraph "后台任务流程"
         D[Background Worker<br/>定时扫描] --> E[查询未处理的<br/>完整时间片]
         E --> F{时间片数据<br/>是否完整?}
-        F -->|是| G[调用向量化函数<br/>ts2v/ft_transformer]
+        F -->|是| G[调用向量化函数<br/>ts2v_moment/ft_transformer]
         G --> H[计算向量结果]
         H --> I[INSERT 到向量表]
         F -->|否| J[等待下次扫描]
@@ -231,7 +231,7 @@ WHERE sv.slice_start IS NULL
 
 ```sql
 -- 向量化函数模板
-CREATE FUNCTION ts2v(
+CREATE FUNCTION ts2v_moment(
     data_rows REFCURSOR,  -- 或使用 SET RETURNING 函数
     vector_len INT DEFAULT 384
 ) RETURNS vector;
@@ -254,7 +254,7 @@ SELECT timescaledb_internal.add_job(
         'bucket_interval', '1 hour',
         'carry_columns', ARRAY['sensor_id', 'location'],
         'vector_column', 'embedding',
-        'vectorize_function', 'ts2v',
+        'vectorize_function', 'ts2v_moment',
         'completion_delay', '5 min'
     ),
     job_name => 'tsv_sensor_vectors'
@@ -403,7 +403,7 @@ ON sensor_vectors USING hnsw (embedding vector_cosine_ops);
 │  3. 遍历每个时间片                                     │
 │     ├── 查询该时间片内的时序数据                        │
 │     ├── 调用向量化函数                                 │
-│     │   ├── ts2v: 时序特征提取                        │
+│     │   ├── ts2v_moment: 时序特征提取                        │
 │     │   └── ft_transformer_embedding: 多列向量化      │
 │     └── INSERT 结果到向量表                           │
 │                                                      │
@@ -446,13 +446,13 @@ WHERE v.slice_start IS NULL;  -- 未处理的时间片
 
 向量化函数接收时间片内的数据，返回向量。两种支持模式：
 
-#### 模式一：聚合特征向量化（ts2v）
+#### 模式一：聚合特征向量化（ts2v_moment）
 
 ```sql
--- ts2v 函数：将时间片的统计特征转为向量
+-- ts2v_moment 函数：将时间片的统计特征转为向量
 -- 输入：时间片内的聚合数据（均值、标准差、最小值、最大值等）
 -- 输出：固定维度的向量
-SELECT ts2v(
+SELECT ts2v_moment(
     avg_temp, avg_humidity, avg_pressure,
     min_temp, max_temp, std_temp,
     row_count
@@ -503,7 +503,7 @@ CREATE TIMESERIES VECTOR TABLE sensor_vectors
 FROM sensor_data
 TIME_BUCKET '1 hour'
 VECTORIZE (embedding)
-USING ts2v
+USING ts2v_moment
 CARRY (sensor_id, location)
 WITH (vector_len = 384, scan_interval = '1 min', completion_delay = '5 min');
 
@@ -640,13 +640,13 @@ timeseries_vector_scan(PG_FUNCTION_ARGS)
 }
 ```
 
-### 7.4 向量化函数 ts2v 设计
+### 7.4 向量化函数 ts2v_moment 设计
 
-`ts2v` 是一个内置的时序数据向量化函数，将时间片内的时序数据转换为固定维度的向量。
+`ts2v_moment` 是一个内置的时序数据向量化函数，将时间片内的时序数据转换为固定维度的向量。当前实现采用 **moment 算法**（统计矩特征提取）：计算均值、标准差、偏度、峰度及 5~8 阶标准化矩，经 soft-sign 有界归一化后循环填充到目标维度（详见 13.5 节）。
 
 ```c
 /*
- * ts2v - 将时序数据转为向量
+ * ts2v_moment - 将时序数据转为向量
  *
  * 接收时间片内的数据行，提取统计特征，
  * 通过线性映射或学习模型转换为固定维度向量。
@@ -657,7 +657,7 @@ timeseries_vector_scan(PG_FUNCTION_ARGS)
  *   - vector(vector_len)
  */
 Datum
-ts2v(PG_FUNCTION_ARGS)
+ts2v_moment(PG_FUNCTION_ARGS)
 {
     int         nargs = PG_NARGS();
     int         vector_len = 384;  /* 默认维度 */
@@ -682,11 +682,11 @@ ts2v(PG_FUNCTION_ARGS)
 }
 ```
 
-特征扩展策略：
-1. **直接填充**：将特征值重复填充到目标维度
+特征扩展策略（当前实现采用 moment 算法，即第 1、4 条的组合）：
+1. **直接填充**：将特征值重复填充到目标维度 — 当前实现将 8 个 moment 特征循环填充
 2. **统计变换**：对每个特征计算多种统计量（平方、对数、平方根等）扩展维度
 3. **位置编码**：添加时间位置信息
-4. **归一化**：确保向量各维度在合理范围内
+4. **归一化**：确保向量各维度在合理范围内 — 当前实现使用 soft-sign 有界归一化到 (-1, 1)
 
 ## 8. 异常处理与可靠性
 
@@ -793,7 +793,7 @@ ts2v(PG_FUNCTION_ARGS)
 | IF NOT EXISTS | ✅ 已完成 | 支持幂等创建 |
 | 重复创建检测 | ✅ 已完成 | 不使用 IF NOT EXISTS 时重复创建报错 |
 | Schema 自动创建 | ✅ 已完成 | 自动创建 `_timescaledb_internal` schema（若不存在） |
-| ts2v 向量化函数 | ✅ 已完成 | `contrib/tsvector_funcs` 共享库，min-max归一化+循环填充 |
+| ts2v_moment 向量化函数 | ✅ 已完成 | `contrib/tsvector_funcs` 共享库，moment 统计矩特征提取 + soft-sign 归一化 + 循环填充 |
 | 手动触发函数 | ✅ 已完成 | `timeseries_vector_run(text)` 函数，手动触发向量计算 |
 
 ### 13.2 待实现功能
@@ -830,16 +830,21 @@ ts2v(PG_FUNCTION_ARGS)
 5. **IF NOT EXISTS**: 幂等创建正常工作
 6. **多 CARRY 列**: 支持多个携带列
 7. **pgvector 兼容**: 需使用对应 PG18 编译的 pgvector 扩展
-8. **ts2v 函数**: min-max归一化、循环填充、默认维度384、空数组/NULL错误处理均通过
+8. **ts2v_moment 函数**: moment 特征提取(均值/标准差/偏度/峰度/高阶矩 + soft-sign 归一化)、循环填充、默认维度384、空数组/NULL错误处理均通过
 9. **timeseries_vector_run**: 正确计算3个时间片的向量，幂等执行(ON CONFLICT DO NOTHING)，不存在的表返回错误
-10. **向量内容验证**: 归一化后 [0,1,0,1,...] 模式正确
+10. **向量内容验证**: moment 特征经 soft-sign 归一化后落在 [-1,1]，如 `[0.6666667, 0.44948974, 0, 0.6]`
 
-### 13.5 ts2v 函数技术细节
+### 13.5 ts2v_moment 函数技术细节
 
 - **实现位置**: `contrib/tsvector_funcs/tsvector_funcs.c`（共享库，非内置函数）
 - **原因**: `vector` 返回类型来自 pgvector 扩展，bootstrap 时不可用，无法通过 `pg_proc.dat` 注册为 `LANGUAGE internal`
-- **算法**: 对输入 float8[] 数组进行 min-max 归一化到 [0,1]，然后循环填充到目标维度
-- **签名**: `ts2v(float8[], int DEFAULT 384) RETURNS vector`
+- **算法**（moment 特征提取）:
+  1. 计算 1 阶原点矩（均值 mean）与 2 阶中心矩（方差 variance，标准差 stddev）
+  2. 计算 3~8 阶标准化矩（偏度 skewness、峰度 kurtosis 及更高阶矩），标准化矩具有平移/尺度不变性
+  3. 对每个特征应用 soft-sign 有界归一化 `f(v) = v / (1 + |v|)`，映射到 (-1, 1)
+  4. 将 8 个有界特征（mean, stddev, 3~8 阶标准化矩）循环填充到目标维度
+  - 常量序列（std=0）时，高阶矩全部置 0，仅保留均值特征
+- **签名**: `ts2v_moment(float8[], int DEFAULT 384) RETURNS vector`
 - **属性**: IMMUTABLE, PARALLEL SAFE
 
 ### 13.6 timeseries_vector_run 函数技术细节
