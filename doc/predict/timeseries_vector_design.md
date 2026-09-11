@@ -44,14 +44,14 @@ CREATE TABLE vector_table_name (
     <自定义列...>                             -- 可选：用户自定义列，可省略
 ) WITH (
     timeseries.source = 'source_table_name',  -- 必需：关联原始时序表（触发自动注入）
-    timeseries.bucket_interval = 'interval',  -- 必需：时间片间隔
+    timeseries.bucket_interval = 3600,      -- 必需：时间片间隔（秒）
     timeseries.vector_len = 384,             -- 向量维度（默认 384）
     timeseries.vectorize_function = 'fn',     -- 向量化函数（默认 ts2v_moment）
     timeseries.vector_column = 'col',         -- 向量列名（默认 embedding）
     timeseries.carry_columns = 'c1,c2,...',   -- 携带列名（逗号分隔，类型从源表自动推断）
     timeseries.enabled = true,                -- 后台任务开关
-    timeseries.scan_interval = 'interval',    -- 扫描间隔
-    timeseries.completion_delay = 'interval'  -- 完成延迟
+    timeseries.scan_interval = 300,           -- 扫描间隔（秒）
+    timeseries.completion_delay = 0           -- 完成延迟（秒）
     /* 其余数据质量参数见 4.3 节 */
 );
 ```
@@ -91,18 +91,18 @@ CREATE TABLE vector_table_name (
 | 选项 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `timeseries.source` | text | ✅ | — | 关联的原始时序表（源表）名称。存在即触发系统列自动注入 |
-| `timeseries.bucket_interval` | text | ✅ | — | 时间片间隔，如 `'1 hour'` |
+| `timeseries.bucket_interval` | int | ✅ | — | 时间片间隔（秒），如 `3600`（1 小时） |
 | `timeseries.vector_len` | int | — | `384` | 向量维度，决定向量列 `vector(N)` 的 N |
 | `timeseries.vectorize_function` | text | — | `ts2v_moment` | 向量化函数名 |
 | `timeseries.vector_column` | text | — | `embedding` | 向量列名 |
 | `timeseries.carry_columns` | text | — | 空 | 携带列名（逗号分隔），类型从源表自动推断 |
 | `timeseries.enabled` | bool | — | `true` | 是否启用后台任务 |
-| `timeseries.scan_interval` | text | — | `'5 min'` | 后台任务扫描间隔 |
-| `timeseries.completion_delay` | text | — | `'0 min'` | 时间片完成后的延迟等待 |
-| `timeseries.sample_interval` | text | — | NULL | 期望采样间隔（推断期望采样点数） |
+| `timeseries.scan_interval` | int | — | `300` | 后台任务扫描间隔（秒） |
+| `timeseries.completion_delay` | int | — | `0` | 时间片完成后的延迟等待（秒） |
+| `timeseries.sample_interval` | int | — | NULL | 期望采样间隔（秒），用于推断期望采样点数 |
 | `timeseries.min_coverage` | float | — | `0.5` | 覆盖率阈值 |
-| `timeseries.max_gap` | text | — | NULL | 最大数据间隙 |
-| `timeseries.completion_timeout` | text | — | NULL | 补全缺失数据超时 |
+| `timeseries.max_gap` | int | — | NULL | 最大数据间隙（秒） |
+| `timeseries.completion_timeout` | int | — | NULL | 补全缺失数据超时（秒） |
 | `timeseries.strict` | bool | — | `false` | 超时后是否跳过不完整时间片 |
 | `timeseries.recompute_on_late_data` | bool | — | `false` | 迟到数据是否触发重算 |
 
@@ -114,11 +114,11 @@ CREATE TABLE vector_table_name (
 -- 基本示例：只写 WITH 子句，系统列全部自动注入
 CREATE TABLE sensor_vectors () WITH (
     timeseries.source = 'sensor_data',
-    timeseries.bucket_interval = '1 hour',
+    timeseries.bucket_interval = 3600,
     timeseries.carry_columns = 'sensor_id,location',
     timeseries.vector_len = 384,
-    timeseries.scan_interval = '5 min',
-    timeseries.completion_delay = '5 min'
+    timeseries.scan_interval = 300,
+    timeseries.completion_delay = 300
 );
 -- 系统自动注入：slice_start, slice_end, sensor_id(TEXT), location(TEXT),
 --               embedding vector(384), _processed, _data_watermark, _coverage,
@@ -131,7 +131,7 @@ CREATE TABLE sensor_vectors_ext (
     notes         TEXT            -- 自定义列
 ) WITH (
     timeseries.source = 'sensor_data',
-    timeseries.bucket_interval = '30 minutes',
+    timeseries.bucket_interval = 1800,
     timeseries.carry_columns = 'sensor_id',
     timeseries.vector_len = 128
 );
@@ -164,10 +164,10 @@ SELECT * FROM timeseries_vector_info;
 SELECT timeseries_vector_run('vector_table_name');
 
 -- 修改扫描间隔（后台任务下次扫描时动态读取，立即生效）
-ALTER TABLE vector_table_name SET (timeseries.scan_interval = '10 min');
+ALTER TABLE vector_table_name SET (timeseries.scan_interval = 600);
 
 -- 修改时间片完成延迟
-ALTER TABLE vector_table_name SET (timeseries.completion_delay = '5 min');
+ALTER TABLE vector_table_name SET (timeseries.completion_delay = 300);
 
 -- 恢复为默认值
 ALTER TABLE vector_table_name RESET (timeseries.scan_interval);
@@ -178,7 +178,7 @@ ALTER TABLE vector_table_name SET (timeseries.enabled = true);
 
 -- 关联到新的源表 / 调整时间片间隔（结构性配置同样通过 reloptions 修改）
 ALTER TABLE vector_table_name SET (timeseries.source = 'new_source_table');
-ALTER TABLE vector_table_name SET (timeseries.bucket_interval = '30 minutes');
+ALTER TABLE vector_table_name SET (timeseries.bucket_interval = 1800);
 ```
 
 说明：
@@ -265,7 +265,7 @@ graph TB
    - 非 `strict` 模式：仍计算向量，但记录低覆盖率标记，供查询时过滤。
 4. **质量元数据**：在向量表中记录质量元数据列，供查询时过滤低质量向量（见 3.2.1）。
 
-期望采样点数由 `sample_interval` 表属性推断（= 时间片长度 / 采样间隔）；未指定时仅依据 `_row_count` 与 `_gap_count` 判断。
+期望采样点数由 `sample_interval` 表属性推断（= 时间片长度 / 采样间隔秒数）；未指定时仅依据 `_row_count` 与 `_gap_count` 判断。
 
 ##### 3. 综合判定流程
 
@@ -292,7 +292,7 @@ WITH candidates AS (
         count(*)::float / (3600.0 / 60.0) AS coverage,  -- 期望采样点 = 片长 / 采样间隔(60s)
         MAX(time) AS max_time_in_slice
     FROM sensor_data
-    WHERE time < NOW() - interval '5 min'               -- completion_delay
+    WHERE time < NOW() - make_interval(secs => ${completion_delay})  -- completion_delay（秒）
       AND time > ${watermark}                            -- 水位线之后
     GROUP BY 1, 2, 3, 4
 )
@@ -377,13 +377,13 @@ CREATE VIEW timeseries_vector_info AS
 SELECT
     c.oid::regclass::text AS vector_table_name,
     reloptions_text(c.reloptions, 'timeseries.source') AS source_table_name,
-    reloptions_text(c.reloptions, 'timeseries.bucket_interval') AS bucket_interval,
+    reloptions_int(c.reloptions, 'timeseries.bucket_interval') AS bucket_interval,
     reloptions_text(c.reloptions, 'timeseries.vectorize_function') AS vectorize_function,
     reloptions_text(c.reloptions, 'timeseries.vector_column') AS vector_column,
     reloptions_text(c.reloptions, 'timeseries.carry_columns') AS carry_columns,
     reloptions_bool(c.reloptions, 'timeseries.enabled') AS enabled,
-    reloptions_text(c.reloptions, 'timeseries.scan_interval') AS scan_interval,
-    reloptions_text(c.reloptions, 'timeseries.completion_delay') AS completion_delay
+    reloptions_int(c.reloptions, 'timeseries.scan_interval') AS scan_interval,
+    reloptions_int(c.reloptions, 'timeseries.completion_delay') AS completion_delay
 FROM pg_class c
 WHERE reloptions_text(c.reloptions, 'timeseries.source') IS NOT NULL;
 ```
@@ -418,7 +418,7 @@ CREATE TABLE sensor_vectors (
     anomaly_score FLOAT               -- 自定义列（可选，后台任务不写入）
 ) WITH (
     timeseries.source = 'sensor_data',
-    timeseries.bucket_interval = '1 hour',
+    timeseries.bucket_interval = 3600,
     timeseries.carry_columns = 'sensor_id,location',
     timeseries.vector_len = 384
 );
@@ -449,18 +449,18 @@ CREATE TABLE sensor_vectors (
 | 选项 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `timeseries.source` | text | —（必需） | 关联的原始时序表名称。存在即触发系统列自动注入 |
-| `timeseries.bucket_interval` | text | —（必需） | 时间片间隔，如 `'1 hour'` |
+| `timeseries.bucket_interval` | int | —（必需） | 时间片间隔（秒），如 `3600`（1 小时） |
 | `timeseries.vector_len` | int | 384 | 向量维度，决定自动注入的向量列类型 `vector(N)` |
 | `timeseries.vectorize_function` | text | ts2v_moment | 向量化函数名 |
 | `timeseries.vector_column` | text | embedding | 向量列名 |
 | `timeseries.carry_columns` | text | 空 | 携带列名（逗号分隔），类型从源表自动推断 |
 | `timeseries.enabled` | bool | true | 是否启用后台任务 |
-| `timeseries.scan_interval` | text | '5 min' | 后台任务扫描间隔 |
-| `timeseries.completion_delay` | text | '0 min' | 时间片完成后的延迟等待（缓解迟到数据） |
-| `timeseries.sample_interval` | text | NULL | 期望采样间隔，用于推断期望采样点数（NULL 则自动推断） |
+| `timeseries.scan_interval` | int | 300 | 后台任务扫描间隔（秒） |
+| `timeseries.completion_delay` | int | 0 | 时间片完成后的延迟等待（秒，缓解迟到数据） |
+| `timeseries.sample_interval` | int | NULL | 期望采样间隔（秒），用于推断期望采样点数（NULL 则自动推断） |
 | `timeseries.min_coverage` | float | 0.5 | 覆盖率阈值，低于此值不计算向量 |
-| `timeseries.max_gap` | text | NULL | 最大数据间隙，超过则判定数据不连续（NULL 表示不检测） |
-| `timeseries.completion_timeout` | text | NULL | 等待补齐缺失数据的超时时间（NULL 表示一直等待） |
+| `timeseries.max_gap` | int | NULL | 最大数据间隙（秒），超过则判定数据不连续（NULL 表示不检测） |
+| `timeseries.completion_timeout` | int | NULL | 等待补齐缺失数据的超时时间（秒，NULL 表示一直等待） |
 | `timeseries.strict` | bool | false | 超时后是否跳过不完整时间片（true 跳过 / false 带质量标记计算） |
 | `timeseries.recompute_on_late_data` | bool | false | 检测到迟到数据时是否重算受影响的时间片 |
 
@@ -516,7 +516,7 @@ WITH complete_slices AS (
         max(temperature) AS max_temp,
         stddev(temperature) AS std_temp
     FROM sensor_data
-    WHERE time < NOW() - $2  -- completion_delay
+    WHERE time < NOW() - make_interval(secs => $2)  -- completion_delay（秒）
     GROUP BY slice_start, sensor_id, location
 )
 SELECT c.* FROM complete_slices c
@@ -588,11 +588,11 @@ CREATE TABLE sensor_vectors (
     anomaly_score FLOAT               -- 自定义列（可选）
 ) WITH (
     timeseries.source = 'sensor_data',
-    timeseries.bucket_interval = '1 hour',
+    timeseries.bucket_interval = 3600,
     timeseries.carry_columns = 'sensor_id,location',
     timeseries.vector_len = 384,
-    timeseries.scan_interval = '1 min',
-    timeseries.completion_delay = '5 min'
+    timeseries.scan_interval = 60,
+    timeseries.completion_delay = 300
 );
 -- 系统自动注入 slice_start, slice_end, sensor_id, location, embedding,
 -- _processed, _data_watermark, _coverage, _row_count, _gap_count, _created_at
@@ -724,12 +724,12 @@ timeseries_vector_scan(PG_FUNCTION_ARGS)
     Jsonb       *config;
     Oid          source_table;
     Oid          vector_table;
-    Interval    *bucket_interval;
+    int          bucket_interval;  /* 秒 */
     char       **carry_columns;
     int          num_carry;
     char        *vector_column;
     Oid          vectorize_func;
-    Interval    *completion_delay;
+    int          completion_delay;   /* 秒 */
 
     /* 1. 从 job config 读取参数 */
     config = PG_GETARG_JSONB_P(0);

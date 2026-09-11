@@ -1,7 +1,7 @@
 -- ================================================================
 -- PostgreSQL 18.3 综合回归测试脚本
--- 覆盖: PREDICT / EMBEDDING / EMBEDDINGS / RAG / st_embedding / ft_transformer_embedding / ldm_infer
--- 日期: 2026-06-10（基础功能），2026-06-20（新增 ldm_infer）
+-- 覆盖: PREDICT / EMBEDDING / EMBEDDINGS / RAG / st_embedding / ft_transformer_embedding / ldm_infer / 创建时序向量表 (CREATE TABLE ... WITH timeseries.*) / ts2v_moment / timeseries_vector_run
+-- 日期: 2026-06-10（基础功能），2026-06-20（新增 ldm_infer），2026-07-15（新增时序向量表），2026-07-16（新增 ts2v_moment 和 timeseries_vector_run），2026-09-11（时序向量表改为标准 CREATE TABLE + reloptions 方案）
 -- ================================================================
 -- 使用方法:
 --   psql -h localhost -p 5433 -U postgres -d postgres -f regression_test.sql
@@ -10,6 +10,7 @@
 --   2. 已全局安装 sentence-transformers: sudo -H pip3 install sentence-transformers
 --   3. 已创建模型目录: /usr/local/pgsql/models (postgres用户可写)
 --   4. 网络可访问 LLM API
+--   5. 第11部分需要 pgvector 和 tsvector_funcs 扩展
 -- ================================================================
 
 \set ON_ERROR_STOP off
@@ -22,8 +23,10 @@
 \echo '============================================================'
 
 \echo '--- 1.1 扩展安装验证 ---'
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS tsvector_funcs;
 SELECT extname, extversion FROM pg_extension
-WHERE extname IN ('jolix_predict', 'jolix_embedding', 'vector', 'plpgsql')
+WHERE extname IN ('jolix_predict', 'jolix_embedding', 'vector', 'tsvector_funcs', 'plpgsql')
 ORDER BY extname;
 
 \echo '--- 1.2 GUC 参数验证（需先加载扩展）---'
@@ -41,7 +44,8 @@ SHOW jolix_embedding.ft_vector_len;
 SELECT proname, pronargs FROM pg_proc
 WHERE proname IN ('llm_infer', 'llm_rag_infer', 'set_llm_config', 'get_llm_config',
                    'st_embedding', 'ft_transformer_embedding',
-                   'record_predict_history', 'clear_predict_history', 'cleanup_predict_history')
+                   'record_predict_history', 'clear_predict_history', 'cleanup_predict_history',
+                   'ts2v_moment', 'timeseries_vector_run')
 ORDER BY proname, pronargs;
 
 \echo '--- 1.4 配置 LLM API ---'
@@ -736,10 +740,135 @@ SELECT label FROM ldm_test_default WHERE name='grape';
 SELECT reloptions FROM pg_class WHERE relname='ldm_test_reg';
 
 -- ================================================================
--- 第11部分: 清理
+-- 第11部分: 创建时序向量表 (CREATE TABLE ... WITH timeseries.*) 测试
 -- ================================================================
 \echo '============================================================'
-\echo '第11部分: 清理'
+\echo '第11部分: 创建时序向量表测试'
+\echo '============================================================'
+
+\echo '--- 11.1 创建源时序表 ---'
+DROP TABLE IF EXISTS tsvec_source CASCADE;
+DROP TABLE IF EXISTS tsvec_result CASCADE;
+
+CREATE TABLE tsvec_source (
+    time TIMESTAMPTZ NOT NULL,
+    device_id TEXT NOT NULL,
+    temperature DOUBLE PRECISION,
+    humidity DOUBLE PRECISION
+);
+INSERT INTO tsvec_source VALUES
+('2025-01-01 00:00:00', 'dev1', 20.5, 45.0),
+('2025-01-01 00:30:00', 'dev1', 21.0, 44.5),
+('2025-01-01 01:00:00', 'dev1', 21.5, 44.0),
+('2025-01-01 01:30:00', 'dev1', 22.0, 43.5);
+
+\echo '--- 11.2 创建时序向量表（系统列自动注入）---'
+CREATE TABLE tsvec_result () WITH (
+    timeseries.source = 'tsvec_source',
+    timeseries.bucket_interval = 3600,
+    timeseries.carry_columns = 'device_id',
+    timeseries.vectorize_function = 'ts2v_moment',
+    timeseries.vector_column = 'embedding',
+    timeseries.vector_len = 384
+);
+
+\echo '--- 11.3 验证向量表结构 ---'
+SELECT a.attname, format_type(a.atttypid, a.atttypmod) as type, a.attnotnull
+FROM pg_catalog.pg_attribute a
+WHERE a.attrelid = 'tsvec_result'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum;
+
+\echo '--- 11.4 验证索引 ---'
+SELECT c.relname as index_name, pg_get_indexdef(c.oid) as index_def
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'tsvec_result'::regclass;
+
+\echo '--- 11.5 验证 reloptions 元数据 ---'
+SELECT relname, reloptions
+FROM pg_class
+WHERE relname = 'tsvec_result';
+
+\echo '--- 11.6 测试 IF NOT EXISTS ---'
+CREATE TABLE IF NOT EXISTS tsvec_result () WITH (
+    timeseries.source = 'tsvec_source',
+    timeseries.bucket_interval = 3600,
+    timeseries.carry_columns = 'device_id',
+    timeseries.vectorize_function = 'ts2v_moment',
+    timeseries.vector_column = 'embedding',
+    timeseries.vector_len = 384
+);
+
+\echo '--- 11.7 测试重复创建（应报错）---'
+CREATE TABLE tsvec_result () WITH (
+    timeseries.source = 'tsvec_source',
+    timeseries.bucket_interval = 3600,
+    timeseries.carry_columns = 'device_id',
+    timeseries.vectorize_function = 'ts2v_moment',
+    timeseries.vector_column = 'embedding',
+    timeseries.vector_len = 384
+);
+
+\echo '--- 11.8 测试多个carry列 ---'
+DROP TABLE IF EXISTS tsvec_result2 CASCADE;
+CREATE TABLE tsvec_result2 () WITH (
+    timeseries.source = 'tsvec_source',
+    timeseries.bucket_interval = 1800,
+    timeseries.carry_columns = 'device_id,temperature,humidity',
+    timeseries.vectorize_function = 'ts2v_moment',
+    timeseries.vector_column = 'vec',
+    timeseries.vector_len = 256
+);
+
+SELECT a.attname, format_type(a.atttypid, a.atttypmod) as type
+FROM pg_catalog.pg_attribute a
+WHERE a.attrelid = 'tsvec_result2'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum;
+
+\echo '--- 11.9 ts2v_moment 函数 - 基本向量化（moment 算法）---'
+SELECT ts2v_moment(ARRAY[1.0, 2.0, 3.0]::float8[], 4) AS basic_vec;
+-- 预期: [0.6666667, 0.44948974, 0, 0.6]
+-- (4 维: 均值/标准差/偏度=0(对称)/峰度=1.5 的 soft-sign 归一化)
+
+\echo '--- 11.10 ts2v_moment 函数 - 相同值（range=0）---'
+SELECT ts2v_moment(ARRAY[5.0, 5.0, 5.0]::float8[], 3) AS same_val_vec;
+-- 预期: [0.8333333, 0, 0] (常量序列: 均值特征 + 高阶矩为 0)
+
+\echo '--- 11.11 ts2v_moment 函数 - 默认维度384 ---'
+SELECT vector_dims(ts2v_moment(ARRAY[1.0, 2.0]::float8[])) AS default_dims;
+-- 预期: 384
+
+\echo '--- 11.12 ts2v_moment 函数 - 空数组报错 ---'
+SELECT ts2v_moment(ARRAY[]::float8[], 4);
+
+\echo '--- 11.13 ts2v_moment 函数 - NULL输入报错 ---'
+SELECT ts2v_moment(NULL::float8[], 4);
+
+\echo '--- 11.14 timeseries_vector_run 手动触发 ---'
+-- 使用11.1创建的tsvec_source和tsvec_result表
+DELETE FROM tsvec_result;
+SELECT timeseries_vector_run('tsvec_result') AS run1;
+-- 预期: Processed 2 time slice(s) (2个1小时时间片)
+
+\echo '--- 11.15 验证向量表数据 ---'
+SELECT slice_start, slice_end, device_id,
+       vector_dims(embedding) AS dims,
+       (embedding IS NOT NULL) AS has_vec
+FROM tsvec_result
+ORDER BY slice_start, device_id;
+
+\echo '--- 11.16 timeseries_vector_run 幂等性 ---'
+SELECT timeseries_vector_run('tsvec_result') AS run2;
+-- 预期: Processed 0 time slice(s) (ON CONFLICT DO NOTHING)
+
+\echo '--- 11.17 timeseries_vector_run 不存在的表 ---'
+SELECT timeseries_vector_run('nonexistent_tsvec_table');
+
+-- ================================================================
+-- 第12部分: 清理
+-- ================================================================
+\echo '============================================================'
+\echo '第12部分: 清理'
 \echo '============================================================'
 
 DROP TABLE IF EXISTS pred_basic CASCADE;
@@ -761,6 +890,9 @@ DROP TABLE IF EXISTS ldm_test_anom CASCADE;
 DROP TABLE IF EXISTS ldm_test_ext CASCADE;
 DROP TABLE IF EXISTS ldm_test_empty CASCADE;
 DROP TABLE IF EXISTS ldm_test_default CASCADE;
+DROP TABLE IF EXISTS tsvec_result CASCADE;
+DROP TABLE IF EXISTS tsvec_result2 CASCADE;
+DROP TABLE IF EXISTS tsvec_source CASCADE;
 DROP SCHEMA IF EXISTS test_schema CASCADE;
 
 SELECT clear_predict_history();

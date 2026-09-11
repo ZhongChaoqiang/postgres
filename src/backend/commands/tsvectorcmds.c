@@ -325,11 +325,16 @@ InjectTimeseriesColumns(CreateStmt *stmt)
 	if (source_name == NULL)
 		return NIL;
 
-	/* timeseries.bucket_interval is required (see design 2.1 / 4.3). */
-	if (tsrelopt_get_string(stmt->options, "bucket_interval") == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("timeseries.bucket_interval is required")));
+	/* timeseries.bucket_interval is required and must be a positive integer (seconds). */
+	{
+		int			bucket_interval;
+
+		bucket_interval = tsrelopt_get_int32(stmt->options, "bucket_interval", 0);
+		if (bucket_interval <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("timeseries.bucket_interval must be a positive integer (seconds)")));
+	}
 
 	carry_str = tsrelopt_get_string(stmt->options, "carry_columns");
 	vector_column = tsrelopt_get_string(stmt->options, "vector_column");

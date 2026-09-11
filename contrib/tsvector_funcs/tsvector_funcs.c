@@ -210,10 +210,10 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 	Oid			vec_oid;
 	char	   *source_qualified = NULL;
 	char	   *vec_qualified = NULL;
-	char	   *bucket_interval = NULL;
+	int			bucket_interval = 3600;	/* 秒 */
 	char	   *vector_column = NULL;
 	char	   *vectorize_func = NULL;
-	char	   *completion_delay = NULL;
+	int			completion_delay = 0;	/* 秒 */
 	int			vector_len = 384;
 	MemoryContext	oldcontext;
 	char	   *time_col_name = NULL;
@@ -231,34 +231,65 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 				 errmsg("could not connect to SPI")));
 
-	/* ---- 1. Read metadata ---- */
+	/* ---- 1. Read configuration from pg_class.reloptions ---- */
 	query = makeStringInfo();
 	appendStringInfo(query,
-		"SELECT source_table, bucket_interval, vector_column, "
-		"vectorize_function, carry_columns, vector_len, completion_delay "
-		"FROM _timescaledb_internal.timeseries_vector_tables "
-		"WHERE vector_table = %s::regclass",
+		"SELECT "
+		"  (SELECT (regexp_match(opt, '^timeseries.source=(.+)$'))[1] "
+		"     FROM unnest(reloptions) opt "
+		"     WHERE regexp_match(opt, '^timeseries.source=(.+)$') IS NOT NULL) AS source, "
+		"  (SELECT (regexp_match(opt, '^timeseries.bucket_interval=(.+)$'))[1] "
+		"     FROM unnest(reloptions) opt "
+		"     WHERE regexp_match(opt, '^timeseries.bucket_interval=(.+)$') IS NOT NULL) AS bucket_interval, "
+		"  (SELECT (regexp_match(opt, '^timeseries.vector_column=(.+)$'))[1] "
+		"     FROM unnest(reloptions) opt "
+		"     WHERE regexp_match(opt, '^timeseries.vector_column=(.+)$') IS NOT NULL) AS vector_column, "
+		"  (SELECT (regexp_match(opt, '^timeseries.vectorize_function=(.+)$'))[1] "
+		"     FROM unnest(reloptions) opt "
+		"     WHERE regexp_match(opt, '^timeseries.vectorize_function=(.+)$') IS NOT NULL) AS vectorize_func, "
+		"  (SELECT (regexp_match(opt, '^timeseries.carry_columns=(.+)$'))[1] "
+		"     FROM unnest(reloptions) opt "
+		"     WHERE regexp_match(opt, '^timeseries.carry_columns=(.+)$') IS NOT NULL) AS carry_cols, "
+		"  (SELECT (regexp_match(opt, '^timeseries.vector_len=(.+)$'))[1] "
+		"     FROM unnest(reloptions) opt "
+		"     WHERE regexp_match(opt, '^timeseries.vector_len=(.+)$') IS NOT NULL) AS vector_len, "
+		"  (SELECT (regexp_match(opt, '^timeseries.completion_delay=(.+)$'))[1] "
+		"     FROM unnest(reloptions) opt "
+		"     WHERE regexp_match(opt, '^timeseries.completion_delay=(.+)$') IS NOT NULL) AS completion_delay "
+		"FROM pg_class WHERE oid = %s::regclass",
 		quote_literal_cstr(vec_table_name));
 
 	if (SPI_execute(query->data, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("no metadata found for vector table \"%s\"", vec_table_name)));
+				 errmsg("vector table \"%s\" not found or not a timeseries vector table",
+						vec_table_name)));
 
 	{
 		bool		isnull;
 		Datum		d;
+		char	   *source_name;
 
-		/* source_table is REGCLASS (OID) */
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
 		if (isnull)
 			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("source_table is NULL in metadata")));
-		source_oid = DatumGetObjectId(d);
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("timeseries.source not set for table \"%s\"", vec_table_name)));
+		source_name = TextDatumGetCString(d);
+
+		/* Resolve source table name to OID */
+		{
+			Oid	source_oid_tmp = DirectFunctionCall1(regclassin,
+													 CStringGetDatum(source_name));
+			if (!OidIsValid(source_oid_tmp))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_TABLE),
+						 errmsg("source table \"%s\" not found", source_name)));
+			source_oid = source_oid_tmp;
+		}
 
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
-		bucket_interval = isnull ? pstrdup("1 hour") : TextDatumGetCString(d);
+		bucket_interval = isnull ? 3600 : pg_strtoint32(TextDatumGetCString(d));
 
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
 		vector_column = isnull ? pstrdup("embedding") : TextDatumGetCString(d);
@@ -266,28 +297,24 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
 		vectorize_func = isnull ? pstrdup("ts2v_moment") : TextDatumGetCString(d);
 
-		/* carry_columns is TEXT[] */
+		/* carry_columns is comma-separated string */
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);
 		if (!isnull)
 		{
-			ArrayType  *carry_arr = DatumGetArrayTypeP(d);
-			ArrayIterator it = array_create_iterator(carry_arr, 0, NULL);
-			Datum		elem;
-			bool		elem_isnull;
+			char	   *carry_str = TextDatumGetCString(d);
+			char	   *copy = pstrdup(carry_str);
+			char	   *tok;
 
-			while (array_iterate(it, &elem, &elem_isnull))
-			{
-				if (!elem_isnull)
-					carry_cols = lappend(carry_cols, TextDatumGetCString(elem));
-			}
-			array_free_iterator(it);
+			for (tok = strtok(copy, ", "); tok != NULL; tok = strtok(NULL, ", "))
+				carry_cols = lappend(carry_cols, pstrdup(tok));
+			pfree(copy);
 		}
 
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
-		vector_len = isnull ? 384 : DatumGetInt32(d);
+		vector_len = isnull ? 384 : pg_strtoint64(TextDatumGetCString(d));
 
 		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 7, &isnull);
-		completion_delay = isnull ? pstrdup("0 min") : TextDatumGetCString(d);
+		completion_delay = isnull ? 0 : pg_strtoint32(TextDatumGetCString(d));
 	}
 
 	SPI_freetuptable(SPI_tuptable);
@@ -404,25 +431,29 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 						 quote_identifier(colname));
 	}
 
-	/* Build the full INSERT...SELECT query */
+	/* Build the full INSERT...SELECT query.
+	 * bucket_interval is now an integer (seconds), so the time-bucket math
+	 * simplifies: EXTRACT(epoch FROM bucket_interval::interval) == bucket_interval,
+	 * and multiplying back uses make_interval(secs => bucket_interval).
+	 */
 	resetStringInfo(query);
 	appendStringInfo(query,
 		"INSERT INTO %s (%s) "
 		"SELECT "
 		"  'epoch'::timestamptz + "
-		"    FLOOR(EXTRACT(epoch FROM %s) / EXTRACT(epoch FROM %s::interval)) "
-		"    * %s::interval AS slice_start, "
+		"    FLOOR(EXTRACT(epoch FROM %s) / %d) "
+		"    * make_interval(secs => %d) AS slice_start, "
 		"  'epoch'::timestamptz + "
-		"    (FLOOR(EXTRACT(epoch FROM %s) / EXTRACT(epoch FROM %s::interval)) + 1) "
-		"    * %s::interval AS slice_end",
+		"    (FLOOR(EXTRACT(epoch FROM %s) / %d) + 1) "
+		"    * make_interval(secs => %d) AS slice_end",
 		vec_qualified,
 		insert_cols->data,
 		quote_identifier(time_col_name),
-		quote_literal_cstr(bucket_interval),
-		quote_literal_cstr(bucket_interval),
+		bucket_interval,
+		bucket_interval,
 		quote_identifier(time_col_name),
-		quote_literal_cstr(bucket_interval),
-		quote_literal_cstr(bucket_interval));
+		bucket_interval,
+		bucket_interval);
 
 	if (carry_list->len > 0)
 		appendStringInfo(query, ", %s", carry_list->data);
@@ -434,12 +465,12 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 		vector_len);
 
 	appendStringInfo(query,
-		" FROM %s WHERE %s < NOW() - %s::interval"
+		" FROM %s WHERE %s < NOW() - make_interval(secs => %d)"
 		" GROUP BY %s"
 		" ON CONFLICT DO NOTHING",
 		source_qualified,
 		quote_identifier(time_col_name),
-		quote_literal_cstr(completion_delay),
+		completion_delay,
 		group_by->data);
 
 	/* ---- 5. Execute ---- */

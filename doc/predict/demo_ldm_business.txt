@@ -1,0 +1,224 @@
+-- ============================================================
+-- ldm_infer 业务演示：多列结构化数据智能分析
+-- 使用 EMBEDDINGS AS 语法对多列结构化数据生成组合向量
+-- 演示 ldm_infer 四种任务类型在真实业务场景中的应用
+--
+-- 与 EMBEDDING AS（单列文本嵌入）的区别：
+--   EMBEDDING AS (st_embedding(col))        → 单列文本 → 向量
+--   EMBEDDINGS AS (ft_transformer_embedding(col1, col2, ...)) → 多列组合 → 向量
+-- ============================================================
+
+-- ============================================================
+-- 场景一：客户信用评级分类 (classification)
+-- 业务场景：银行根据客户的职业、城市、年龄段、收入水平
+--           自动评定信用等级（excellent/good/fair/poor）
+-- 多列结构化数据：occupation + city + age_group + income_level
+-- ============================================================
+
+\echo '=== 场景一：客户信用评级分类 ==='
+\echo '业务场景：银行客户信用自动评级（excellent/good/fair/poor）'
+\echo '多列特征：occupation, city, age_group, income_level'
+
+DROP TABLE IF EXISTS customer_credit CASCADE;
+CREATE TABLE customer_credit (
+    id serial PRIMARY KEY,
+    occupation text,
+    city text,
+    age_group text,
+    income_level text,
+    credit_rating text PREDICT AS (ldm_infer()),
+    customer_profile EMBEDDINGS AS (ft_transformer_embedding(occupation, city, age_group, income_level))
+) WITH (predict_timing=immediate, ldm_task='classification', ldm_topn=3, vector_len=384);
+
+-- 训练数据：历史客户及其信用评级（每类4条，特征语义相近）
+INSERT INTO customer_credit (occupation, city, age_group, income_level, credit_rating) VALUES
+    -- excellent: 高收入专业人士
+    ('software architect', 'san francisco', 'middle', 'high', 'excellent'),
+    ('investment banker', 'new york', 'middle', 'high', 'excellent'),
+    ('surgeon', 'boston', 'senior', 'high', 'excellent'),
+    ('tech company executive', 'seattle', 'senior', 'high', 'excellent'),
+    -- good: 稳定中等收入
+    ('software engineer', 'austin', 'young', 'medium', 'good'),
+    ('registered nurse', 'denver', 'middle', 'medium', 'good'),
+    ('accountant', 'portland', 'middle', 'medium', 'good'),
+    ('high school teacher', 'chicago', 'middle', 'medium', 'good'),
+    -- fair: 一般收入
+    ('retail worker', 'phoenix', 'young', 'low', 'fair'),
+    ('truck driver', 'dallas', 'middle', 'low', 'fair'),
+    ('warehouse worker', 'atlanta', 'young', 'low', 'fair'),
+    ('food service worker', 'miami', 'young', 'low', 'fair'),
+    -- poor: 不稳定低收入
+    ('unemployed', 'detroit', 'young', 'none', 'poor'),
+    ('temporary worker', 'cleveland', 'young', 'none', 'poor'),
+    ('day laborer', 'memphis', 'young', 'none', 'poor'),
+    ('part time cleaner', 'baltimore', 'senior', 'none', 'poor');
+
+-- 新客户：自动信用评级
+\echo '--- 新客户自动信用评级 ---'
+INSERT INTO customer_credit (occupation, city, age_group, income_level) VALUES
+    ('data scientist', 'san jose', 'young', 'high'),        -- 预期: excellent（高收入科技行业）
+    ('civil engineer', 'denver', 'middle', 'medium'),       -- 预期: good（稳定中等收入）
+    ('gas station attendant', 'houston', 'young', 'low'),   -- 预期: fair（一般收入）
+    ('construction day worker', 'phoenix', 'young', 'none'); -- 预期: poor（不稳定低收入）
+
+SELECT occupation, city, age_group, income_level, credit_rating
+FROM customer_credit
+WHERE occupation IN ('data scientist', 'civil engineer', 'gas station attendant', 'construction day worker')
+ORDER BY id;
+
+-- ============================================================
+-- 场景二：房屋租金预测 (regression)
+-- 业务场景：房产平台根据位置、房型、面积、装修情况
+--           预测月租金（美元），用于租金定价建议
+-- 多列结构化数据：location + house_type + size + furnishing
+-- ============================================================
+
+\echo ''
+\echo '=== 场景二：房屋租金预测 ==='
+\echo '业务场景：房产平台预测月租金（美元），用于定价建议'
+\echo '多列特征：location, house_type, size, furnishing'
+
+DROP TABLE IF EXISTS house_rent CASCADE;
+CREATE TABLE house_rent (
+    id serial PRIMARY KEY,
+    location text,
+    house_type text,
+    size text,
+    furnishing text,
+    monthly_rent text PREDICT AS (ldm_infer()),
+    property_features EMBEDDINGS AS (ft_transformer_embedding(location, house_type, size, furnishing))
+) WITH (predict_timing=immediate, ldm_task='regression', ldm_topn=3, vector_len=384);
+
+-- 训练数据：历史房源 → 实际月租金（美元）
+-- 语义与租金有直接对应关系：核心区贵、郊区便宜；大户型贵、小户型便宜
+INSERT INTO house_rent (location, house_type, size, furnishing, monthly_rent) VALUES
+    ('manhattan new york', 'studio apartment', 'small', 'furnished', '2500'),
+    ('manhattan new york', 'studio apartment', 'small', 'unfurnished', '2000'),
+    ('manhattan new york', 'one bedroom apartment', 'medium', 'furnished', '3500'),
+    ('manhattan new york', 'one bedroom apartment', 'medium', 'unfurnished', '3000'),
+    ('brooklyn new york', 'one bedroom apartment', 'medium', 'unfurnished', '2000'),
+    ('brooklyn new york', 'two bedroom apartment', 'large', 'furnished', '3000'),
+    ('queens new york', 'two bedroom apartment', 'large', 'unfurnished', '2200'),
+    ('jersey city', 'one bedroom apartment', 'medium', 'furnished', '1800'),
+    ('suburban new jersey', 'three bedroom house', 'large', 'unfurnished', '1500'),
+    ('suburban connecticut', 'three bedroom house', 'large', 'unfurnished', '1300'),
+    ('rural pennsylvania', 'three bedroom house', 'large', 'unfurnished', '800'),
+    ('rural ohio', 'two bedroom house', 'medium', 'unfurnished', '600');
+
+-- 新房源：预测月租金
+\echo '--- 新房源租金预测 ---'
+INSERT INTO house_rent (location, house_type, size, furnishing) VALUES
+    ('manhattan new york', 'studio apartment', 'small', 'unfurnished'),  -- 预期: ~2000-2500（曼哈顿小户型）
+    ('brooklyn new york', 'two bedroom apartment', 'large', 'furnished'), -- 预期: ~2500-3500（布鲁克林大户型带装修）
+    ('suburban connecticut', 'three bedroom house', 'large', 'unfurnished'); -- 预期: ~1200-1800（郊区大房子）
+
+SELECT location, house_type, size, furnishing, monthly_rent
+FROM house_rent
+WHERE location IN (
+    'manhattan new york',
+    'brooklyn new york',
+    'suburban connecticut'
+) AND id > 10
+ORDER BY id;
+
+-- ============================================================
+-- 场景三：交易欺诈检测 (anomaly)
+-- 业务场景：支付平台检测异常交易，识别潜在的欺诈行为
+--           正常交易模式：常规商户、合理金额、常见支付方式
+--           异常交易模式：非常规商户、异常金额、可疑支付方式
+-- 多列结构化数据：merchant + category + amount + payment_method
+-- ============================================================
+
+\echo ''
+\echo '=== 场景三：交易欺诈检测 ==='
+\echo '业务场景：支付平台检测异常交易，识别潜在欺诈'
+\echo '多列特征：merchant, category, amount, payment_method'
+
+DROP TABLE IF EXISTS transaction_fraud CASCADE;
+CREATE TABLE transaction_fraud (
+    id serial PRIMARY KEY,
+    merchant text,
+    category text,
+    amount text,
+    payment_method text,
+    status text PREDICT AS (ldm_infer()),
+    transaction_features EMBEDDINGS AS (ft_transformer_embedding(merchant, category, amount, payment_method))
+) WITH (predict_timing=immediate, ldm_task='anomaly', ldm_topn=3, vector_len=384);
+
+-- 训练数据：正常交易记录（语义相近的日常消费，含不同金额范围）
+INSERT INTO transaction_fraud (merchant, category, amount, payment_method, status) VALUES
+    ('whole foods market', 'grocery', '85 dollars', 'credit card', 'normal'),
+    ('trader joes', 'grocery', '45 dollars', 'debit card', 'normal'),
+    ('safeway supermarket', 'grocery', '62 dollars', 'credit card', 'normal'),
+    ('kroger grocery store', 'grocery', '78 dollars', 'credit card', 'normal'),
+    ('walmart supercenter', 'shopping', '145 dollars', 'credit card', 'normal'),
+    ('costco wholesale', 'shopping', '180 dollars', 'credit card', 'normal'),
+    ('target retail store', 'shopping', '67 dollars', 'debit card', 'normal'),
+    ('amazon online store', 'shopping', '125 dollars', 'credit card', 'normal'),
+    ('best buy electronics', 'shopping', '350 dollars', 'credit card', 'normal'),
+    ('starbucks coffee', 'food and drink', '12 dollars', 'credit card', 'normal'),
+    ('mcdonalds restaurant', 'food and drink', '18 dollars', 'debit card', 'normal'),
+    ('shell gas station', 'gasoline', '52 dollars', 'credit card', 'normal');
+
+-- 新交易：正常 vs 异常
+\echo '--- 交易欺诈检测对比 ---'
+INSERT INTO transaction_fraud (merchant, category, amount, payment_method) VALUES
+    ('publix supermarket', 'grocery', '55 dollars', 'credit card'),              -- 正常（日常超市消费）
+    ('home depot hardware store', 'shopping', '210 dollars', 'credit card'),     -- 正常（常规商场购物）
+    ('unknown overseas wire transfer', 'money transfer', '5000 dollars', 'cryptocurrency'), -- 异常（海外大额加密货币转账）
+    ('suspicious lottery winner notification', 'prize claim', '10000 dollars', 'gift card'); -- 异常（可疑奖品领取）
+
+SELECT merchant, category, amount, payment_method, status
+FROM transaction_fraud
+WHERE id > 12
+ORDER BY id;
+
+-- ============================================================
+-- 场景四：智能产品推荐 (extraction)
+-- 业务场景：电商平台根据客户需求、预算、使用场景
+--           匹配最相似的历史客户，复用其购买的产品推荐
+-- 多列结构化数据：customer_need + budget_range + use_case
+-- ============================================================
+
+\echo ''
+\echo '=== 场景四：智能产品推荐 ==='
+\echo '业务场景：电商平台根据客户需求匹配最相似的历史推荐'
+\echo '多列特征：customer_need, budget_range, use_case'
+
+DROP TABLE IF EXISTS product_recommendation CASCADE;
+CREATE TABLE product_recommendation (
+    id serial PRIMARY KEY,
+    customer_need text,
+    budget_range text,
+    use_case text,
+    recommended_product text PREDICT AS (ldm_infer()),
+    customer_profile EMBEDDINGS AS (ft_transformer_embedding(customer_need, budget_range, use_case))
+) WITH (predict_timing=immediate, ldm_task='extraction', ldm_topn=1, vector_len=384);
+
+-- 训练数据：历史客户需求 → 成功推荐的产品
+INSERT INTO product_recommendation (customer_need, budget_range, use_case, recommended_product) VALUES
+    ('laptop for work', '1000 to 1500 dollars', 'office productivity and video calls',
+     'MacBook Air M2 13 inch'),
+    ('laptop for school', '500 to 800 dollars', 'note taking and online classes',
+     'Lenovo IdeaPad 3 15 inch'),
+    ('gaming computer', '1500 to 2500 dollars', 'playing modern games at high settings',
+     'ASUS ROG Strix G16 gaming laptop'),
+    ('budget tablet', '200 to 400 dollars', 'reading and media consumption',
+     'Samsung Galaxy Tab A8'),
+    ('professional workstation', '2500 to 4000 dollars', 'video editing and 3d rendering',
+     'MacBook Pro 16 inch M3 Max'),
+    ('cheap phone', '100 to 300 dollars', 'basic calling and messaging',
+     'Samsung Galaxy A14 budget smartphone');
+
+-- 新客户：自动推荐产品
+\echo '--- 智能产品推荐结果 ---'
+INSERT INTO product_recommendation (customer_need, budget_range, use_case) VALUES
+    ('notebook for office work', '1000 to 1500 dollars', 'business meetings and documents'),  -- 预期: MacBook Air
+    ('laptop for college student', '500 to 800 dollars', 'studying and homework'),            -- 预期: Lenovo IdeaPad
+    ('professional workstation for content creation', '2500 to 4000 dollars', 'video production and 3d rendering'); -- 预期: MacBook Pro
+
+SELECT customer_need, budget_range, use_case, recommended_product
+FROM product_recommendation
+WHERE id > 6
+ORDER BY id;
+
