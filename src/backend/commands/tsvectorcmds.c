@@ -1,484 +1,636 @@
+/*-------------------------------------------------------------------------
+ *
+ * tsvectorcmds.c
+ *	  Commands for creating timeseries vector tables.
+ *
+ * A timeseries vector table is a normal PostgreSQL table created through the
+ * standard CREATE TABLE ... WITH (...) syntax.  When the WITH clause contains
+ * a "timeseries.source" option, the core injects all system-required columns
+ * (slice_start, slice_end, the carry columns, the vector column and the
+ * quality metadata columns) plus a PRIMARY KEY constraint, and stores the
+ * timeseries.* options in pg_class.reloptions under their own namespace.
+ *
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ *
+ * src/backend/commands/tsvectorcmds.c
+ *
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
-#include "access/genam.h"
-#include "access/htup_details.h"
+#include "access/attnum.h"
 #include "access/relation.h"
-#include "access/skey.h"
+#include "access/reloptions.h"
 #include "access/table.h"
-#include "catalog/catalog.h"
-#include "catalog/dependency.h"
-#include "catalog/heap.h"
-#include "catalog/indexing.h"
+#include "access/tupdesc.h"
 #include "catalog/namespace.h"
-#include "catalog/objectaccess.h"
 #include "catalog/pg_attribute.h"
-#include "catalog/pg_class.h"
-#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
-#include "commands/tablecmds.h"
 #include "commands/tsvectorcmds.h"
-#include "executor/spi.h"
-#include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/parsenodes.h"
 #include "nodes/value.h"
-#include "parser/parse_coerce.h"
-#include "parser/parse_func.h"
-#include "parser/parse_type.h"
-#include "utils/acl.h"
+#include "parser/parser.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/snapmgr.h"
-#include "utils/syscache.h"
+#include "utils/regproc.h"
+
+/* Prefix used when serializing a timeseries.* reloption into pg_class. */
+#define TS_RELOPT_PREFIX "timeseries."
+
+/* Number of dimensions of a vector column when timeseries.vector_len is not
+ * given.  Matches the default used across the timeseries vector feature. */
+#define TS_DEFAULT_VECTOR_LEN 384
+
+/* Default names for the vector column and vectorize function. */
+#define TS_DEFAULT_VECTOR_COLUMN "embedding"
+#define TS_DEFAULT_VECTORIZE_FUNCTION "ts2v_moment"
+
+
+/* ----------------------------------------------------------------------
+ * Reloption helpers.
+ * ---------------------------------------------------------------------- */
 
 /*
- * Get the OID of the vector type.
+ * Look up a "timeseries.<name>" option in a DefElem list and return its
+ * string value (via defGetString), or NULL when absent.
  */
-static Oid
-get_vector_type_oid(void)
-{
-	return TypenameGetTypid("vector");
-}
-
-/*
- * Parse WITH options from the TsVectorStmt.
- */
-static void
-parse_tsvector_options(List *options, int *vector_len, char **scan_interval,
-					   char **completion_delay)
+static char *
+tsrelopt_get_string(List *options, const char *name)
 {
 	ListCell   *lc;
-
-	*vector_len = 384;
-	*scan_interval = pstrdup("5 min");
-	*completion_delay = pstrdup("0 min");
 
 	foreach(lc, options)
 	{
-		DefElem    *defel = (DefElem *) lfirst(lc);
+		DefElem    *def = lfirst_node(DefElem, lc);
 
-		if (strcmp(defel->defname, "vector_len") == 0)
-			*vector_len = defGetInt64(defel);
-		else if (strcmp(defel->defname, "scan_interval") == 0)
-		{
-			pfree(*scan_interval);
-			*scan_interval = defGetString(defel);
-		}
-		else if (strcmp(defel->defname, "completion_delay") == 0)
-		{
-			pfree(*completion_delay);
-			*completion_delay = defGetString(defel);
-		}
+		if (def->defnamespace != NULL &&
+			strcmp(def->defnamespace, "timeseries") == 0 &&
+			strcmp(def->defname, name) == 0)
+			return defGetString(def);
 	}
+	return NULL;
 }
 
 /*
- * Build a CREATE TABLE statement string for the vector table and execute it
- * via SPI.
+ * Look up a "timeseries.<name>" integer option, returning default_val when
+ * absent.
  */
-static void
-create_vector_table(const char *vec_table_name, const char *source_table_name,
-					List *carry_columns, const char *vector_column,
-					int vector_len, Oid source_relid)
+static int
+tsrelopt_get_int32(List *options, const char *name, int default_val)
 {
-	StringInfo	query;
-	StringInfo	pk_cols;
 	ListCell   *lc;
-	Oid			vector_typoid;
-	char	   *source_schema;
-	char	   *source_relname;
-	Relation	rel;
-	TupleDesc	tupdesc;
 
-	vector_typoid = get_vector_type_oid();
-	if (!OidIsValid(vector_typoid))
+	foreach(lc, options)
+	{
+		DefElem    *def = lfirst_node(DefElem, lc);
+
+		if (def->defnamespace != NULL &&
+			strcmp(def->defnamespace, "timeseries") == 0 &&
+			strcmp(def->defname, name) == 0)
+			return defGetInt32(def);
+	}
+	return default_val;
+}
+
+
+/* ----------------------------------------------------------------------
+ * Column injection helpers.
+ * ---------------------------------------------------------------------- */
+
+/*
+ * Does the given table element list already declare a column "name"?
+ * Only ColumnDef nodes are considered.
+ */
+static bool
+column_name_exists(List *tableElts, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, tableElts)
+	{
+		Node	   *node = lfirst(lc);
+
+		if (IsA(node, ColumnDef) &&
+			strcmp(((ColumnDef *) node)->colname, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Build a raw (untransformed) boolean A_Const, matching what the grammar
+ * produces for a bare TRUE/FALSE literal.  raw_default must hold an A_Const
+ * (not a transformed Const), otherwise transformExpr() rejects it.
+ */
+static Node *
+make_raw_bool_const(bool state)
+{
+	A_Const    *n = makeNode(A_Const);
+
+	n->val.boolval.type = T_Boolean;
+	n->val.boolval.boolval = state;
+	n->location = -1;
+
+	return (Node *) n;
+}
+
+/*
+ * Build a simple injected ColumnDef from a built-in type OID.  Optionally
+ * marks it NOT NULL and/or supplies a raw (untransformed) default expression.
+ */
+static ColumnDef *
+make_injected_column(const char *colname, Oid typeOid, int32 typmod,
+					 bool is_not_null, Node *raw_default)
+{
+	ColumnDef  *col = makeColumnDef(colname, typeOid, typmod, InvalidOid);
+
+	col->is_not_null = is_not_null;
+	col->raw_default = raw_default;
+	col->is_hidden = false;
+
+	return col;
+}
+
+/*
+ * Build the injected vector column of type vector(vector_len).
+ */
+static ColumnDef *
+make_injected_vector_column(const char *colname, int vector_len)
+{
+	ColumnDef  *col = makeNode(ColumnDef);
+	TypeName   *type = makeNode(TypeName);
+	A_Const    *typmod;
+
+	typmod = makeNode(A_Const);
+	typmod->val.ival.type = T_Integer;
+	typmod->val.ival.ival = vector_len;
+	typmod->location = -1;
+
+	type->names = list_make1(makeString("vector"));
+	type->typmods = list_make1(typmod);
+	type->typemod = -1;
+	type->location = -1;
+
+	col->colname = pstrdup(colname);
+	col->typeName = type;
+	col->compression = NULL;
+	col->inhcount = 0;
+	col->is_local = true;
+	col->is_not_null = false;
+	col->is_from_type = false;
+	col->is_predict = false;
+	col->is_embedding = false;
+	col->is_embeddings = false;
+	col->is_hidden = false;
+	col->embeddings_func = NIL;
+	col->embeddings_cols = NIL;
+	col->storage = 0;
+	col->storage_name = NULL;
+	col->raw_default = NULL;
+	col->cooked_default = NULL;
+	col->identity = '\0';
+	col->identitySequence = NULL;
+	col->generated = '\0';
+	col->collClause = NULL;
+	col->collOid = InvalidOid;
+	col->constraints = NIL;
+	col->fdwoptions = NIL;
+	col->location = -1;
+
+	return col;
+}
+
+/*
+ * Split a comma-separated list of column names into a List of freshly
+ * allocated, whitespace-trimmed strings.
+ */
+static List *
+parse_carry_columns(const char *carry_str)
+{
+	List	   *result = NIL;
+	char	   *copy;
+	char	   *tok;
+
+	if (carry_str == NULL)
+		return NIL;
+
+	copy = pstrdup(carry_str);
+	for (tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ","))
+	{
+		char	   *s = tok;
+		char	   *e;
+
+		/* Trim leading whitespace. */
+		while (*s == ' ' || *s == '\t')
+			s++;
+
+		/* Trim trailing whitespace. */
+		e = s + strlen(s);
+		while (e > s && (e[-1] == ' ' || e[-1] == '\t'))
+			e--;
+		*e = '\0';
+
+		if (*s != '\0')
+			result = lappend(result, pstrdup(s));
+	}
+
+	pfree(copy);
+	return result;
+}
+
+/*
+ * Build the HNSW vector index statement that is created automatically after
+ * the vector table itself is created.
+ */
+static IndexStmt *
+make_timeseries_hnsw_index(RangeVar *relation, const char *vector_column)
+{
+	IndexStmt  *index = makeNode(IndexStmt);
+	IndexElem  *iparam = makeNode(IndexElem);
+
+	index->idxname = psprintf("%s_%s_idx", relation->relname, vector_column);
+	index->relation = copyObject(relation);
+	index->accessMethod = pstrdup("hnsw");
+	index->tableSpace = NULL;
+	index->options = NIL;
+	index->whereClause = NULL;
+	index->excludeOpNames = NIL;
+	index->idxcomment = NULL;
+	index->indexOid = InvalidOid;
+	index->oldNumber = InvalidRelFileNumber;
+	index->oldCreateSubid = InvalidSubTransactionId;
+	index->oldFirstRelfilelocatorSubid = InvalidSubTransactionId;
+	index->unique = false;
+	index->nulls_not_distinct = false;
+	index->primary = false;
+	index->isconstraint = false;
+	index->iswithoutoverlaps = false;
+	index->deferrable = false;
+	index->initdeferred = false;
+	index->transformed = false;
+	index->concurrent = false;
+	index->if_not_exists = true;
+	index->reset_default_tblspc = false;
+
+	iparam->name = pstrdup(vector_column);
+	iparam->expr = NULL;
+	iparam->indexcolname = NULL;
+	iparam->collation = NIL;
+	iparam->opclass = list_make1(makeString("vector_cosine_ops"));
+	iparam->opclassopts = NIL;
+	iparam->ordering = SORTBY_DEFAULT;
+	iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+
+	index->indexParams = list_make1(iparam);
+	index->indexIncludingParams = NIL;
+
+	return index;
+}
+
+
+/* ----------------------------------------------------------------------
+ * Main column injection entry point.
+ * ---------------------------------------------------------------------- */
+
+/*
+ * InjectTimeseriesColumns
+ *
+ * See header comment.  The injection mutates stmt->tableElts in place and
+ * returns a List of IndexStmt nodes (the HNSW vector index) to be executed
+ * after the CREATE TABLE itself.
+ */
+List *
+InjectTimeseriesColumns(CreateStmt *stmt)
+{
+	char	   *source_name;
+	char	   *carry_str;
+	char	   *vector_column;
+	int			vector_len;
+	Oid			source_relid;
+	Relation	source_rel;
+	TupleDesc	tupdesc;
+	List	   *carry_names = NIL;
+	List	   *injected = NIL;
+	List	   *pk_keys = NIL;
+	Constraint *pk;
+	ListCell   *lc;
+	List	   *extra_stmts = NIL;
+
+	/* Trigger: only act when timeseries.source is present. */
+	source_name = tsrelopt_get_string(stmt->options, "source");
+	if (source_name == NULL)
+		return NIL;
+
+	/* timeseries.bucket_interval is required (see design 2.1 / 4.3). */
+	if (tsrelopt_get_string(stmt->options, "bucket_interval") == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("timeseries.bucket_interval is required")));
+
+	carry_str = tsrelopt_get_string(stmt->options, "carry_columns");
+	vector_column = tsrelopt_get_string(stmt->options, "vector_column");
+	if (vector_column == NULL)
+		vector_column = pstrdup(TS_DEFAULT_VECTOR_COLUMN);
+	vector_len = tsrelopt_get_int32(stmt->options, "vector_len",
+									TS_DEFAULT_VECTOR_LEN);
+
+	/* The vector type must be available (provided by pgvector). */
+	if (!OidIsValid(TypenameGetTypid("vector")))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("type \"vector\" is not installed"),
 				 errhint("Install the pgvector extension first: CREATE EXTENSION vector;")));
 
-	/* Open source table to inspect carry column types */
-	rel = relation_open(source_relid, AccessShareLock);
-	tupdesc = RelationGetDescr(rel);
-	source_schema = get_namespace_name(RelationGetNamespace(rel));
-	source_relname = pstrdup(RelationGetRelationName(rel));
-
-	query = makeStringInfo();
-	pk_cols = makeStringInfo();
-
-	appendStringInfo(query, "CREATE TABLE %s (", quote_identifier(vec_table_name));
-	appendStringInfoString(query, "slice_start TIMESTAMPTZ NOT NULL");
-	appendStringInfoString(query, ", slice_end TIMESTAMPTZ NOT NULL");
-
-	appendStringInfoString(pk_cols, "slice_start");
-
-	/* Add carry columns with types from source table */
-	foreach(lc, carry_columns)
+	/* Open the source table to validate it and read carry-column types. */
 	{
-		char	   *colname = strVal(lfirst(lc));
-		AttrNumber	attnum;
-		Form_pg_attribute attr;
-		char	   *typname;
+		List	   *names = stringToQualifiedNameList(source_name, NULL);
+		RangeVar   *rv = makeRangeVarFromNameList(names);
 
-		attnum = get_attnum(source_relid, colname);
-		if (attnum == InvalidAttrNumber)
+		source_relid = RangeVarGetRelid(rv, AccessShareLock, false);
+	}
+	source_rel = relation_open(source_relid, AccessShareLock);
+	tupdesc = RelationGetDescr(source_rel);
+
+	/* Parse and validate the carry columns. */
+	carry_names = parse_carry_columns(carry_str);
+	foreach(lc, carry_names)
+	{
+		char	   *colname = (char *) lfirst(lc);
+
+		if (get_attnum(source_relid, colname) == InvalidAttrNumber)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
-					 errmsg("column \"%s\" does not exist in source table \"%s\"",
-							colname, source_relname)));
-
-		attr = TupleDescAttr(tupdesc, attnum - 1);
-		typname = format_type_with_typemod(attr->atttypid, attr->atttypmod);
-
-		appendStringInfo(query, ", %s %s NOT NULL",
-						 quote_identifier(colname), typname);
-		appendStringInfo(pk_cols, ", %s", quote_identifier(colname));
-
-		pfree(typname);
+					 errmsg("carry column \"%s\" does not exist in source table \"%s\"",
+							colname, source_name)));
 	}
 
-	/* Add vector column */
-	appendStringInfo(query, ", %s vector(%d)", quote_identifier(vector_column), vector_len);
-
-	/* Add hidden metadata columns */
-	appendStringInfoString(query, ", _processed BOOLEAN DEFAULT true");
-	appendStringInfoString(query, ", _created_at TIMESTAMPTZ DEFAULT now()");
-
-	/* Add primary key */
-	appendStringInfo(query, ", PRIMARY KEY (%s)", pk_cols->data);
-
-	appendStringInfoChar(query, ')');
-
-	relation_close(rel, AccessShareLock);
-
-	/* Execute CREATE TABLE via SPI */
-	if (SPI_connect() != SPI_OK_CONNECT)
+	/* Validate vector_len is within pgvector's supported range. */
+	if (vector_len <= 0)
 		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("could not connect to SPI")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("timeseries.vector_len must be positive")));
 
-	if (SPI_execute(query->data, false, 0) != SPI_OK_UTILITY)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("failed to create vector table: %s", vec_table_name)));
-
-	SPI_finish();
-
-	pfree(query->data);
-	pfree(pk_cols->data);
-	pfree(source_schema);
-	pfree(source_relname);
-}
-
-/*
- * Create a vector index on the vector column.
- */
-static void
-create_vector_index(const char *vec_table_name, const char *vector_column)
-{
-	StringInfo	query;
-
-	query = makeStringInfo();
-	appendStringInfo(query,
-					 "CREATE INDEX %s_%s_idx ON %s USING hnsw (%s vector_cosine_ops)",
-					 quote_identifier(vec_table_name),
-					 quote_identifier(vector_column),
-					 quote_identifier(vec_table_name),
-					 quote_identifier(vector_column));
-
-	if (SPI_connect() != SPI_OK_CONNECT)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("could not connect to SPI")));
-
-	if (SPI_execute(query->data, false, 0) != SPI_OK_UTILITY)
-		elog(NOTICE, "could not create vector index on %s (non-fatal)", vec_table_name);
-
-	SPI_finish();
-	pfree(query->data);
-}
-
-/*
- * Register metadata and background job.
- */
-static void
-register_tsvector_metadata(const char *vec_table_name, Oid source_relid,
-						   const char *bucket_interval, const char *vector_column,
-						   const char *vectorize_func, List *carry_columns,
-						   int vector_len, const char *scan_interval,
-						   const char *completion_delay)
-{
-	StringInfo	query;
-	StringInfo	carry_str;
-	ListCell   *lc;
-	Oid			vec_relid;
-	int			job_id = 0;
-
-	/* Resolve vector table OID */
-	vec_relid = get_relname_relid(vec_table_name, PG_PUBLIC_NAMESPACE);
-	if (!OidIsValid(vec_relid))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("vector table \"%s\" was not created", vec_table_name)));
-
-	/* Build carry columns array string */
-	carry_str = makeStringInfo();
-	appendStringInfoString(carry_str, "{");
-	foreach(lc, carry_columns)
-	{
-		char	   *colname = strVal(lfirst(lc));
-		if (lc != list_head(carry_columns))
-			appendStringInfoChar(carry_str, ',');
-		appendStringInfoString(carry_str, colname);
-	}
-	appendStringInfoChar(carry_str, '}');
-
-	/* Insert metadata */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("could not connect to SPI")));
-
-	/* Create schema if not exists */
-	query = makeStringInfo();
-	appendStringInfo(query,
-		"CREATE SCHEMA IF NOT EXISTS _timescaledb_internal");
-
-	if (SPI_execute(query->data, false, 0) != SPI_OK_UTILITY)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("failed to create metadata schema")));
-
-	/* Create metadata table if not exists */
-	resetStringInfo(query);
-	appendStringInfo(query,
-		"CREATE TABLE IF NOT EXISTS _timescaledb_internal.timeseries_vector_tables ("
-		"  id SERIAL PRIMARY KEY,"
-		"  vector_table REGCLASS NOT NULL UNIQUE,"
-		"  source_table REGCLASS NOT NULL,"
-		"  bucket_interval TEXT NOT NULL,"
-		"  vector_column TEXT NOT NULL,"
-		"  vectorize_function TEXT NOT NULL,"
-		"  carry_columns TEXT[] NOT NULL DEFAULT '{}',"
-		"  vector_len INT NOT NULL DEFAULT 384,"
-		"  scan_interval TEXT NOT NULL DEFAULT '5 min',"
-		"  completion_delay TEXT NOT NULL DEFAULT '0 min',"
-		"  job_id INTEGER,"
-		"  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
-		"  enabled BOOLEAN NOT NULL DEFAULT true)");
-
-	if (SPI_execute(query->data, false, 0) != SPI_OK_UTILITY)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("failed to create metadata table")));
-
-	/* Insert metadata record */
-	resetStringInfo(query);
-	appendStringInfo(query,
-		"INSERT INTO _timescaledb_internal.timeseries_vector_tables "
-		"(vector_table, source_table, bucket_interval, vector_column, "
-		"vectorize_function, carry_columns, vector_len, scan_interval, completion_delay) "
-		"VALUES (%s::regclass, %s::regclass, %s, %s, %s, %s, %d, %s, %s)",
-		quote_literal_cstr(vec_table_name),
-		quote_literal_cstr(get_rel_name(source_relid)),
-		quote_literal_cstr(bucket_interval),
-		quote_literal_cstr(vector_column),
-		quote_literal_cstr(vectorize_func),
-		quote_literal_cstr(carry_str->data),
-		vector_len,
-		quote_literal_cstr(scan_interval),
-		quote_literal_cstr(completion_delay));
-
-	if (SPI_execute(query->data, false, 0) != SPI_OK_INSERT)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("failed to insert metadata for vector table")));
 
 	/*
-	 * Try to register a TimescaleDB background job.
-	 * If TimescaleDB is not available or the scan function doesn't exist,
-	 * we skip silently.
+	 * Inject the fixed time-slice columns.  Skip any column the user already
+	 * declared explicitly.
 	 */
+	if (!column_name_exists(stmt->tableElts, "slice_start"))
+		injected = lappend(injected,
+						   make_injected_column("slice_start", TIMESTAMPTZOID,
+												-1, true, NULL));
+	if (!column_name_exists(stmt->tableElts, "slice_end"))
+		injected = lappend(injected,
+						   make_injected_column("slice_end", TIMESTAMPTZOID,
+												-1, true, NULL));
+
+	/* Inject the carry columns with types taken from the source table. */
+	foreach(lc, carry_names)
 	{
-		Oid			scan_func_oid;
-		Oid			add_job_oid;
-		List	   *scan_func_name;
+		char	   *colname = (char *) lfirst(lc);
+		AttrNumber	attnum;
+		Form_pg_attribute attr;
+		ColumnDef  *col;
 
-		/* Check if timeseries_vector_scan function exists */
-		scan_func_name = list_make1(makeString((char *) "timeseries_vector_scan"));
-		scan_func_oid = LookupFuncName(scan_func_name, 0, NULL, true);
-		list_free(scan_func_name);
+		if (column_name_exists(stmt->tableElts, colname))
+			continue;
 
-		/* Check if timescaledb_internal.add_job function exists */
-		add_job_oid = LookupFuncName(list_make2(makeString((char *) "timescaledb_internal"),
-												makeString((char *) "add_job")),
-									 -1, NULL, true);
+		attnum = get_attnum(source_relid, colname);
+		attr = TupleDescAttr(tupdesc, attnum - 1);
 
-		if (OidIsValid(scan_func_oid) && OidIsValid(add_job_oid))
+		col = makeColumnDef(colname, attr->atttypid, attr->atttypmod,
+							attr->attcollation);
+		col->is_not_null = true;
+		injected = lappend(injected, col);
+	}
+
+	/* Inject the vector column. */
+	if (!column_name_exists(stmt->tableElts, vector_column))
+		injected = lappend(injected,
+						   make_injected_vector_column(vector_column,
+													   vector_len));
+
+	/* Inject the quality metadata columns. */
+	if (!column_name_exists(stmt->tableElts, "_processed"))
+		injected = lappend(injected,
+						   make_injected_column("_processed", BOOLOID, -1,
+												false, make_raw_bool_const(true)));
+	if (!column_name_exists(stmt->tableElts, "_data_watermark"))
+		injected = lappend(injected,
+						   make_injected_column("_data_watermark", TIMESTAMPTZOID,
+												-1, false, NULL));
+	if (!column_name_exists(stmt->tableElts, "_coverage"))
+		injected = lappend(injected,
+						   make_injected_column("_coverage", FLOAT8OID, -1,
+												false, NULL));
+	if (!column_name_exists(stmt->tableElts, "_row_count"))
+		injected = lappend(injected,
+						   make_injected_column("_row_count", INT4OID, -1,
+												false, NULL));
+	if (!column_name_exists(stmt->tableElts, "_gap_count"))
+		injected = lappend(injected,
+						   make_injected_column("_gap_count", INT4OID, -1,
+												false, NULL));
+	if (!column_name_exists(stmt->tableElts, "_created_at"))
+		injected = lappend(injected,
+						   make_injected_column("_created_at", TIMESTAMPTZOID,
+												-1, false,
+												(Node *) makeFuncCall(SystemFuncName("now"),
+																	  NIL,
+																	  COERCE_EXPLICIT_CALL,
+																	  -1)));
+
+	relation_close(source_rel, AccessShareLock);
+
+	/* Build the PRIMARY KEY (slice_start, carry columns...) constraint. */
+	pk_keys = lappend(pk_keys, makeString("slice_start"));
+	foreach(lc, carry_names)
+		pk_keys = lappend(pk_keys, makeString((char *) lfirst(lc)));
+
+	pk = makeNode(Constraint);
+	pk->contype = CONSTR_PRIMARY;
+	pk->location = -1;
+	pk->keys = pk_keys;
+	injected = lappend(injected, pk);
+
+	/* Prepend the injected elements ahead of any user-declared columns. */
+	stmt->tableElts = list_concat(injected, stmt->tableElts);
+
+	/* The HNSW vector index runs after the table is created. */
+	extra_stmts = lappend(extra_stmts,
+						  make_timeseries_hnsw_index(stmt->relation,
+													 vector_column));
+
+	return extra_stmts;
+}
+
+
+/* ----------------------------------------------------------------------
+ * Reloption storage (bypass) helpers.
+ * ---------------------------------------------------------------------- */
+
+/*
+ * Does the option element beginning at text_str/text_len carry the
+ * "timeseries." prefix?
+ */
+static bool
+is_timeseries_option(const char *text_str, int text_len)
+{
+	const char *prefix = TS_RELOPT_PREFIX;
+	int			prefix_len = (int) strlen(prefix);
+
+	return (text_len > prefix_len &&
+			strncmp(text_str, prefix, prefix_len) == 0);
+}
+
+/*
+ * Does defList contain a "timeseries.<name>" DefElem whose name matches the
+ * length-bounded name starting at name_ptr?
+ */
+static bool
+timeseries_def_matches(List *defList, const char *name_ptr, int name_len)
+{
+	ListCell   *lc;
+
+	foreach(lc, defList)
+	{
+		DefElem    *def = lfirst_node(DefElem, lc);
+
+		if (def->defnamespace != NULL &&
+			strcmp(def->defnamespace, "timeseries") == 0 &&
+			(int) strlen(def->defname) == name_len &&
+			strncmp(def->defname, name_ptr, name_len) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * timeseries_strip_reloptions
+ *
+ * See header comment.
+ */
+Datum
+timeseries_strip_reloptions(Datum options)
+{
+	ArrayBuildState *astate = NULL;
+	ArrayType  *array;
+	Datum	   *elems;
+	int			nelems;
+	int			i;
+
+	if (options == (Datum) 0 || DatumGetPointer(options) == NULL)
+		return (Datum) 0;
+
+	array = DatumGetArrayTypeP(options);
+	deconstruct_array_builtin(array, TEXTOID, &elems, NULL, &nelems);
+
+	for (i = 0; i < nelems; i++)
+	{
+		char	   *text_str = VARDATA(elems[i]);
+		int			text_len = VARSIZE(elems[i]) - VARHDRSZ;
+
+		if (!is_timeseries_option(text_str, text_len))
+			astate = accumArrayResult(astate, elems[i], false, TEXTOID,
+									  CurrentMemoryContext);
+	}
+
+	if (astate == NULL)
+		return (Datum) 0;
+
+	return makeArrayResult(astate, CurrentMemoryContext);
+}
+
+/*
+ * timeseries_merge_reloptions
+ *
+ * See header comment.
+ */
+Datum
+timeseries_merge_reloptions(Datum base, Datum old_options, List *defList,
+							bool isReset)
+{
+	ArrayBuildState *astate = NULL;
+	ArrayType  *array;
+	Datum	   *elems;
+	int			nelems;
+	int			i;
+	ListCell   *lc;
+
+	/* 1. Carry all non-timeseries "base" entries forward unchanged. */
+	if (base != (Datum) 0 && DatumGetPointer(base) != NULL)
+	{
+		array = DatumGetArrayTypeP(base);
+		deconstruct_array_builtin(array, TEXTOID, &elems, NULL, &nelems);
+		for (i = 0; i < nelems; i++)
+			astate = accumArrayResult(astate, elems[i], false, TEXTOID,
+									  CurrentMemoryContext);
+	}
+
+	/* 2. Carry old timeseries.* entries that are not replaced/removed. */
+	if (old_options != (Datum) 0 && DatumGetPointer(old_options) != NULL)
+	{
+		array = DatumGetArrayTypeP(old_options);
+		deconstruct_array_builtin(array, TEXTOID, &elems, NULL, &nelems);
+		for (i = 0; i < nelems; i++)
 		{
-			resetStringInfo(query);
-			appendStringInfo(query,
-				"SELECT timescaledb_internal.add_job("
-				"  'timeseries_vector_scan'::regproc, "
-				"  '%s'::interval, "
-				"  jsonb_build_object("
-				"    'vector_table', %s::regclass::text,"
-				"    'source_table', %s::regclass::text,"
-				"    'bucket_interval', %s,"
-				"    'vector_column', %s,"
-				"    'vectorize_function', %s,"
-				"    'carry_columns', %s::jsonb,"
-				"    'vector_len', %d,"
-				"    'completion_delay', %s"
-				"  ),"
-				"  job_name => %s"
-				")",
-				scan_interval,
-				quote_literal_cstr(vec_table_name),
-				quote_literal_cstr(get_rel_name(source_relid)),
-				quote_literal_cstr(bucket_interval),
-				quote_literal_cstr(vector_column),
-				quote_literal_cstr(vectorize_func),
-				quote_literal_cstr(carry_str->data),
-				vector_len,
-				quote_literal_cstr(completion_delay),
-				quote_literal_cstr(psprintf("tsv_%s", vec_table_name)));
+			char	   *text_str = VARDATA(elems[i]);
+			int			text_len = VARSIZE(elems[i]) - VARHDRSZ;
 
-			if (SPI_execute(query->data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+			if (!is_timeseries_option(text_str, text_len))
+				continue;
+
 			{
-				bool		isnull;
-				Datum		val;
+				const char *p = text_str + strlen(TS_RELOPT_PREFIX);
+				const char *end = text_str + text_len;
+				const char *eq = p;
 
-				val = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-				if (!isnull)
-					job_id = DatumGetInt32(val);
+				while (eq < end && *eq != '=')
+					eq++;
+
+				if (!timeseries_def_matches(defList, p, (int) (eq - p)))
+					astate = accumArrayResult(astate, elems[i], false, TEXTOID,
+											  CurrentMemoryContext);
 			}
 		}
-		else
+	}
+
+	/* 3. Append new timeseries.* options from defList (SET only). */
+	if (!isReset)
+	{
+		foreach(lc, defList)
 		{
-			elog(NOTICE, "TimescaleDB job scheduling not available; "
-						  "use timeseries_vector_run() for manual execution");
+			DefElem    *def = lfirst_node(DefElem, lc);
+			const char *value;
+			text	   *t;
+			Size		len;
+
+			if (def->defnamespace == NULL ||
+				strcmp(def->defnamespace, "timeseries") != 0)
+				continue;
+
+			if (def->arg != NULL)
+				value = defGetString(def);
+			else
+				value = "true";
+
+			len = VARHDRSZ + strlen(TS_RELOPT_PREFIX) + strlen(def->defname) +
+				1 + strlen(value);
+			t = (text *) palloc(len + 1);
+			SET_VARSIZE(t, len);
+			sprintf(VARDATA(t), "%s%s=%s", TS_RELOPT_PREFIX, def->defname, value);
+
+			astate = accumArrayResult(astate, PointerGetDatum(t), false, TEXTOID,
+									  CurrentMemoryContext);
 		}
 	}
 
-	/* Update job_id in metadata if we got one */
-	if (job_id > 0)
-	{
-		resetStringInfo(query);
-		appendStringInfo(query,
-			"UPDATE _timescaledb_internal.timeseries_vector_tables "
-			"SET job_id = %d WHERE vector_table = %s::regclass",
-			job_id, quote_literal_cstr(vec_table_name));
-		SPI_execute(query->data, false, 0);
-	}
+	if (astate == NULL)
+		return (Datum) 0;
 
-	SPI_finish();
-
-	/*
-	 * Note: query was allocated in the SPI context (after SPI_connect), so it
-	 * has already been freed by SPI_finish().  Do not pfree(query->data).
-	 * carry_str, however, was allocated before SPI_connect and must be freed.
-	 */
-	pfree(carry_str->data);
-}
-
-/*
- * Main entry point: CreateTsVectorTable
- * Creates a vector table from a source hypertable.
- */
-void
-CreateTsVectorTable(TsVectorStmt *stmt)
-{
-	Oid			source_relid;
-	char	   *source_name;
-	char	   *vec_table_name = stmt->vec_table_name;
-	int			vector_len;
-	char	   *scan_interval;
-	char	   *completion_delay;
-	Oid			vector_typoid;
-
-	/* Resolve source table */
-	source_relid = RangeVarGetRelidExtended(stmt->source_table,
-											 ShareUpdateExclusiveLock,
-											 0, RangeVarCallbackOwnsRelation, NULL);
-	source_name = get_rel_name(source_relid);
-
-	/* Check source table exists and user owns it */
-	if (!object_ownercheck(RelationRelationId, source_relid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, source_name);
-
-	/* Check if vector table already exists */
-	if (get_relname_relid(vec_table_name, PG_PUBLIC_NAMESPACE) != InvalidOid)
-	{
-		if (stmt->if_not_exists)
-		{
-			ereport(NOTICE,
-					(errmsg("vector table \"%s\" already exists, skipping",
-							vec_table_name)));
-			return;
-		}
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_TABLE),
-				 errmsg("relation \"%s\" already exists", vec_table_name)));
-	}
-
-	/* Check vector type is available */
-	vector_typoid = get_vector_type_oid();
-	if (!OidIsValid(vector_typoid))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("type \"vector\" is not installed"),
-				 errhint("Install the pgvector extension first: CREATE EXTENSION vector;")));
-
-	/* Check vectorize function exists */
-	if ( LookupExplicitNamespace("public", false) != InvalidOid)
-	{
-		Oid func_oid = LookupFuncName(list_make1(makeString((char *)stmt->vectorize_func)),
-									  -1, NULL, true);	/* nargs=-1 表示不检查参数数量 */
-		if (!OidIsValid(func_oid))
-			elog(NOTICE, "vectorize function \"%s\" not found; "
-						  "it must be created before running the scan", stmt->vectorize_func);
-	}
-
-	/* Parse options */
-	parse_tsvector_options(stmt->options, &vector_len, &scan_interval,
-						   &completion_delay);
-
-	/* Validate carry columns exist in source table */
-	if (stmt->carry_columns != NIL)
-	{
-		ListCell   *lc;
-		foreach(lc, stmt->carry_columns)
-		{
-			char	   *colname = strVal(lfirst(lc));
-			AttrNumber	attnum = get_attnum(source_relid, colname);
-			if (attnum == InvalidAttrNumber)
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_COLUMN),
-						 errmsg("carry column \"%s\" does not exist in source table \"%s\"",
-								colname, source_name)));
-		}
-	}
-
-	/* Step 1: Create the vector table */
-	create_vector_table(vec_table_name, source_name, stmt->carry_columns,
-						stmt->vector_column, vector_len, source_relid);
-
-	CommandCounterIncrement();
-
-	/* Step 2: Create vector index */
-	create_vector_index(vec_table_name, stmt->vector_column);
-
-	CommandCounterIncrement();
-
-	/* Step 3: Register metadata and background job */
-	register_tsvector_metadata(vec_table_name, source_relid,
-							   stmt->bucket_interval, stmt->vector_column,
-							   stmt->vectorize_func, stmt->carry_columns,
-							   vector_len, scan_interval, completion_delay);
-
-	elog(NOTICE, "Timeseries vector table \"%s\" created successfully from \"%s\"",
-		 vec_table_name, source_name);
+	return makeArrayResult(astate, CurrentMemoryContext);
 }

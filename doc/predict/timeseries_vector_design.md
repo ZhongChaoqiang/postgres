@@ -37,81 +37,155 @@
 
 ### 2.1 创建时序向量表
 
+创建向量表**不再引入自定义 DDL 语法**，而是复用 PostgreSQL 标准的 `CREATE TABLE ... WITH (...)` 语法。当 `WITH` 子句中指定了 `timeseries.source` 时，内核在建表前**自动注入**所有系统必需列（`slice_start`、`slice_end`、携带列、向量列、质量元数据列等），用户**只需声明额外的自定义列**（也可以不声明任何列）。
+
 ```sql
-CREATE TIMESERIES VECTOR TABLE vector_table_name
-FROM source_hypertable
-TIME_BUCKET bucket_interval
-VECTORIZE (vector_column_name)
-USING vectorize_function
-[ CARRY (column1, column2, ...) ]
-[ WITH (option = value, ...) ];
+CREATE TABLE vector_table_name (
+    <自定义列...>                             -- 可选：用户自定义列，可省略
+) WITH (
+    timeseries.source = 'source_table_name',  -- 必需：关联原始时序表（触发自动注入）
+    timeseries.bucket_interval = 'interval',  -- 必需：时间片间隔
+    timeseries.vector_len = 384,             -- 向量维度（默认 384）
+    timeseries.vectorize_function = 'fn',     -- 向量化函数（默认 ts2v_moment）
+    timeseries.vector_column = 'col',         -- 向量列名（默认 embedding）
+    timeseries.carry_columns = 'c1,c2,...',   -- 携带列名（逗号分隔，类型从源表自动推断）
+    timeseries.enabled = true,                -- 后台任务开关
+    timeseries.scan_interval = 'interval',    -- 扫描间隔
+    timeseries.completion_delay = 'interval'  -- 完成延迟
+    /* 其余数据质量参数见 4.3 节 */
+);
 ```
 
-#### 参数说明
+#### 自动注入的列
 
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `vector_table_name` | 新创建的向量表名称 | `sensor_vectors` |
-| `source_hypertable` | 源超表名称 | `sensor_data` |
-| `bucket_interval` | 时间片间隔 | `'1 hour'`、`'30 minutes'` |
-| `vector_column_name` | 向量表中存储向量的列名 | `embedding` |
-| `vectorize_function` | 向量化函数名 | `ts2v_moment`、`ft_transformer_embedding` |
-| `CARRY (columns)` | 从源表携带的属性列（用于 GROUP BY） | `CARRY (sensor_id, location)` |
-| `WITH (options)` | 表级选项 | `vector_len = 384, scan_interval = '5 min'` |
+当 `timeseries.source` 存在于 `WITH` 子句时，内核在 `DefineRelation()` 执行前自动向 `tableElts` 注入以下列（若用户已手动声明同名列则跳以免重复）：
+
+| 列名 | 类型 | 来源 | 说明 |
+|------|------|------|------|
+| `slice_start` | TIMESTAMPTZ NOT NULL | 固定 | 时间片开始时间（主键之一） |
+| `slice_end` | TIMESTAMPTZ NOT NULL | 固定 | 时间片结束时间 |
+| `{carry_columns}` | 源表对应类型 NOT NULL | 从源表 `pg_attribute` 推断 | 携带列，用于 GROUP BY 与主键 |
+| `{vector_column}` | vector(vector_len) | 由 `timeseries.vector_len` 决定维度 | 向量数据列（列名默认 `embedding`） |
+| `_processed` | BOOLEAN DEFAULT true | 固定 | 处理状态 |
+| `_data_watermark` | TIMESTAMPTZ | 固定 | 迟到数据水位线 |
+| `_coverage` | FLOAT | 固定 | 覆盖率 |
+| `_row_count` | INT | 固定 | 采样点数 |
+| `_gap_count` | INT | 固定 | 间隙数 |
+| `_created_at` | TIMESTAMPTZ DEFAULT now() | 固定 | 记录创建时间 |
+| PRIMARY KEY | — | `(slice_start, {carry_columns})` 自动生成 | 保证幂等性 |
+
+注入完成后，内核还自动创建 HNSW 向量索引：`CREATE INDEX ... USING hnsw ({vector_column} vector_cosine_ops)`。
+
+#### 用户只需关注的列
+
+| 列类型 | 说明 |
+|------|------|
+| 自定义列 | 用户在 `CREATE TABLE` 中显式声明的额外列，后台任务不写入，其值由用户自行维护 |
+
+> 即使用户不声明任何列（`CREATE TABLE foo () WITH (...)`），系统也会自动注入上述全部必需列，建出一张完整的向量表。
+
+#### 表选项（reloptions）说明
+
+下表列出与源表关联和向量化相关的表选项，全部保存在表的 reloptions 中。
+
+| 选项 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `timeseries.source` | text | ✅ | — | 关联的原始时序表（源表）名称。存在即触发系统列自动注入 |
+| `timeseries.bucket_interval` | text | ✅ | — | 时间片间隔，如 `'1 hour'` |
+| `timeseries.vector_len` | int | — | `384` | 向量维度，决定向量列 `vector(N)` 的 N |
+| `timeseries.vectorize_function` | text | — | `ts2v_moment` | 向量化函数名 |
+| `timeseries.vector_column` | text | — | `embedding` | 向量列名 |
+| `timeseries.carry_columns` | text | — | 空 | 携带列名（逗号分隔），类型从源表自动推断 |
+| `timeseries.enabled` | bool | — | `true` | 是否启用后台任务 |
+| `timeseries.scan_interval` | text | — | `'5 min'` | 后台任务扫描间隔 |
+| `timeseries.completion_delay` | text | — | `'0 min'` | 时间片完成后的延迟等待 |
+| `timeseries.sample_interval` | text | — | NULL | 期望采样间隔（推断期望采样点数） |
+| `timeseries.min_coverage` | float | — | `0.5` | 覆盖率阈值 |
+| `timeseries.max_gap` | text | — | NULL | 最大数据间隙 |
+| `timeseries.completion_timeout` | text | — | NULL | 补全缺失数据超时 |
+| `timeseries.strict` | bool | — | `false` | 超时后是否跳过不完整时间片 |
+| `timeseries.recompute_on_late_data` | bool | — | `false` | 迟到数据是否触发重算 |
+
+> `timeseries.source` 与 `timeseries.bucket_interval` 为必需项，其余选项均带默认值。结构性与可调参数统一保存在 reloptions 中，均可通过 `ALTER TABLE ... SET/RESET` 维护（见 2.4 节）。
 
 ### 2.2 语法示例
 
 ```sql
--- 基本示例：按 1 小时分片，使用 ts2v_moment 函数向量化
-CREATE TIMESERIES VECTOR TABLE sensor_vectors
-FROM sensor_data
-TIME_BUCKET '1 hour'
-VECTORIZE (embedding)
-USING ts2v_moment
-CARRY (sensor_id, location)
-WITH (vector_len = 384, scan_interval = '5 min');
+-- 基本示例：只写 WITH 子句，系统列全部自动注入
+CREATE TABLE sensor_vectors () WITH (
+    timeseries.source = 'sensor_data',
+    timeseries.bucket_interval = '1 hour',
+    timeseries.carry_columns = 'sensor_id,location',
+    timeseries.vector_len = 384,
+    timeseries.scan_interval = '5 min',
+    timeseries.completion_delay = '5 min'
+);
+-- 系统自动注入：slice_start, slice_end, sensor_id(TEXT), location(TEXT),
+--               embedding vector(384), _processed, _data_watermark, _coverage,
+--               _row_count, _gap_count, _created_at, PRIMARY KEY(slice_start, sensor_id, location)
+-- 系统自动创建：HNSW 索引 on embedding
+
+-- 携带自定义列：用户只声明额外需要的列
+CREATE TABLE sensor_vectors_ext (
+    anomaly_score FLOAT,          -- 自定义列（后台任务不写入）
+    notes         TEXT            -- 自定义列
+) WITH (
+    timeseries.source = 'sensor_data',
+    timeseries.bucket_interval = '30 minutes',
+    timeseries.carry_columns = 'sensor_id',
+    timeseries.vector_len = 128
+);
+-- 系统自动注入：slice_start, slice_end, sensor_id(TEXT), embedding vector(128),
+--               _processed, _data_watermark, _coverage, _row_count, _gap_count,
+--               _created_at, PRIMARY KEY(slice_start, sensor_id)
+-- 系统自动创建：HNSW 索引 on embedding
+-- 用户自定义列 anomaly_score、notes 保留在表中，由用户自行维护
 ```
 
 ### 2.3 删除时序向量表
 
+向量表就是普通表，直接使用标准 `DROP TABLE` 即可，无需专用语法：
+
 ```sql
-DROP TIMESERIES VECTOR TABLE vector_table_name;
--- 或直接使用
-DROP TABLE vector_table_name CASCADE;
+DROP TABLE vector_table_name;
 ```
 
-删除向量表时自动删除关联的后台任务。
+后台任务通过 reloptions 识别向量表，表被删除后对应的后台任务/扫描逻辑自动失效，无需额外清理。
 
 ### 2.4 管理后台任务
 
-后台任务的可调参数（`scan_interval`、`completion_delay`、`enabled` 等）通过向量表的表属性（reloptions）保存，因此直接使用 PostgreSQL 标准的 `ALTER TABLE ... SET/RESET` 语法即可管理，无需额外的管理函数。
+向量表的所有配置（含可调参数与结构性配置）都保存在表的 reloptions 中，因此直接使用 PostgreSQL 标准的 `ALTER TABLE ... SET/RESET` 语法即可管理，无需额外的管理函数。
 
 ```sql
 -- 查看所有时序向量表配置
 SELECT * FROM timeseries_vector_info;
 
 -- 手动触发一次向量计算
-SELECT timeseries_vector_run(vector_table_name);
+SELECT timeseries_vector_run('vector_table_name');
 
--- 修改扫描间隔（后台任务下次扫描时读取，立即生效）
-ALTER TABLE vector_table_name SET (scan_interval = '10 min');
+-- 修改扫描间隔（后台任务下次扫描时动态读取，立即生效）
+ALTER TABLE vector_table_name SET (timeseries.scan_interval = '10 min');
 
 -- 修改时间片完成延迟
-ALTER TABLE vector_table_name SET (completion_delay = '5 min');
+ALTER TABLE vector_table_name SET (timeseries.completion_delay = '5 min');
 
 -- 恢复为默认值
-ALTER TABLE vector_table_name RESET (scan_interval);
+ALTER TABLE vector_table_name RESET (timeseries.scan_interval);
 
 -- 停用 / 启用后台任务
-ALTER TABLE vector_table_name SET (enabled = false);
-ALTER TABLE vector_table_name SET (enabled = true);
+ALTER TABLE vector_table_name SET (timeseries.enabled = false);
+ALTER TABLE vector_table_name SET (timeseries.enabled = true);
+
+-- 关联到新的源表 / 调整时间片间隔（结构性配置同样通过 reloptions 修改）
+ALTER TABLE vector_table_name SET (timeseries.source = 'new_source_table');
+ALTER TABLE vector_table_name SET (timeseries.bucket_interval = '30 minutes');
 ```
 
 说明：
 
-- 表属性（reloptions）是 PostgreSQL 表自带的存储机制，`ALTER TABLE ... SET/RESET` 由内核自动处理，无需自定义语法解析。
-- 后台任务每次扫描时动态读取表属性，因此修改后无需重建任务。
-- 结构性的配置（`vectorize_function`、`bucket_interval`、`carry_columns`、`vector_len` 等）在创建后不可通过 `ALTER TABLE` 修改，仍保留在元数据表中。
+- 表选项（reloptions）是 PostgreSQL 表自带的存储机制，`ALTER TABLE ... SET/RESET` 由内核自动处理，无需自定义语法解析。
+- 后台任务每次扫描时动态读取 reloptions，因此修改后无需重建任务。
+- 所有配置统一保存在 reloptions 中，不再维护独立的元数据表（见 3.3 节）。
 
 ## 3. 架构设计
 
@@ -147,20 +221,25 @@ graph TB
 
 #### 3.2.1 向量表结构
 
-向量表自动创建，包含以下列：
+向量表由用户通过标准 `CREATE TABLE ... WITH (timeseries.source = ...)` 创建。当 `timeseries.source` 存在时，内核自动注入以下列（用户无需手动声明），用户声明的自定义列会追加在系统列之后：
 
-| 列名 | 类型 | 说明 |
-|------|------|------|
-| `slice_start` | TIMESTAMPTZ | 时间片开始时间（主键之一） |
-| `slice_end` | TIMESTAMPTZ | 时间片结束时间 |
-| `{carry_columns}` | 源表对应类型 | 从源表携带的属性列（主键之一） |
-| `{vector_column}` | vector(vector_len) | 向量数据列 |
-| `_processed` | BOOLEAN | 是否已处理（默认 true） |
-| `_data_watermark` | TIMESTAMPTZ | 本时间片包含的源数据最高时间（用于迟到数据检测） |
-| `_coverage` | FLOAT | 覆盖率 = 实际采样点 / 期望采样点（0~1） |
-| `_row_count` | INT | 本时间片实际采样点数 |
-| `_gap_count` | INT | 检测到的数据间隙数量 |
-| `_created_at` | TIMESTAMPTZ | 记录创建时间 |
+| 列名 | 类型 | 注入方式 | 说明 |
+|------|------|---------|------|
+| `slice_start` | TIMESTAMPTZ NOT NULL | 自动注入 | 时间片开始时间（主键之一） |
+| `slice_end` | TIMESTAMPTZ NOT NULL | 自动注入 | 时间片结束时间 |
+| `{carry_columns}` | 源表对应类型 NOT NULL | 自动注入（类型从源表推断） | 携带列，用于 GROUP BY 与主键 |
+| `{vector_column}` | vector(vector_len) | 自动注入 | 向量数据列（列名默认 `embedding`，维度由 `timeseries.vector_len` 决定） |
+| `_processed` | BOOLEAN DEFAULT true | 自动注入 | 处理状态 |
+| `_data_watermark` | TIMESTAMPTZ | 自动注入 | 迟到数据水位线 |
+| `_coverage` | FLOAT | 自动注入 | 覆盖率 = 实际采样点 / 期望采样点（0~1） |
+| `_row_count` | INT | 自动注入 | 本时间片实际采样点数 |
+| `_gap_count` | INT | 自动注入 | 检测到的数据间隙数量 |
+| `_created_at` | TIMESTAMPTZ DEFAULT now() | 自动注入 | 记录创建时间 |
+| PRIMARY KEY | — | 自动注入 | `(slice_start, {carry_columns})` |
+| HNSW 索引 | — | 自动创建 | `ON {vector_column} USING hnsw (... vector_cosine_ops)` |
+| `{用户自定义列}` | 任意 | 用户声明 | 用户在 `CREATE TABLE` 中显式声明的列，后台任务不写入 |
+
+> 系统列若与用户声明的列同名则跳过注入（以免重复），用户可在 `CREATE TABLE` 中覆盖系统列定义（如改默认值或加约束）。
 
 #### 3.2.2 时间片完整性判断与数据质量处理
 
@@ -241,85 +320,75 @@ CREATE FUNCTION ts2v_moment(
 
 #### 3.2.4 后台任务机制
 
-利用 TimescaleDB 的 `add_job` API 注册定时任务：
+定时扫描可用 TimescaleDB 的 `add_job` API 注册。由于配置已保存在向量表的 reloptions 中，job 只需一个通用入口，扫描时动态发现并读取各向量表配置，无需在 job config 中重复维护：
 
 ```sql
--- 注册后台任务（DDL 执行时自动创建）
+-- 注册一个通用扫描任务（配置来自各向量表的 reloptions）
 SELECT timescaledb_internal.add_job(
     proc => 'timeseries_vector_scan'::regproc,
-    schedule_interval => '5 min'::interval,  -- scan_interval
-    config => jsonb_build_object(
-        'source_table', 'sensor_data',
-        'vector_table', 'sensor_vectors',
-        'bucket_interval', '1 hour',
-        'carry_columns', ARRAY['sensor_id', 'location'],
-        'vector_column', 'embedding',
-        'vectorize_function', 'ts2v_moment',
-        'completion_delay', '5 min'
-    ),
-    job_name => 'tsv_sensor_vectors'
+    schedule_interval => '5 min'::interval,
+    job_name => 'timeseries_vector_scan'
 );
 ```
 
 后台任务的执行逻辑：
 
 ```
-1. 读取 job config 获取源表、向量表、时间片配置
-2. 查询源表，找出未处理且已完整的时间片
-3. 对每个完整时间片：
+1. 扫描 pg_class，找出含 timeseries.source reloption 的向量表
+2. 读取每个向量表的 reloptions，获取源表、时间片、向量化等配置
+3. 查询源表，找出未处理且已完整的时间片（依据 completion_delay 等质量参数）
+4. 对每个完整时间片：
    a. 查询该时间片内的时序数据
    b. 调用向量化函数计算向量
    c. INSERT 到向量表（slice_start, slice_end, carry_columns, vector_column）
-4. 记录处理日志
+5. 记录处理日志
 ```
 
 ### 3.3 元数据管理
 
-#### 3.3.1 元数据表
+#### 3.3.1 配置存储
 
-创建一个系统级元数据表记录所有时序向量表的配置：
+向量表**不再维护独立的元数据表**。所有配置（源表关联、时间片间隔、向量化函数、携带列，以及可调参数）统一保存在向量表自身的 reloptions 中，即在 `pg_class.reloptions` 中以 `timeseries.*` 前缀的键值存储。
 
-```sql
-CREATE TABLE _timescaledb_internal.timeseries_vector_tables (
-    id              SERIAL PRIMARY KEY,
-    vector_table    REGCLASS NOT NULL UNIQUE,
-    source_table    REGCLASS NOT NULL,
-    bucket_interval INTERVAL NOT NULL,
-    vector_column   TEXT NOT NULL,
-    vectorize_function REGPROC NOT NULL,
-    carry_columns   TEXT[] NOT NULL DEFAULT '{}',
-    vector_len      INT NOT NULL DEFAULT 384,
-    job_id          INTEGER,  -- TimescaleDB job ID
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
+- **识别依据**：`pg_class.reloptions` 中存在 `timeseries.source` 选项的普通表即视为时序向量表。
+- **动态读取**：后台任务通过内核函数（`get_reloptions` / 解析 reloptions 数组）读取配置，因此任何 `ALTER TABLE ... SET/RESET` 均立即生效，无需重建任务。
+- **统一存储**：结构性配置（`timeseries.source`、`timeseries.bucket_interval`、`timeseries.vectorize_function`、`timeseries.vector_column`、`timeseries.carry_columns`）与可调参数（`timeseries.scan_interval`、`timeseries.completion_delay`、`timeseries.enabled` 等）不再拆分。
 
-> 注：`scan_interval`、`completion_delay`、`enabled` 等可调参数不存储在元数据表中，而是作为向量表的表属性（reloptions）保存，通过 `ALTER TABLE ... SET/RESET` 修改。元数据表只记录创建时确定的结构性配置及后台任务句柄（`job_id`）。
-```
+为使 `CREATE TABLE ... WITH (...)` 与 `ALTER TABLE ... SET/RESET` 能解析这些键，采用 **reloption 命名空间（namespace）** 机制，而非逐个注册 reloption。具体做法：
+
+1. 在 `src/include/access/reloptions.h` 的 `HEAP_RELOPT_NAMESPACES` 中加入 `"timeseries"`：
+   ```c
+   #define HEAP_RELOPT_NAMESPACES { "toast", "timeseries", NULL }
+   ```
+   这样 parser 在解析 `WITH (timeseries.source = '...')` 时，会将 `timeseries` 识别为合法命名空间，`DefElem->defnamespace = "timeseries"`、`DefElem->defname = "source"`。
+
+2. 由于 `transformRelOptions(..., NULL, ...)` 仅处理空命名空间选项，且 `heap_reloptions` 不识别 `timeseries.*` 键，内核在 `DefineRelation()` 与 `ATExecSetRelOptions()` 中对 `timeseries.*` 选项做**旁路处理**：
+   - 验证阶段：过滤掉 `timeseries.*` 条目后再交给 `heap_reloptions` 校验；
+   - 存储阶段：手动将 `timeseries.*` 选项以 `timeseries.<name>=<value>` 格式拼入 `pg_class.reloptions` 文本数组（保留命名空间前缀，便于 `timeseries_vector_run` 通过 `regexp_match` 定位）。
+
+> 这种方式无需为每个 `timeseries.*` 键调用 `add_*_reloption`，新增选项时也不必改 reloptions.c，只需在 `tsvectorcmds.c` 的 `tsrelopt_get_string` / `tsrelopt_get_int` 中读取即可。
 
 #### 3.3.2 信息视图
+
+后台任务与信息视图通过解析 `pg_class.reloptions` 识别并展示向量表配置：
 
 ```sql
 CREATE VIEW timeseries_vector_info AS
 SELECT
-    t.vector_table::regclass::text AS vector_table_name,
-    t.source_table::regclass::text AS source_table_name,
-    t.bucket_interval,
-    t.vector_column,
-    t.vectorize_function::regproc::text AS vectorize_function,
-    t.carry_columns,
-    t.vector_len,
-    c.reloptions,                    -- 可调参数（scan_interval/completion_delay/enabled）
-    t.job_id,
-    t.created_at,
-    j.job_status,
-    j.last_run_status,
-    j.last_run_started_at,
-    j.next_start
-FROM _timescaledb_internal.timeseries_vector_tables t
-JOIN pg_class c ON c.oid = t.vector_table
-LEFT JOIN timescaledb_information.jobs j ON t.job_id = j.job_id;
+    c.oid::regclass::text AS vector_table_name,
+    reloptions_text(c.reloptions, 'timeseries.source') AS source_table_name,
+    reloptions_text(c.reloptions, 'timeseries.bucket_interval') AS bucket_interval,
+    reloptions_text(c.reloptions, 'timeseries.vectorize_function') AS vectorize_function,
+    reloptions_text(c.reloptions, 'timeseries.vector_column') AS vector_column,
+    reloptions_text(c.reloptions, 'timeseries.carry_columns') AS carry_columns,
+    reloptions_bool(c.reloptions, 'timeseries.enabled') AS enabled,
+    reloptions_text(c.reloptions, 'timeseries.scan_interval') AS scan_interval,
+    reloptions_text(c.reloptions, 'timeseries.completion_delay') AS completion_delay
+FROM pg_class c
+WHERE reloptions_text(c.reloptions, 'timeseries.source') IS NOT NULL;
 ```
+
+> `reloptions_text` / `reloptions_bool` 为示意函数，实际实现中从 `c.reloptions`（`text[]`）解析对应的 `timeseries.*` 键值。若后续接入 TimescaleDB 后台任务，`job_id` 与任务状态通过扩展自身元数据维护，不写入向量表 reloptions。
 
 ## 4. 数据模型设计
 
@@ -341,45 +410,61 @@ SELECT create_hypertable('sensor_data', 'time');
 
 ### 4.2 向量表结构
 
-执行 `CREATE TIMESERIES VECTOR TABLE` 后自动创建：
+用户只需写 `WITH` 子句和自定义列，系统列由内核自动注入：
 
 ```sql
--- 自动生成的向量表
+-- 用户只声明自定义列（也可以不声明任何列）
 CREATE TABLE sensor_vectors (
-    slice_start   TIMESTAMPTZ NOT NULL,
-    slice_end     TIMESTAMPTZ NOT NULL,
-    sensor_id     TEXT NOT NULL,       -- CARRY 列
-    location      TEXT NOT NULL,       -- CARRY 列
-    embedding     vector(384),         -- VECTORIZE 列
-    _processed    BOOLEAN DEFAULT true,
-    _created_at   TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (slice_start, sensor_id, location)
+    anomaly_score FLOAT               -- 自定义列（可选，后台任务不写入）
+) WITH (
+    timeseries.source = 'sensor_data',
+    timeseries.bucket_interval = '1 hour',
+    timeseries.carry_columns = 'sensor_id,location',
+    timeseries.vector_len = 384
 );
 
--- 自动创建向量索引
-CREATE INDEX sensor_vectors_embedding_idx
-ON sensor_vectors USING hnsw (embedding vector_cosine_ops);
-
--- 自动注册 TimescaleDB 后台任务
+-- 内核自动注入后的等效表结构：
+-- CREATE TABLE sensor_vectors (
+--     slice_start   TIMESTAMPTZ NOT NULL,
+--     slice_end     TIMESTAMPTZ NOT NULL,
+--     sensor_id     TEXT NOT NULL,         -- 类型从 sensor_data.sensor_id 推断
+--     location      TEXT NOT NULL,         -- 类型从 sensor_data.location 推断
+--     embedding     vector(384),
+--     _processed    BOOLEAN DEFAULT true,
+--     _data_watermark TIMESTAMPTZ,
+--     _coverage     FLOAT,
+--     _row_count    INT,
+--     _gap_count    INT,
+--     _created_at   TIMESTAMPTZ DEFAULT now(),
+--     anomaly_score FLOAT,                  -- 用户自定义列
+--     PRIMARY KEY (slice_start, sensor_id, location)
+-- );
+-- CREATE INDEX ... ON sensor_vectors USING hnsw (embedding vector_cosine_ops);
 ```
 
 ### 4.3 WITH 选项
 
+下表中的选项均通过 `CREATE TABLE ... WITH (...)` 设置，并保存在表的 reloptions 中，可后续用 `ALTER TABLE ... SET/RESET` 修改。向量维度由 `timeseries.vector_len` 决定（默认 384），系统据此自动创建 `vector(N)` 类型的列。
+
 | 选项 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `vector_len` | int | 384 | 向量维度 |
-| `scan_interval` | interval | '5 min' | 后台任务扫描间隔 |
-| `completion_delay` | interval | '0 min' | 时间片完成后的延迟等待（缓解迟到数据） |
-| `sample_interval` | interval | NULL | 期望采样间隔，用于推断期望采样点数（NULL 则自动推断） |
-| `min_coverage` | float | 0.5 | 覆盖率阈值，低于此值不计算向量 |
-| `max_gap` | interval | NULL | 最大数据间隙，超过则判定数据不连续（NULL 表示不检测） |
-| `completion_timeout` | interval | NULL | 等待补齐缺失数据的超时时间（NULL 表示一直等待） |
-| `strict` | bool | false | 超时后是否跳过不完整时间片（true 跳过 / false 带质量标记计算） |
-| `recompute_on_late_data` | bool | false | 检测到迟到数据时是否重算受影响的时间片 |
-| `vector_index` | enum | hnsw | 向量索引类型（hnsw/ivfflat） |
-| `vector_distance` | enum | cosine | 向量距离类型 |
-| `m` | int | 16 | HNSW 索引参数 |
-| `ef_construction` | int | 64 | HNSW 索引参数 |
+| `timeseries.source` | text | —（必需） | 关联的原始时序表名称。存在即触发系统列自动注入 |
+| `timeseries.bucket_interval` | text | —（必需） | 时间片间隔，如 `'1 hour'` |
+| `timeseries.vector_len` | int | 384 | 向量维度，决定自动注入的向量列类型 `vector(N)` |
+| `timeseries.vectorize_function` | text | ts2v_moment | 向量化函数名 |
+| `timeseries.vector_column` | text | embedding | 向量列名 |
+| `timeseries.carry_columns` | text | 空 | 携带列名（逗号分隔），类型从源表自动推断 |
+| `timeseries.enabled` | bool | true | 是否启用后台任务 |
+| `timeseries.scan_interval` | text | '5 min' | 后台任务扫描间隔 |
+| `timeseries.completion_delay` | text | '0 min' | 时间片完成后的延迟等待（缓解迟到数据） |
+| `timeseries.sample_interval` | text | NULL | 期望采样间隔，用于推断期望采样点数（NULL 则自动推断） |
+| `timeseries.min_coverage` | float | 0.5 | 覆盖率阈值，低于此值不计算向量 |
+| `timeseries.max_gap` | text | NULL | 最大数据间隙，超过则判定数据不连续（NULL 表示不检测） |
+| `timeseries.completion_timeout` | text | NULL | 等待补齐缺失数据的超时时间（NULL 表示一直等待） |
+| `timeseries.strict` | bool | false | 超时后是否跳过不完整时间片（true 跳过 / false 带质量标记计算） |
+| `timeseries.recompute_on_late_data` | bool | false | 检测到迟到数据时是否重算受影响的时间片 |
+
+> 向量索引（HNSW）由系统在建表后自动创建，无需用户手动执行。
 
 ## 5. 后台任务设计
 
@@ -498,14 +583,20 @@ INSERT INTO sensor_data VALUES
     ('2026-01-01 01:00:00+00', 'S001', 'Room-A', 23.0, 46.0, 1013.1),
     ('2026-01-01 01:30:00+00', 'S001', 'Room-A', 23.2, 46.2, 1013.0);
 
--- 3. 创建时序向量表
-CREATE TIMESERIES VECTOR TABLE sensor_vectors
-FROM sensor_data
-TIME_BUCKET '1 hour'
-VECTORIZE (embedding)
-USING ts2v_moment
-CARRY (sensor_id, location)
-WITH (vector_len = 384, scan_interval = '1 min', completion_delay = '5 min');
+-- 3. 创建时序向量表（只需 WITH 子句，系统列自动注入）
+CREATE TABLE sensor_vectors (
+    anomaly_score FLOAT               -- 自定义列（可选）
+) WITH (
+    timeseries.source = 'sensor_data',
+    timeseries.bucket_interval = '1 hour',
+    timeseries.carry_columns = 'sensor_id,location',
+    timeseries.vector_len = 384,
+    timeseries.scan_interval = '1 min',
+    timeseries.completion_delay = '5 min'
+);
+-- 系统自动注入 slice_start, slice_end, sensor_id, location, embedding,
+-- _processed, _data_watermark, _coverage, _row_count, _gap_count, _created_at
+-- 系统自动创建 PRIMARY KEY 和 HNSW 索引
 
 -- 4. 手动触发一次计算（不等后台任务）
 SELECT timeseries_vector_run('sensor_vectors');
@@ -530,11 +621,8 @@ SELECT * FROM timeseries_vector_info;
 ### 6.2 删除示例
 
 ```sql
--- 删除时序向量表（自动删除后台任务）
-DROP TIMESERIES VECTOR TABLE sensor_vectors;
-
--- 或使用普通 DROP TABLE
-DROP TABLE sensor_vectors CASCADE;
+-- 删除时序向量表（直接使用标准 DROP TABLE）
+DROP TABLE sensor_vectors;
 ```
 
 ## 7. 实现方案
@@ -542,44 +630,85 @@ DROP TABLE sensor_vectors CASCADE;
 ### 7.1 实现层次
 
 ```
-contrib/jolix_predict/
-├── jolix_predict.c              # 现有主文件
-├── timeseries_vector.c          # 新增：时序向量表 DDL 处理
-├── timeseries_vector_scan.c     # 新增：后台任务执行逻辑
-├── timeseries_vector.sql        # 新增：SQL 函数定义
-├── timeseries_vector--1.0.sql   # 新增：扩展安装脚本
-└── CMakeLists.txt               # 更新：编译配置
+src/include/access/reloptions.h        # HEAP_RELOPT_NAMESPACES 增加 "timeseries"
+src/backend/parser/parse_utilcmd.c     # transformCreateStmt() 开头调用 InjectTimeseriesColumns()
+src/backend/commands/tablecmds.c       # DefineRelation()/ATExecSetRelOptions() 旁路存储 timeseries.* reloptions
+src/backend/commands/tsvectorcmds.c    # 列注入核心实现（InjectTimeseriesColumns）
+src/include/commands/tsvectorcmds.h    # 头文件声明
+contrib/tsvector_funcs/                # 向量化函数与手动触发（ts2v_moment、timeseries_vector_run）
 ```
 
-### 7.2 DDL 处理流程
+> 由于不再引入自定义 DDL 语法，无需修改语法解析器（`gram.y` / `kwlist.h` / `parsenodes.h`），也无需新增命令标签。实现收敛为：
+> 1) 在 `reloptions.h` 注册 `timeseries` 命名空间；
+> 2) 在 `transformCreateStmt()` 中拦截 `CREATE TABLE`，检测 `timeseries.source`，自动注入系统列与主键（必须在 `transformCreateStmt` 而非 `DefineRelation` 中注入，因为主键约束需经约束转换逻辑处理）；
+> 3) 在 `DefineRelation()` / `ATExecSetRelOptions()` 中旁路存储 `timeseries.*` reloptions；
+> 4) `timeseries_vector_run` 从 reloptions 读取配置。
+
+### 7.2 列自动注入与建表流程
 
 ```
-CREATE TIMESERIES VECTOR TABLE 语句
+用户执行 CREATE TABLE ... WITH (timeseries.source = ..., ...)
     │
-    ├── 1. 解析语法，提取参数
-    │      ├── 源表名、向量表名
-    │      ├── TIME_BUCKET 间隔
-    │      ├── VECTORIZE 列名
-    │      ├── USING 向量化函数
-    │      ├── CARRY 列列表
-    │      └── WITH 选项
+    ├── 1. Parser 解析为 CreateStmt（tableElts + options）
     │
-    ├── 2. 验证
-    │      ├── 源表是否为超表
-    │      ├── 向量化函数是否存在
-    │      ├── CARRY 列是否在源表中存在
-    │      └── WITH 选项是否合法
+    ├── 2. DefineRelation() 前拦截：检测 options 中的 timeseries.source
+    │      ├── 解析 timeseries.* reloptions（source, bucket_interval, carry_columns, vector_len, ...）
+    │      ├── 打开源表 relation，读取 carry 列的 attnum 和 atttypid
+    │      ├── 构造 ColumnDef 节点：
+    │      │   ├── slice_start (TIMESTAMPTZ NOT NULL)
+    │      │   ├── slice_end   (TIMESTAMPTZ NOT NULL)
+    │      │   ├── {carry 列}  (源表对应类型 NOT NULL)
+    │      │   ├── {vector 列}  (vector(vector_len)，typmod = vector_len)
+    │      │   ├── _processed, _data_watermark, _coverage, _row_count, _gap_count, _created_at
+    │      │   └── PRIMARY KEY (slice_start, {carry 列})
+    │      └── 将构造的 ColumnDef / Constraint 追加到 stmt->tableElts
+    │         （与用户已声明的列去重：同名列跳过注入）
     │
-    ├── 3. 创建向量表
-    │      ├── CREATE TABLE（包含 slice_start, slice_end, carry, vector 列）
-    │      ├── 创建向量索引
-    │      └── 设置表级选项
+    ├── 3. 正常执行 DefineRelation()（建表 + 持久化 reloptions 到 pg_class）
     │
-    ├── 4. 注册元数据
-    │      └── INSERT 到 timeseries_vector_tables
-    │
-    └── 5. 注册后台任务
-           └── 调用 timescaledb.add_job()
+    └── 4. 建表后：自动创建 HNSW 向量索引
+           └── CREATE INDEX ... ON {vec_table} USING hnsw ({vector_col} vector_cosine_ops)
+```
+
+列注入核心代码示意：
+
+```c
+/* 在 DefineRelation() 中，解析完 reloptions 后调用 */
+if (tsv_source != NULL)
+{
+    Relation source_rel = relation_openrv(makeRangeVar(NULL, tsv_source, -1),
+                                         AccessShareLock);
+    TupleDesc tupdesc = RelationGetDescr(source_rel);
+
+    /* 注入 slice_start, slice_end */
+    inject_column(stmt, "slice_start", TIMESTAMPTZOID, -1, true);
+    inject_column(stmt, "slice_end",   TIMESTAMPTZOID, -1, true);
+
+    /* 注入 carry 列（类型从源表推断） */
+    foreach(lc, carry_names)
+    {
+        char *colname = strVal(lfirst(lc));
+        AttrNumber attnum = get_attnum(source_rel->rd_id, colname);
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+        inject_column(stmt, colname, attr->atttypid, attr->atttypmod, true);
+    }
+
+    /* 注入向量列 */
+    inject_vector_column(stmt, vector_column, vector_len);
+
+    /* 注入质量元数据列 */
+    inject_column(stmt, "_processed",      BOOLOID,    -1, false);
+    inject_column(stmt, "_data_watermark",  TIMESTAMPTZOID, -1, false);
+    inject_column(stmt, "_coverage",        FLOAT4OID, -1, false);
+    inject_column(stmt, "_row_count",       INT4OID,   -1, false);
+    inject_column(stmt, "_gap_count",       INT4OID,   -1, false);
+    inject_column(stmt, "_created_at",      TIMESTAMPTZOID, -1, false);
+
+    /* 注入主键 */
+    inject_primary_key(stmt, "slice_start", carry_names);
+
+    relation_close(source_rel, AccessShareLock);
+}
 ```
 
 ### 7.3 后台任务实现
@@ -759,12 +888,14 @@ ts2v_moment(PG_FUNCTION_ARGS)
 
 | 测试项 | 说明 |
 |--------|------|
-| 创建向量表 | 验证 DDL 正确创建表、索引、元数据、后台任务 |
-| 手动触发计算 | 验证 `timeseries_vector_run` 正确计算向量 |
-| 自动后台计算 | 验证后台任务自动发现并处理完整时间片 |
+| 创建向量表 | 验证标准 `CREATE TABLE ... WITH (timeseries.*)` 正确解析并持久化 reloptions |
+| 关联源表校验 | 验证 `timeseries.source` 指向的源表存在且可访问 |
+| 自定义列 | 验证除必需列外，用户可自由新增自定义列且不参与向量计算 |
+| 手动触发计算 | 验证 `timeseries_vector_run` 正确读取 reloptions 并计算向量 |
+| 自动后台计算 | 验证后台任务动态发现向量表并处理完整时间片 |
 | 向量相似度搜索 | 验证向量索引和相似度查询正常工作 |
-| 删除向量表 | 验证删除时自动清理后台任务和元数据 |
-| CARRY 列处理 | 验证多列 GROUP BY 和主键正确 |
+| 删除向量表 | 验证标准 `DROP TABLE` 删除后后台任务不再扫描该表 |
+| carry 列处理 | 验证多列 GROUP BY 和主键正确 |
 | 时间片完整性判断 | 验证 completion_delay 机制 |
 
 ### 12.2 边界测试
@@ -779,60 +910,66 @@ ts2v_moment(PG_FUNCTION_ARGS)
 
 ## 13. 实现状态
 
-### 13.1 已实现功能（2026-09-10）
+### 13.1 设计变更说明（2026-09-10）
+
+原有基于自定义 `CREATE TIMESERIES VECTOR TABLE` 语法的实现方案已废弃，本设计已改为**复用标准 `CREATE TABLE ... WITH (...)` + reloptions** 方案（见第 2 章）。原方案中已实现的、依赖自定义 DDL 的建表逻辑不再适用，仅以下与语法无关的实现得以保留：
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| DDL 语法解析 | ✅ 已完成 | `CREATE TIMESERIES VECTOR TABLE` 语法支持，含 `IF NOT EXISTS` |
-| 向量表创建 | ✅ 已完成 | 通过 SPI 自动创建物理表，含 slice_start/slice_end/carry列/vector列/元数据列 |
-| HNSW 向量索引 | ✅ 已完成 | 自动在向量列上创建 HNSW 索引（vector_cosine_ops） |
-| 主键约束 | ✅ 已完成 | (slice_start, carry_columns...) 组合主键 |
-| 元数据表 | ✅ 已完成 | `_timescaledb_internal.timeseries_vector_tables` 自动创建和管理 |
-| WITH 选项解析 | ✅ 已完成 | vector_len, scan_interval, completion_delay |
-| CARRY 列类型推断 | ✅ 已完成 | 自动从源表读取列类型 |
-| IF NOT EXISTS | ✅ 已完成 | 支持幂等创建 |
-| 重复创建检测 | ✅ 已完成 | 不使用 IF NOT EXISTS 时重复创建报错 |
-| Schema 自动创建 | ✅ 已完成 | 自动创建 `_timescaledb_internal` schema（若不存在） |
 | ts2v_moment 向量化函数 | ✅ 已完成 | `contrib/tsvector_funcs` 共享库，moment 统计矩特征提取 + soft-sign 归一化 + 循环填充 |
-| 手动触发函数 | ✅ 已完成 | `timeseries_vector_run(text)` 函数，手动触发向量计算 |
+| 手动触发函数 | ✅ 已完成 | `timeseries_vector_run(text)` 已改为从 `pg_class.reloptions` 读取 `timeseries.*` 配置 |
 
-### 13.2 待实现功能
+### 13.2 待实现 / 待重构功能
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| 后台扫描任务 | 🔲 待实现 | `timeseries_vector_scan` 函数，定时扫描并计算向量 |
-| 时间片完整性判断 | 🔲 待实现 | 基于 completion_delay 判断时间片是否完整 |
-| DROP TIMESERIES VECTOR TABLE | 🔲 待实现 | 专用 DROP 语法，自动清理元数据和后台任务 |
-| TimescaleDB 后台任务集成 | 🔲 待实现 | 需 TimescaleDB 扩展可用时通过 add_job 注册定时任务 |
+| reloption 注册 | ✅ 已完成 | 在 `reloptions.h` 的 `HEAP_RELOPT_NAMESPACES` 中加入 `timeseries` 命名空间 |
+| 列自动注入 | ✅ 已完成 | `transformCreateStmt()` 中检测 `timeseries.source`，调用 `InjectTimeseriesColumns()` 注入系统列、carry 列、向量列、主键 |
+| HNSW 索引自动创建 | ✅ 已完成 | 建表后在向量列上自动创建 `USING hnsw (... vector_cosine_ops)` 索引 |
+| timeseries_vector_run 改造 | ✅ 已完成 | 已从 `pg_class.reloptions` 读取源表、bucket、vectorize、carry 等配置 |
+| 后台扫描任务 | 🔲 待实现 | 定时扫描并计算向量 |
+| 时间片完整性判断 | 🔲 待实现 | 基于 completion_delay 等质量参数判断时间片完整性 |
+| TimescaleDB 后台任务集成 | 🔲 待实现 | TimescaleDB 可用时通过 add_job 注册定时任务 |
 
-### 13.3 修改的源码文件
+### 13.3 涉及源码文件（新方案）
 
 | 文件 | 修改内容 |
 |------|----------|
-| `src/include/parser/kwlist.h` | 新增关键字: TIMESERIES, TIME_BUCKET, VECTOR, VECTORIZE, CARRY |
-| `src/backend/parser/gram.y` | 新增 TsVectorStmt 语法规则和关键字声明 |
-| `src/include/nodes/parsenodes.h` | 新增 TsVectorStmt 节点结构 |
-| `src/include/tcop/cmdtaglist.h` | 新增 CMDTAG_CREATE_TIMESERIES_VECTOR_TABLE 命令标签 |
-| `src/backend/tcop/utility.c` | 新增 T_TsVectorStmt 处理分支 |
-| `src/backend/commands/tsvectorcmds.c` | 核心实现: 建表、建索引、元数据注册 |
+| `src/backend/commands/tablecmds.c` | 修改 `DefineRelation()`：检测 `timeseries.source` 后调用列注入逻辑 |
+| `src/backend/commands/tsvectorcmds.c` | 注册 `timeseries.*` reloption、列注入逻辑、HNSW 索引自动创建 |
 | `src/include/commands/tsvectorcmds.h` | 头文件声明 |
-| `src/backend/commands/Makefile` | 添加 tsvectorcmds.o 编译目标 |
-| `src/backend/nodes/gen_node_support.pl` | 更新 ABI 稳定性检查计数 (481→482) |
+| `contrib/tsvector_funcs/tsvector_funcs.c` | ts2v_moment + timeseries_vector_run（改为从 reloptions 读取配置） |
+
+> 新方案不再修改 parser / nodes / cmdtag 等语法相关文件；原方案对 `kwlist.h`、`gram.y`、`parsenodes.h`、`cmdtaglist.h`、`utility.c`、`gen_node_support.pl` 的改动一并移除。
 
 ### 13.4 测试验证结果
 
+> 说明：以下 1~6 项基于**旧自定义 DDL 方案**，已随设计变更作废；7~10 项与语法无关、依然有效。新方案（标准 `CREATE TABLE` + reloptions）的建表与 reloption 解析已于 2026-09-11 重新验证通过（见下方「13.4.1 新方案验证」）。
+
 在编译的 PostgreSQL 18.3 (端口 5433) 上验证通过：
 
-1. **DDL 解析**: `CREATE TIMESERIES VECTOR TABLE` 语法正确解析
-2. **表创建**: 向量表包含 6 列 (slice_start, slice_end, carry列, vector列, _processed, _created_at)
-3. **索引创建**: 主键索引 + HNSW 向量索引均成功创建
-4. **元数据注册**: 元数据表正确记录配置信息
-5. **IF NOT EXISTS**: 幂等创建正常工作
-6. **多 CARRY 列**: 支持多个携带列
+1. ~~**DDL 解析**: `CREATE TIMESERIES VECTOR TABLE` 语法正确解析~~（旧方案，已作废）
+2. ~~**表创建**: 向量表包含 6 列~~（旧方案，已作废）
+3. ~~**索引创建**: 主键索引 + HNSW 向量索引均成功创建~~（旧方案，已作废）
+4. ~~**元数据注册**: 元数据表正确记录配置信息~~（旧方案，已作废）
+5. ~~**IF NOT EXISTS**: 幂等创建正常工作~~（旧方案，已作废）
+6. ~~**多 CARRY 列**: 支持多个携带列~~（旧方案，已作废）
 7. **pgvector 兼容**: 需使用对应 PG18 编译的 pgvector 扩展
 8. **ts2v_moment 函数**: moment 特征提取(均值/标准差/偏度/峰度/高阶矩 + soft-sign 归一化)、循环填充、默认维度384、空数组/NULL错误处理均通过
-9. **timeseries_vector_run**: 正确计算3个时间片的向量，幂等执行(ON CONFLICT DO NOTHING)，不存在的表返回错误
+9. **timeseries_vector_run**: 正确计算时间片的向量，幂等执行(ON CONFLICT DO NOTHING)，不存在的表返回错误，配置从 `pg_class.reloptions` 读取
 10. **向量内容验证**: moment 特征经 soft-sign 归一化后落在 [-1,1]，如 `[0.6666667, 0.44948974, 0, 0.6]`
+
+#### 13.4.1 新方案验证（2026-09-11）
+
+`CREATE TABLE ... WITH (timeseries.*)` + reloptions 方案在 PostgreSQL 18.3 上验证通过（需重新 initdb 以匹配节点序列化格式）：
+
+1. **列自动注入**: 自动注入 `slice_start`、`slice_end`、carry 列（类型从源表推断）、`{vector_column}` vector(N)、`_processed`（BOOLEAN DEFAULT true）、`_data_watermark`、`_coverage`、`_row_count`、`_gap_count`、`_created_at`（DEFAULT now()），用户已声明的同名列跳过
+2. **主键**: 自动生成 `PRIMARY KEY (slice_start, {carry_columns})`
+3. **HNSW 索引**: 自动创建 `CREATE INDEX ... USING hnsw ({vector_column} vector_cosine_ops)`
+4. **reloptions 持久化**: `timeseries.*` 选项以 `timeseries.<name>=<value>` 形式存储到 `pg_class.reloptions`，`ALTER TABLE ... SET/RESET (timeseries.*)` 正常工作
+5. **自定义列**: 用户自定义列保留在系统列之后，后台任务不写入
+6. **错误处理**: 缺失 `timeseries.bucket_interval` 报错 `timeseries.bucket_interval is required`；`timeseries.source` 指向不存在的表报错
+7. **端到端**: `timeseries_vector_run` 读取 reloptions 成功计算向量并写入向量表，幂等执行
 
 ### 13.5 ts2v_moment 函数技术细节
 
@@ -853,7 +990,7 @@ ts2v_moment(PG_FUNCTION_ARGS)
 - **签名**: `timeseries_vector_run(text) RETURNS text`（参数为向量表名）
 - **属性**: VOLATILE
 - **执行流程**:
-  1. 读取 `_timescaledb_internal.timeseries_vector_tables` 元数据
+  1. 读取向量表 `pg_class.reloptions` 中的 `timeseries.*` 配置（源表、bucket、vectorize、carry 等；当前实现暂读元数据表，待重构为 reloptions）
   2. 构建源表和向量表的限定标识符
   3. 查找源表的时间列（第一个 TIMESTAMPTZ 列）
   4. 查找数值列（排除时间列和 carry 列）

@@ -208,7 +208,6 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_IndexStmt:
 		case T_EmbeddingsStmt:
 		case T_DropEmbeddingsStmt:
-		case T_TsVectorStmt:
 		case T_ReassignOwnedStmt:
 		case T_RefreshMatViewStmt:
 		case T_RenameStmt:
@@ -1578,10 +1577,6 @@ ProcessUtilitySlow(ParseState *pstate,
 				DropEmbeddings((DropEmbeddingsStmt *) parsetree);
 				break;
 
-			case T_TsVectorStmt:
-				CreateTsVectorTable((TsVectorStmt *) parsetree);
-				break;
-
 			case T_ReindexStmt:
 				ExecReindex(pstate, (ReindexStmt *) parsetree, isTopLevel);
 
@@ -2831,10 +2826,6 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_DROP_EMBEDDINGS;
 			break;
 
-		case T_TsVectorStmt:
-			tag = CMDTAG_CREATE_TIMESERIES_VECTOR_TABLE;
-			break;
-
 		case T_RuleStmt:
 			tag = CMDTAG_CREATE_RULE;
 			break;
@@ -3485,7 +3476,6 @@ GetCommandLogLevel(Node *parsetree)
 
 		case T_EmbeddingsStmt:
 		case T_DropEmbeddingsStmt:
-		case T_TsVectorStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

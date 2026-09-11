@@ -45,6 +45,7 @@
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
+#include "commands/tsvectorcmds.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -175,6 +176,7 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	CreateStmtContext cxt;
 	List	   *result;
 	List	   *save_alist;
+	List	   *timeseries_indexes = NIL;
 	ListCell   *elements;
 	Oid			namespaceid;
 	Oid			existing_relid;
@@ -278,6 +280,11 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 		{
 			DefElem    *defel = (DefElem *) lfirst(option);
 
+			/* This loop handles only non-namespaced vector options; skip
+			 * namespaced ones (e.g. timeseries.vector_len). */
+			if (defel->defnamespace != NULL)
+				continue;
+
 			if (strcmp(defel->defname, "vector_len") == 0)
 			{
 				cxt.vector_len = defGetInt32(defel);
@@ -304,6 +311,14 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 			}
 		}
 	}
+
+	/*
+	 * For a timeseries vector table (identified by the presence of
+	 * "timeseries.source" in the WITH clause), inject the system columns and
+	 * primary key constraint before transformation, and collect any follow-up
+	 * statements (the HNSW vector index) to run after CREATE TABLE.
+	 */
+	timeseries_indexes = InjectTimeseriesColumns(stmt);
 
 	if (stmt->ofTypename)
 		transformOfType(&cxt, stmt->ofTypename);
@@ -455,6 +470,7 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	result = lappend(cxt.blist, stmt);
 	result = list_concat(result, cxt.alist);
 	result = list_concat(result, save_alist);
+	result = list_concat(result, timeseries_indexes);
 
 	return result;
 }

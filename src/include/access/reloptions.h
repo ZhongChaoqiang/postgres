@@ -57,8 +57,8 @@ typedef enum relopt_kind
 	RELOPT_KIND_MAX = (1 << 30)
 } relopt_kind;
 
-/* reloption namespaces allowed for heaps -- currently only TOAST */
-#define HEAP_RELOPT_NAMESPACES { "toast", NULL }
+/* reloption namespaces allowed for heaps -- TOAST and timeseries */
+#define HEAP_RELOPT_NAMESPACES { "toast", "timeseries", NULL }
 
 /* generic struct to hold shared data */
 typedef struct relopt_gen

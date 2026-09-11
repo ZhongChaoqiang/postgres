@@ -63,6 +63,7 @@
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
+#include "commands/tsvectorcmds.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
@@ -937,6 +938,15 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	reloptions = transformRelOptions((Datum) 0, stmt->options, NULL, validnsps,
 									 true, false);
 
+	/*
+	 * "timeseries.*" options live in their own namespace; transformRelOptions
+	 * above skipped them (it only handles non-namespaced options).  Serialize
+	 * them (with their namespace prefix) back into the stored reloptions so
+	 * they are persisted in pg_class.reloptions.
+	 */
+	reloptions = timeseries_merge_reloptions(reloptions, (Datum) 0,
+											 stmt->options, false);
+
 	switch (relkind)
 	{
 		case RELKIND_VIEW:
@@ -946,7 +956,9 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			(void) partitioned_table_reloptions(reloptions, true);
 			break;
 		default:
-			(void) heap_reloptions(relkind, reloptions, true);
+			/* Validate only the standard options; keep timeseries.* aside. */
+			(void) heap_reloptions(relkind,
+								   timeseries_strip_reloptions(reloptions), true);
 	}
 
 	if (stmt->ofTypename)
@@ -17015,6 +17027,8 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 	HeapTuple	newtuple;
 	Datum		datum;
 	Datum		newOptions;
+	Datum		base;
+	Datum		clean_old;
 	Datum		repl_val[Natts_pg_class];
 	bool		repl_null[Natts_pg_class];
 	bool		repl_repl[Natts_pg_class];
@@ -17050,16 +17064,21 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 			datum = (Datum) 0;
 	}
 
-	/* Generate new proposed reloptions (text array) */
-	newOptions = transformRelOptions(datum, defList, NULL, validnsps, false,
-									 operation == AT_ResetRelOptions);
+	/* Generate new proposed reloptions (text array).  Keep timeseries.*
+	 * entries aside while validating the standard options, then merge them
+	 * back so they continue to be persisted under their own namespace. */
+	clean_old = timeseries_strip_reloptions(datum);
+	base = transformRelOptions(clean_old, defList, NULL, validnsps, false,
+							   operation == AT_ResetRelOptions);
+	newOptions = timeseries_merge_reloptions(base, datum, defList,
+											 operation == AT_ResetRelOptions);
 
 	/* Validate */
 	switch (rel->rd_rel->relkind)
 	{
 		case RELKIND_RELATION:
 		case RELKIND_MATVIEW:
-			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
+			(void) heap_reloptions(rel->rd_rel->relkind, base, true);
 			break;
 		case RELKIND_PARTITIONED_TABLE:
 			(void) partitioned_table_reloptions(newOptions, true);
