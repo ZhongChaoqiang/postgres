@@ -784,12 +784,19 @@ FROM pg_catalog.pg_index i
 JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
 WHERE i.indrelid = 'tsvec_result'::regclass;
 
-\echo '--- 11.5 验证 reloptions 元数据 ---'
+\echo '--- 11.5 验证触发器自动注册 ---'
+SELECT tgname, tgrelid::regclass as relname, tgenabled,
+       pg_get_triggerdef(oid) as trigger_def
+FROM pg_trigger
+WHERE tgrelid = 'tsvec_source'::regclass
+  AND tgname = 'tsvector_trigger';
+
+\echo '--- 11.6 验证 reloptions 元数据 ---'
 SELECT relname, reloptions
 FROM pg_class
 WHERE relname = 'tsvec_result';
 
-\echo '--- 11.6 测试 IF NOT EXISTS ---'
+\echo '--- 11.7 测试 IF NOT EXISTS ---'
 CREATE TABLE IF NOT EXISTS tsvec_result () WITH (
     timeseries.source = 'tsvec_source',
     timeseries.bucket_interval = 3600,
@@ -799,7 +806,7 @@ CREATE TABLE IF NOT EXISTS tsvec_result () WITH (
     timeseries.vector_len = 384
 );
 
-\echo '--- 11.7 测试重复创建（应报错）---'
+\echo '--- 11.8 测试重复创建（应报错）---'
 CREATE TABLE tsvec_result () WITH (
     timeseries.source = 'tsvec_source',
     timeseries.bucket_interval = 3600,
@@ -809,7 +816,7 @@ CREATE TABLE tsvec_result () WITH (
     timeseries.vector_len = 384
 );
 
-\echo '--- 11.8 测试多个carry列 ---'
+\echo '--- 11.9 测试多个carry列 ---'
 DROP TABLE IF EXISTS tsvec_result2 CASCADE;
 CREATE TABLE tsvec_result2 () WITH (
     timeseries.source = 'tsvec_source',
@@ -825,43 +832,43 @@ FROM pg_catalog.pg_attribute a
 WHERE a.attrelid = 'tsvec_result2'::regclass AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum;
 
-\echo '--- 11.9 ts2v_moment 函数 - 基本向量化（moment 算法）---'
+\echo '--- 11.10 ts2v_moment 函数 - 基本向量化（moment 算法）---'
 SELECT ts2v_moment(ARRAY[1.0, 2.0, 3.0]::float8[], 4) AS basic_vec;
 -- 预期: [0.6666667, 0.44948974, 0, 0.6]
 -- (4 维: 均值/标准差/偏度=0(对称)/峰度=1.5 的 soft-sign 归一化)
 
-\echo '--- 11.10 ts2v_moment 函数 - 相同值（range=0）---'
+\echo '--- 11.11 ts2v_moment 函数 - 相同值（range=0）---'
 SELECT ts2v_moment(ARRAY[5.0, 5.0, 5.0]::float8[], 3) AS same_val_vec;
 -- 预期: [0.8333333, 0, 0] (常量序列: 均值特征 + 高阶矩为 0)
 
-\echo '--- 11.11 ts2v_moment 函数 - 默认维度384 ---'
+\echo '--- 11.12 ts2v_moment 函数 - 默认维度384 ---'
 SELECT vector_dims(ts2v_moment(ARRAY[1.0, 2.0]::float8[])) AS default_dims;
 -- 预期: 384
 
-\echo '--- 11.12 ts2v_moment 函数 - 空数组报错 ---'
+\echo '--- 11.13 ts2v_moment 函数 - 空数组报错 ---'
 SELECT ts2v_moment(ARRAY[]::float8[], 4);
 
-\echo '--- 11.13 ts2v_moment 函数 - NULL输入报错 ---'
+\echo '--- 11.14 ts2v_moment 函数 - NULL输入报错 ---'
 SELECT ts2v_moment(NULL::float8[], 4);
 
-\echo '--- 11.14 timeseries_vector_run 手动触发 ---'
+\echo '--- 11.15 timeseries_vector_run 手动触发 ---'
 -- 使用11.1创建的tsvec_source和tsvec_result表
 DELETE FROM tsvec_result;
 SELECT timeseries_vector_run('tsvec_result') AS run1;
 -- 预期: Processed 2 time slice(s) (2个1小时时间片)
 
-\echo '--- 11.15 验证向量表数据 ---'
+\echo '--- 11.16 验证向量表数据 ---'
 SELECT slice_start, slice_end, device_id,
        vector_dims(embedding) AS dims,
        (embedding IS NOT NULL) AS has_vec
 FROM tsvec_result
 ORDER BY slice_start, device_id;
 
-\echo '--- 11.16 timeseries_vector_run 幂等性 ---'
+\echo '--- 11.17 timeseries_vector_run 幂等性 ---'
 SELECT timeseries_vector_run('tsvec_result') AS run2;
 -- 预期: Processed 0 time slice(s) (ON CONFLICT DO NOTHING)
 
-\echo '--- 11.17 timeseries_vector_run 不存在的表 ---'
+\echo '--- 11.18 timeseries_vector_run 不存在的表 ---'
 SELECT timeseries_vector_run('nonexistent_tsvec_table');
 
 -- ================================================================

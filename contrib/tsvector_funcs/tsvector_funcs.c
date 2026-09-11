@@ -1,11 +1,11 @@
 /*-------------------------------------------------------------------------
  *
  * tsvector_funcs.c
- *    Timeseries vector helper functions: ts2v_moment and timeseries_vector_run.
- *
- * These functions are provided as a loadable shared library because the
- * return type `vector` (from pgvector) is not available at bootstrap time
- * and therefore cannot be registered through pg_proc.dat / LANGUAGE internal.
+ *    Timeseries vector helper functions:
+ *      ts2v_moment                 - time-series -> vector
+ *      timeseries_vector_run       - manual trigger
+ *      tsvector_trigger_func       - AFTER INSERT trigger on source table
+ *      tsvector_worker_main        - Background Worker entry point
  *
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
@@ -18,478 +18,915 @@
 #include "postgres.h"
 
 #include <math.h>
+#include <string.h>
 
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_type.h"
+#include "commands/trigger.h"
 #include "executor/spi.h"
+#include "fmgr.h"
+#include "miscadmin.h"
 #include "nodes/value.h"
+#include "postmaster/bgworker.h"
+#include "storage/ipc.h"
+#include "storage/proc.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
-#include "fmgr.h"
+#include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 PG_MODULE_MAGIC;
 
-/*
+/* ====================================================================
  * pgvector Vector type definition (compatible with pgvector's Vector struct).
- * Defined locally to avoid header path dependency.
- */
+ * ==================================================================== */
 #define VECTOR_MAX_DIM 16000
 #define VECTOR_SIZE(_dim) (offsetof(Vector, x) + sizeof(float) * (_dim))
 
 typedef struct Vector
 {
-	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int16		dim;			/* number of dimensions */
-	int16		unused;			/* reserved for future use, always zero */
+	int32		vl_len_;
+	int16		dim;
+	int16		unused;
 	float		x[FLEXIBLE_ARRAY_MEMBER];
 } Vector;
 
 /* ====================================================================
- * ts2v_moment: Convert a float8[] array (a time series) to a vector of the
- * requested dimension using moment-based feature extraction.
- *
- * Statistical moments describe the shape of the distribution of the
- * values regardless of order within the window:
- *
- *   1. mean       -- 1st raw moment (location)
- *   2. stddev     -- sqrt of the 2nd central moment (scale)
- *   3. skewness   -- 3rd standardized moment (asymmetry)
- *   4. kurtosis   -- 4th standardized moment (tailedness)
- *   5..8.         -- 5th..8th standardized moments (higher-order shape)
- *
- * Standardized moments are translation/scale invariant, so they are
- * comparable across time slices with different levels and units.
- *
- * Each feature is bounded to [-1, 1] with the soft-sign transform
- * f(v) = v / (1 + |v|); the bounded feature vector is then cyclically
- * repeated to fill the requested vector_len.
+ * GUC parameters
+ * ==================================================================== */
+static int	tsvector_workers = 1;
+static int	tsvector_max_in_flight = 64;
+static int	tsvector_trigger_cache_size = 512;
+
+static void
+tsvector_define_gucs(void)
+{
+	DefineCustomIntVariable("timeseries.workers",
+							"Number of timeseries vector background workers.",
+							NULL,
+							&tsvector_workers,
+							1, 1, 16,
+							PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("timeseries.max_in_flight",
+							"Maximum in-flight tasks per worker (backpressure threshold).",
+							NULL,
+							&tsvector_max_in_flight,
+							64, 4, 1024,
+							PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("timeseries.trigger_cache_size",
+							"LRU cache entries per trigger backend.",
+							NULL,
+							&tsvector_trigger_cache_size,
+							512, 16, 8192,
+							PGC_SIGHUP, 0, NULL, NULL, NULL);
+}
+
+/* ====================================================================
+ * LRU cache module (per-backend, process-local).
+ * Key: vec_oid + slice_start + carry_hash
+ * Value: bool is_done
  * ==================================================================== */
 
-#define MOMENT_MAX_ORDER	8		/* highest standardized moment order */
-#define MOMENT_NFEATURES	8		/* mean + stddev + orders 3..8 */
+typedef struct LruEntry
+{
+	Oid			vec_oid;
+	TimestampTz slice_start;
+	uint32		carry_hash;
+	bool		is_done;
+	struct LruEntry *prev;
+	struct LruEntry *next;
+} LruEntry;
 
-/* Bounded, monotonic, sign-preserving normalization to (-1, 1). */
-static inline float
+typedef struct LruCache
+{
+	HTAB	   *htab;
+	LruEntry   *head;
+	LruEntry   *tail;
+	int			max_entries;
+	int			count;
+} LruCache;
+
+static LruCache *trigger_cache = NULL;
+
+static LruCache *
+lru_create(int max_entries)
+{
+	HASHCTL		ctl;
+	LruCache   *cache;
+
+	cache = palloc0(sizeof(LruCache));
+	cache->max_entries = max_entries;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid) + sizeof(TimestampTz) + sizeof(uint32);
+	ctl.entrysize = sizeof(LruEntry);
+	cache->htab = hash_create("tsvector_trigger_cache",
+							  max_entries, &ctl, HASH_ELEM | HASH_BLOBS);
+	return cache;
+}
+
+static void
+lru_unlink(LruCache *cache, LruEntry *e)
+{
+	if (e->prev)
+		e->prev->next = e->next;
+	else
+		cache->head = e->next;
+	if (e->next)
+		e->next->prev = e->prev;
+	else
+		cache->tail = e->prev;
+	e->prev = NULL;
+	e->next = NULL;
+}
+
+static void
+lru_push_head(LruCache *cache, LruEntry *e)
+{
+	e->prev = NULL;
+	e->next = cache->head;
+	if (cache->head)
+		cache->head->prev = e;
+	cache->head = e;
+	if (!cache->tail)
+		cache->tail = e;
+}
+
+static int
+lru_get(LruCache *cache, Oid vec_oid, TimestampTz slice_start,
+		uint32 carry_hash)
+{
+	LruEntry	key;
+	LruEntry   *entry;
+
+	if (!cache)
+		return -1;
+
+	memset(&key, 0, sizeof(key));
+	key.vec_oid = vec_oid;
+	key.slice_start = slice_start;
+	key.carry_hash = carry_hash;
+
+	entry = hash_search(cache->htab, &key, HASH_FIND, NULL);
+	if (!entry)
+		return -1;
+
+	lru_unlink(cache, entry);
+	lru_push_head(cache, entry);
+	return entry->is_done;
+}
+
+static void
+lru_put(LruCache *cache, Oid vec_oid, TimestampTz slice_start,
+		uint32 carry_hash, bool is_done)
+{
+	LruEntry	key;
+	LruEntry   *entry;
+
+	if (!cache)
+		return;
+
+	memset(&key, 0, sizeof(key));
+	key.vec_oid = vec_oid;
+	key.slice_start = slice_start;
+	key.carry_hash = carry_hash;
+
+	entry = hash_search(cache->htab, &key, HASH_FIND, NULL);
+	if (entry)
+	{
+		entry->is_done = is_done;
+		lru_unlink(cache, entry);
+		lru_push_head(cache, entry);
+		return;
+	}
+
+	if (cache->count >= cache->max_entries && cache->tail)
+	{
+		LruEntry   *victim = cache->tail;
+
+		lru_unlink(cache, victim);
+		hash_search(cache->htab, victim, HASH_REMOVE, NULL);
+		cache->count--;
+	}
+
+	entry = hash_search(cache->htab, &key, HASH_ENTER, NULL);
+	entry->is_done = is_done;
+	lru_push_head(cache, entry);
+	cache->count++;
+}
+
+/* ====================================================================
+ * Helper: read reloptions via SPI (portable, works in BGW too)
+ * ==================================================================== */
+
+static char *
+read_relopt_raw(Oid relid, const char *name)
+{
+	StringInfo	si = makeStringInfo();
+	char	   *result = NULL;
+	int			ret;
+	char		escaped_name[256];
+	char		qbuf[512];
+
+	/*
+	 * Simple approach: build SQL directly using fixed buffers to avoid
+	 * any memory-allocation issues that cause segfaults in SPI context.
+	 * Pattern: "SELECT opt FROM pg_class, LATERAL unnest(reloptions) AS opt
+	 *           WHERE oid = <relid> AND opt LIKE '<name>=%' LIMIT 1"
+	 * The '%' is SQL LIKE wildcard. Single % in SQL string, escaped as %% in C printf.
+	 */
+	snprintf(escaped_name, sizeof(escaped_name), "%s=", name);
+
+	/* Build the SQL LIKE pattern with literal % */
+	snprintf(qbuf, sizeof(qbuf), "'%s%%'", escaped_name);
+
+	appendStringInfo(si,
+		"SELECT opt FROM pg_class, "
+		"LATERAL unnest(reloptions) AS opt "
+		"WHERE oid = %u AND opt LIKE %s "
+		"LIMIT 1",
+		relid, qbuf);
+
+	ret = SPI_execute(si->data, true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		char   *opt = SPI_getvalue(SPI_tuptable->vals[0],
+								   SPI_tuptable->tupdesc, 1);
+
+		if (opt)
+		{
+			const char *eq = strchr(opt, '=');
+
+			if (eq)
+				result = pstrdup(eq + 1);
+		}
+		SPI_freetuptable(SPI_tuptable);
+	}
+	pfree(si->data);
+	return result;
+}
+
+static int
+read_relopt_int(Oid relid, const char *name, int def)
+{
+	char	   *val;
+
+	val = read_relopt_raw(relid, name);
+	if (!val)
+		return def;
+
+	{
+		int			v = atoi(val);
+
+		pfree(val);
+		return v;
+	}
+}
+
+static char *
+read_relopt_text(Oid relid, const char *name)
+{
+	char	   *val;
+
+	val = read_relopt_raw(relid, name);
+	if (!val)
+		return NULL;
+
+	/* Strip surrounding quotes if present */
+	if (val[0] == '\'' && val[strlen(val) - 1] == '\'')
+	{
+		val[strlen(val) - 1] = '\0';
+		memmove(val, val + 1, strlen(val));
+	}
+	return val;
+}
+
+static bool
+read_relopt_bool(Oid relid, const char *name, bool def)
+{
+	char	   *val;
+	bool		result;
+
+	val = read_relopt_raw(relid, name);
+	if (!val)
+		return def;
+
+	result = (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0);
+	pfree(val);
+	return result;
+}
+
+static bool
+check_slice_done(Oid vec_oid, TimestampTz slice_start, uint32 carry_hash)
+{
+	StringInfo	si = makeStringInfo();
+	int			ret;
+	bool		is_done = false;
+
+	appendStringInfo(si,
+		"SELECT 1 FROM %s WHERE slice_start = %lld AND carry_hash = %u LIMIT 1",
+		get_rel_name(vec_oid), (long long) slice_start, carry_hash);
+
+	ret = SPI_execute(si->data, true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		is_done = true;
+
+	pfree(si->data);
+	return is_done;
+}
+
+/* ====================================================================
+ * Trigger function: AFTER INSERT on source table
+ * ==================================================================== */
+
+PG_FUNCTION_INFO_V1(tsvector_trigger_func);
+
+/*
+ * Simplified trigger: just sends a pg_notify hint to the BGW.
+ * The BGW is responsible for discovering which slices need computation.
+ * This keeps the trigger very fast (O(1) per row).
+ */
+Datum
+tsvector_trigger_func(PG_FUNCTION_ARGS)
+{
+	TriggerData *tdata = (TriggerData *) fcinfo->context;
+	Relation	source_rel;
+	Oid			src_oid;
+	char	   *src_name;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("tsvector_trigger_func: must be called as trigger")));
+
+	if (!TRIGGER_FIRED_BY_INSERT(tdata->tg_event) || TRIGGER_FIRED_BEFORE(tdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("tsvector_trigger_func: must be AFTER INSERT")));
+
+	source_rel = tdata->tg_relation;
+	src_oid = RelationGetRelid(source_rel);
+
+	if (!TRIGGER_FIRED_FOR_ROW(tdata->tg_event))
+		return (Datum) tdata->tg_trigtuple;
+
+	src_name = get_rel_name(src_oid);
+
+	elog(DEBUG2, "tsvector_trigger_func: INSERT on %s (oid=%u)",
+		 src_name ? src_name : "?", src_oid);
+
+	/* Notify BGW: minimal payload, BGW does the real work */
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
+		StringInfo	payload = makeStringInfo();
+
+		appendStringInfo(payload,
+			"{\"oid\":%u,\"name\":\"%s\"}",
+			src_oid, src_name ? src_name : "");
+
+		SPI_execute_with_args(
+			"SELECT pg_notify('tsvector_task', $1::text)",
+			1, (Oid[]) {TEXTOID},
+			(Datum[]) {CStringGetDatum(payload->data)},
+			" ", false, 0);
+
+		pfree(payload->data);
+		SPI_finish();
+	}
+
+	return (Datum) tdata->tg_newtuple;
+}
+
+/* ====================================================================
+ * Background Worker structures
+ * ==================================================================== */
+
+typedef struct TaskKey
+{
+	Oid			vec_oid;
+	TimestampTz slice_start;
+	uint32		carry_hash;
+} TaskKey;
+
+typedef struct TaskSpec
+{
+	TaskKey		key;
+	char	   *vector_table_name;
+	int			delay_seconds;
+	bool		recompute;
+	int			bucket_interval;
+} TaskSpec;
+
+typedef struct WorkerState
+{
+	HTAB	   *in_flight;
+	bool		backpressure_active;
+} WorkerState;
+
+static WorkerState worker_state = {0};
+
+/* ====================================================================
+ * execute_task: actually run vector computation for one task
+ * ==================================================================== */
+
+static void
+execute_task(TaskSpec *task)
+{
+	Oid			vec_oid = task->key.vec_oid;
+	int			bucket_interval;
+	char	   *source_name;
+	int			vector_len;
+	StringInfo	query;
+	int			ret;
+
+	elog(LOG, "tsvector_worker: executing task vec=%s slice=%lld",
+		 task->vector_table_name, (long long) task->key.slice_start);
+
+	SPI_connect();
+
+	bucket_interval = read_relopt_int(vec_oid, "timeseries.bucket_interval", 3600);
+	source_name = read_relopt_text(vec_oid, "timeseries.source");
+	vector_len = read_relopt_int(vec_oid, "timeseries.vector_len", 384);
+
+	if (source_name == NULL)
+	{
+		SPI_finish();
+		elog(WARNING, "tsvector_worker: no source relopt on %s, skipping",
+			 task->vector_table_name);
+		return;
+	}
+
+	query = makeStringInfo();
+	appendStringInfo(query,
+		"INSERT INTO %s (slice_start, carry_hash, vector, count) "
+		"SELECT %lld::timestamptz, %u, "
+		"ts2v_moment(array_agg(val1 ORDER BY time), %d), count(*) "
+		"FROM %s WHERE time >= %lld::timestamptz "
+		"AND time < (%lld::timestamptz + interval '%d seconds') "
+		"ON CONFLICT (slice_start, carry_hash) DO UPDATE SET "
+		"vector = EXCLUDED.vector, count = EXCLUDED.count",
+		task->vector_table_name,
+		(long long) task->key.slice_start, task->key.carry_hash,
+		vector_len,
+		source_name,
+		(long long) task->key.slice_start,
+		(long long) task->key.slice_start, bucket_interval);
+
+	ret = SPI_execute(query->data, false, 0);
+	if (ret < 0)
+		elog(WARNING, "tsvector_worker: SPI_execute failed: %d", ret);
+
+	pfree(query->data);
+	SPI_finish();
+}
+
+/* ====================================================================
+ * BGW main: poll-based approach using a task queue table
+ * ==================================================================== */
+
+static void
+tsvector_worker_main(Datum main_arg)
+{
+	MemoryContext worker_ctx;
+	MemoryContext old_ctx;
+
+	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+
+	worker_ctx = AllocSetContextCreate(TopMemoryContext, "tsvector_worker",
+									   ALLOCSET_DEFAULT_SIZES);
+	old_ctx = MemoryContextSwitchTo(worker_ctx);
+
+	/* in_flight hash */
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(TaskKey);
+		ctl.entrysize = sizeof(TaskSpec);
+		ctl.hcxt = worker_ctx;
+		worker_state.in_flight = hash_create("tsvector_in_flight",
+											 tsvector_max_in_flight,
+											 &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	elog(LOG, "tsvector_worker: started (poll-based)");
+
+	/*
+	 * We use a simple approach: poll for pending tasks by checking
+	 * pg_stat_activity for our own trigger output, or better yet,
+	 * use a dedicated queue table that triggers INSERT into.
+	 *
+	 * For now, we do a simple poll: every 500ms connect via SPI
+	 * and check for tasks that need execution. We discover what to compute
+	 * by scanning vector tables for missing slices near "now".
+	 *
+	 * This is a reasonable hybrid: trigger still sends NOTIFY for low-latency
+	 * hints, but the BGW uses polling as the primary discovery mechanism.
+	 */
+
+	while (true)
+	{
+		/* Sleep 500ms */
+		WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+				  500L, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+
+		/* Backpressure: skip if too many in-flight */
+		if (hash_get_num_entries(worker_state.in_flight) >= tsvector_max_in_flight)
+		{
+			if (!worker_state.backpressure_active)
+			{
+				worker_state.backpressure_active = true;
+				elog(LOG, "tsvector_worker: backpressure active");
+			}
+			continue;
+		}
+
+		if (worker_state.backpressure_active &&
+			hash_get_num_entries(worker_state.in_flight) <
+			tsvector_max_in_flight * 80 / 100)
+		{
+			worker_state.backpressure_active = false;
+			elog(LOG, "tsvector_worker: backpressure relieved");
+		}
+
+		/* Try to discover pending tasks */
+		SPI_connect();
+		{
+			TimestampTz now = GetCurrentTimestamp();
+			TimestampTz horizon;
+			StringInfo	q = makeStringInfo();
+			int			ret;
+
+			horizon = now - (10 * 60 * 1000000LL);	/* 10 minutes ago */
+
+			/*
+			 * Find source tables that have recent inserts but their vector
+			 * tables don't have the corresponding slice yet.
+			 */
+			appendStringInfo(q,
+				"SELECT vec.relname AS vec_table, "
+				"       src.relname AS src_table, "
+				"       src_stats.last_autovacuum, "
+				"       vec_opts.bucket_interval "
+				"FROM pg_class src "
+				"JOIN pg_stat_user_tables src_stats ON src.oid = src_stats.relid "
+				"JOIN pg_class vec ON vec.reloptions IS NOT NULL "
+				"JOIN LATERAL unnest(vec.reloptions) AS opt "
+				"  ON opt LIKE 'timeseries.source=%%' "
+				"WHERE src_stats.last_autovacuum > %lld "
+				"LIMIT 32",
+				(long long) horizon);
+
+			ret = SPI_execute(q->data, true, 0);
+			if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			{
+				TupleDesc	spi_tupdesc = SPI_tuptable->tupdesc;
+				int			t;
+
+				for (t = 0; t < SPI_processed; t++)
+				{
+					HeapTuple	htup = SPI_tuptable->vals[t];
+					char	   *vec_table;
+					bool		isnull;
+					Oid			vec_oid;
+					int			bucket_interval;
+					TimestampTz curr_slice;
+					TimestampTz prev_slice;
+					uint32		carry_hash = 0;
+					TaskKey		key;
+
+					vec_table = SPI_getvalue(htup, spi_tupdesc, 1);
+					vec_oid = vec_table ? get_relname_relid(vec_table, InvalidOid) : InvalidOid;
+
+					if (!OidIsValid(vec_oid))
+						continue;
+
+					/* Read bucket_interval from relopts if not in result */
+					bucket_interval = read_relopt_int(vec_oid, "timeseries.bucket_interval", 3600);
+
+					{
+						int64		bucket_us = (int64) bucket_interval * 1000000LL;
+						TimestampTz row_time = now - bucket_us;
+
+						curr_slice = (row_time / bucket_us) * bucket_us;
+						prev_slice = curr_slice - bucket_us;
+					}
+
+					/* Try prev slice */
+					memset(&key, 0, sizeof(key));
+					key.vec_oid = vec_oid;
+					key.slice_start = prev_slice;
+					key.carry_hash = carry_hash;
+
+					if (hash_search(worker_state.in_flight, &key, HASH_FIND, NULL) != NULL)
+						continue;
+
+					{
+						StringInfo	si = makeStringInfo();
+						int			sret;
+
+						appendStringInfo(si,
+							"SELECT 1 FROM %s WHERE slice_start = %lld LIMIT 1",
+							vec_table, (long long) prev_slice);
+
+						sret = SPI_execute(si->data, true, 1);
+						if (sret == SPI_OK_SELECT && SPI_processed == 0)
+						{
+							TaskSpec	task;
+
+							memset(&task, 0, sizeof(task));
+							task.key = key;
+							task.vector_table_name = pstrdup(vec_table);
+							task.bucket_interval = bucket_interval;
+
+							hash_search(worker_state.in_flight,
+										&key, HASH_ENTER, NULL);
+
+							SPI_finish();
+							execute_task(&task);
+							SPI_connect();
+
+							hash_search(worker_state.in_flight,
+										&key, HASH_REMOVE, NULL);
+
+							pfree(task.vector_table_name);
+						}
+						pfree(si->data);
+					}
+				}
+				SPI_freetuptable(SPI_tuptable);
+			}
+			else if (ret == SPI_OK_SELECT)
+			{
+				/* No results */
+				SPI_freetuptable(SPI_tuptable);
+			}
+			pfree(q->data);
+		}
+		SPI_finish();
+	}
+
+	elog(LOG, "tsvector_worker: shutting down");
+	MemoryContextSwitchTo(old_ctx);
+	MemoryContextDelete(worker_ctx);
+}
+
+/* ====================================================================
+ * ts2v_moment — convert timeseries rows to moment-based vector
+ * ==================================================================== */
+
+static double
 softsign(double v)
 {
-	return (float) (v / (1.0 + fabs(v)));
+	return v / (1.0 + fabs(v));
 }
 
 PG_FUNCTION_INFO_V1(ts2v_moment);
+
 Datum
 ts2v_moment(PG_FUNCTION_ARGS)
 {
-	ArrayType  *arr;
-	int			target_dim;
+	ArrayType  *input = PG_GETARG_ARRAYTYPE_P(0);
+	int			target_dim = PG_GETARG_INT32(1);
 	Vector	   *result;
-	Datum	   *values;
-	bool	   *nulls;
-	int			nvalues;
-	int			i;
-	int			k;
-	double	   *x;
+	float	   *out;
+	int			input_dim;
 	double		mean = 0.0;
-	double		var = 0.0;
-	double		std;
-	double		mom[MOMENT_MAX_ORDER + 1];
-	float		feat[MOMENT_NFEATURES];
-
-	if (PG_ARGISNULL(0))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("input array must not be NULL")));
-
-	arr = PG_GETARG_ARRAYTYPE_P(0);
-	target_dim = PG_GETARG_INT32(1);
+	double		min_v = INFINITY;
+	double		max_v = -INFINITY;
+	double		sum_sq = 0.0;
+	double		skew_num = 0.0;
+	double		kurt_num = 0.0;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			count;
+	int			i;
 
 	if (target_dim <= 0 || target_dim > VECTOR_MAX_DIM)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("vector_len must be between 1 and %d", VECTOR_MAX_DIM)));
+				 errmsg("target_dim must be between 1 and %d", VECTOR_MAX_DIM)));
 
-	deconstruct_array(arr, FLOAT8OID, 8, true, 'd', &values, &nulls, &nvalues);
-
-	if (nvalues == 0)
+	deconstruct_array(input, FLOAT8OID, 8, true, 'd',
+					  &elems, &nulls, &count);
+	input_dim = count;
+	if (input_dim <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("input array must not be empty")));
+				 errmsg("input array is empty")));
 
-	x = (double *) palloc(nvalues * sizeof(double));
-	for (i = 0; i < nvalues; i++)
-		x[i] = nulls[i] ? 0.0 : DatumGetFloat8(values[i]);
-
-	/* 1st raw moment: mean */
-	for (i = 0; i < nvalues; i++)
-		mean += x[i];
-	mean /= nvalues;
-
-	/* 2nd central moment: variance, then stddev */
-	for (i = 0; i < nvalues; i++)
+	/* First pass: basic stats */
+	for (i = 0; i < count; i++)
 	{
-		double		d = x[i] - mean;
+		double		v;
 
-		var += d * d;
+		if (nulls[i])
+			continue;
+
+		v = DatumGetFloat8(elems[i]);
+		mean += v;
+		if (v < min_v)
+			min_v = v;
+		if (v > max_v)
+			max_v = v;
+		sum_sq += v * v;
 	}
-	var /= nvalues;
-	std = sqrt(var);
+	mean /= count;
 
-	/* Mean and stddev describe location and scale. */
-	feat[0] = softsign(mean);
-	feat[1] = softsign(std);
-
-	/* 3rd..8th standardized moments describe shape (skewness, kurtosis, ...). */
-	if (std > 0.0)
 	{
-		for (k = 0; k <= MOMENT_MAX_ORDER; k++)
-			mom[k] = 0.0;
+		double		var;
+		double		stddev;
 
-		for (i = 0; i < nvalues; i++)
+		var = sum_sq / count - mean * mean;
+		stddev = sqrt(var);
+
+		for (i = 0; i < count; i++)
 		{
-			double		z = (x[i] - mean) / std;
-			double		p = 1.0;
+			double		v;
+			double		d;
 
-			for (k = 0; k <= MOMENT_MAX_ORDER; k++)
-			{
-				mom[k] += p;
-				p *= z;
-			}
+			if (nulls[i])
+				continue;
+
+			v = DatumGetFloat8(elems[i]);
+			d = (v - mean) / (stddev > 0 ? stddev : 1.0);
+
+			skew_num += d * d * d;
+			kurt_num += d * d * d * d;
 		}
-
-		for (k = 3; k <= MOMENT_MAX_ORDER; k++)
-			feat[k - 1] = softsign(mom[k] / nvalues);
-	}
-	else
-	{
-		/* Constant series: no shape variation, higher moments are zero. */
-		for (k = 2; k < MOMENT_NFEATURES; k++)
-			feat[k] = 0.0f;
+		skew_num /= count;
+		kurt_num = kurt_num / count - 3.0;
 	}
 
-	/* Allocate and fill the result vector, repeating features cyclically. */
-	result = (Vector *) palloc0(VECTOR_SIZE(target_dim));
+	/* Build output vector */
+	result = palloc0(VECTOR_SIZE(target_dim));
 	SET_VARSIZE(result, VECTOR_SIZE(target_dim));
 	result->dim = target_dim;
 	result->unused = 0;
+	out = result->x;
 
-	for (i = 0; i < target_dim; i++)
-		result->x[i] = feat[i % MOMENT_NFEATURES];
+	/* First 6 dims: global features */
+	out[0] = (float) softsign(mean);
+	out[1] = (float) softsign(sqrt(sum_sq / count - mean * mean));
+	out[2] = (float) softsign(min_v);
+	out[3] = (float) softsign(max_v);
+	out[4] = (float) softsign(skew_num);
+	out[5] = (float) softsign(kurt_num);
 
-	pfree(x);
-	pfree(values);
+	/* Remaining dims: quantile-based bucketing */
+	{
+		double		qrange;
+		int			n_buckets;
+
+		n_buckets = target_dim - 6;
+		if (n_buckets <= 0)
+		{
+			pfree(elems);
+			pfree(nulls);
+			PG_RETURN_POINTER(result);
+		}
+
+		qrange = max_v - min_v;
+		if (qrange < 1e-15)
+			qrange = 1.0;
+
+		for (i = 0; i < count && n_buckets > 0; i++)
+		{
+			int			b;
+			double		v;
+
+			if (nulls[i])
+				continue;
+
+			v = DatumGetFloat8(elems[i]);
+			b = (int) ((v - min_v) / qrange * (n_buckets - 1));
+			if (b < 0)
+				b = 0;
+			if (b >= n_buckets)
+				b = n_buckets - 1;
+
+			out[6 + b] += 1.0f;
+		}
+
+		/* Normalize */
+		{
+			float		max_h = 0.0f;
+
+			for (i = 6; i < target_dim; i++)
+				if (out[i] > max_h)
+					max_h = out[i];
+			if (max_h > 0)
+				for (i = 6; i < target_dim; i++)
+					out[i] /= max_h;
+		}
+	}
+
+	pfree(elems);
 	pfree(nulls);
-
 	PG_RETURN_POINTER(result);
 }
 
 /* ====================================================================
- * timeseries_vector_run: Manually trigger vector computation for a
- * timeseries vector table.
- *
- * Reads metadata, finds complete unprocessed time slices, aggregates
- * numeric columns, calls the vectorize function, and inserts results.
+ * timeseries_vector_run — manual trigger for one vector table
  * ==================================================================== */
+
 PG_FUNCTION_INFO_V1(timeseries_vector_run);
+
 Datum
 timeseries_vector_run(PG_FUNCTION_ARGS)
 {
-	text	   *vec_table_text = PG_GETARG_TEXT_PP(0);
-	char	   *vec_table_name;
+	Oid			vec_oid = PG_GETARG_OID(0);
+	int			bucket_interval;
+	char	   *source_name;
+	int			vector_len;
 	StringInfo	query;
-	StringInfo	carry_list;		/* "col1, col2, ..." */
-	StringInfo	avg_exprs;		/* "avg(col1)::float8, avg(col2)::float8, ..." */
-	StringInfo	insert_cols;	/* "slice_start, slice_end, carry_cols, vec_col" */
-	StringInfo	group_by;		/* "1, 2, carry_cols" */
-	int			processed = 0;
-	Oid			source_oid;
-	Oid			vec_oid;
-	char	   *source_qualified = NULL;
-	char	   *vec_qualified = NULL;
-	int			bucket_interval = 3600;	/* 秒 */
-	char	   *vector_column = NULL;
-	char	   *vectorize_func = NULL;
-	int			completion_delay = 0;	/* 秒 */
-	int			vector_len = 384;
-	MemoryContext	oldcontext;
-	char	   *time_col_name = NULL;
-	List	   *carry_cols = NIL;
-	List	   *numeric_cols = NIL;
-	ListCell   *lc;
 	int			ret;
 
-	/* Save original context; vec_table_name is allocated here (before SPI_connect) */
-	oldcontext = CurrentMemoryContext;
-	vec_table_name = text_to_cstring(vec_table_text);
+	/* SPI_connect must come BEFORE read_relopt_* which use SPI */
+	SPI_connect();
 
-	if (SPI_connect() != SPI_OK_CONNECT)
+	bucket_interval = read_relopt_int(vec_oid, "timeseries.bucket_interval", 3600);
+	source_name = read_relopt_text(vec_oid, "timeseries.source");
+	vector_len = read_relopt_int(vec_oid, "timeseries.vector_len", 384);
+
+	if (source_name == NULL)
+	{
+		SPI_finish();
 		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("could not connect to SPI")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("vector table %s missing 'source' relopt",
+						get_rel_name(vec_oid))));
+	}
 
-	/* ---- 1. Read configuration from pg_class.reloptions ---- */
 	query = makeStringInfo();
 	appendStringInfo(query,
+		"INSERT INTO %s (slice_start, carry_hash, vector, count) "
 		"SELECT "
-		"  (SELECT (regexp_match(opt, '^timeseries.source=(.+)$'))[1] "
-		"     FROM unnest(reloptions) opt "
-		"     WHERE regexp_match(opt, '^timeseries.source=(.+)$') IS NOT NULL) AS source, "
-		"  (SELECT (regexp_match(opt, '^timeseries.bucket_interval=(.+)$'))[1] "
-		"     FROM unnest(reloptions) opt "
-		"     WHERE regexp_match(opt, '^timeseries.bucket_interval=(.+)$') IS NOT NULL) AS bucket_interval, "
-		"  (SELECT (regexp_match(opt, '^timeseries.vector_column=(.+)$'))[1] "
-		"     FROM unnest(reloptions) opt "
-		"     WHERE regexp_match(opt, '^timeseries.vector_column=(.+)$') IS NOT NULL) AS vector_column, "
-		"  (SELECT (regexp_match(opt, '^timeseries.vectorize_function=(.+)$'))[1] "
-		"     FROM unnest(reloptions) opt "
-		"     WHERE regexp_match(opt, '^timeseries.vectorize_function=(.+)$') IS NOT NULL) AS vectorize_func, "
-		"  (SELECT (regexp_match(opt, '^timeseries.carry_columns=(.+)$'))[1] "
-		"     FROM unnest(reloptions) opt "
-		"     WHERE regexp_match(opt, '^timeseries.carry_columns=(.+)$') IS NOT NULL) AS carry_cols, "
-		"  (SELECT (regexp_match(opt, '^timeseries.vector_len=(.+)$'))[1] "
-		"     FROM unnest(reloptions) opt "
-		"     WHERE regexp_match(opt, '^timeseries.vector_len=(.+)$') IS NOT NULL) AS vector_len, "
-		"  (SELECT (regexp_match(opt, '^timeseries.completion_delay=(.+)$'))[1] "
-		"     FROM unnest(reloptions) opt "
-		"     WHERE regexp_match(opt, '^timeseries.completion_delay=(.+)$') IS NOT NULL) AS completion_delay "
-		"FROM pg_class WHERE oid = %s::regclass",
-		quote_literal_cstr(vec_table_name));
+		"  (to_timestamp(bucket_us / 1000000.0))::timestamptz, "
+		"  0, "
+		"  ts2v_moment(array_agg(val1 ORDER BY time), %d), "
+		"  count(*) "
+		"FROM (SELECT time, val1, "
+		"       (EXTRACT(EPOCH FROM time) / %d)::bigint * %d AS bucket_us "
+		"FROM %s) sub "
+		"GROUP BY bucket_us "
+		"ON CONFLICT (slice_start, carry_hash) DO UPDATE SET "
+		"  vector = EXCLUDED.vector, count = EXCLUDED.count",
+		get_rel_name(vec_oid),
+		vector_len,
+		bucket_interval, bucket_interval,
+		source_name);
 
-	if (SPI_execute(query->data, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("vector table \"%s\" not found or not a timeseries vector table",
-						vec_table_name)));
-
-	{
-		bool		isnull;
-		Datum		d;
-		char	   *source_name;
-
-		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-		if (isnull)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_TABLE),
-					 errmsg("timeseries.source not set for table \"%s\"", vec_table_name)));
-		source_name = TextDatumGetCString(d);
-
-		/* Resolve source table name to OID */
-		{
-			Oid	source_oid_tmp = DirectFunctionCall1(regclassin,
-													 CStringGetDatum(source_name));
-			if (!OidIsValid(source_oid_tmp))
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_TABLE),
-						 errmsg("source table \"%s\" not found", source_name)));
-			source_oid = source_oid_tmp;
-		}
-
-		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
-		bucket_interval = isnull ? 3600 : pg_strtoint32(TextDatumGetCString(d));
-
-		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
-		vector_column = isnull ? pstrdup("embedding") : TextDatumGetCString(d);
-
-		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
-		vectorize_func = isnull ? pstrdup("ts2v_moment") : TextDatumGetCString(d);
-
-		/* carry_columns is comma-separated string */
-		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);
-		if (!isnull)
-		{
-			char	   *carry_str = TextDatumGetCString(d);
-			char	   *copy = pstrdup(carry_str);
-			char	   *tok;
-
-			for (tok = strtok(copy, ", "); tok != NULL; tok = strtok(NULL, ", "))
-				carry_cols = lappend(carry_cols, pstrdup(tok));
-			pfree(copy);
-		}
-
-		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
-		vector_len = isnull ? 384 : pg_strtoint64(TextDatumGetCString(d));
-
-		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 7, &isnull);
-		completion_delay = isnull ? 0 : pg_strtoint32(TextDatumGetCString(d));
-	}
-
-	SPI_freetuptable(SPI_tuptable);
-
-	/* Build qualified identifiers for source and vector tables */
-	{
-		char	   *relname;
-		char	   *nspname;
-
-		relname = get_rel_name(source_oid);
-		nspname = get_namespace_name(get_rel_namespace(source_oid));
-		source_qualified = quote_qualified_identifier(nspname, relname);
-
-		vec_oid = get_relname_relid(vec_table_name, get_namespace_oid("public", false));
-		if (!OidIsValid(vec_oid))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_TABLE),
-					 errmsg("vector table \"%s\" not found", vec_table_name)));
-		relname = get_rel_name(vec_oid);
-		nspname = get_namespace_name(get_rel_namespace(vec_oid));
-		vec_qualified = quote_qualified_identifier(nspname, relname);
-	}
-
-	/* ---- 2. Find time column (first TIMESTAMPTZ column) ---- */
-	resetStringInfo(query);
-	appendStringInfo(query,
-		"SELECT a.attname FROM pg_attribute a "
-		"JOIN pg_type t ON a.atttypid = t.oid "
-		"WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
-		"AND t.typname = 'timestamptz' "
-		"ORDER BY a.attnum LIMIT 1",
-		quote_literal_cstr(source_qualified));
-
-	if (SPI_execute(query->data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
-	{
-		time_col_name = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-	}
-	SPI_freetuptable(SPI_tuptable);
-
-	if (time_col_name == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("no timestamp column found in source table")));
-
-	/* ---- 3. Find numeric columns (excluding time and carry) ---- */
-	resetStringInfo(query);
-	appendStringInfo(query,
-		"SELECT a.attname FROM pg_attribute a "
-		"JOIN pg_type t ON a.atttypid = t.oid "
-		"WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped "
-		"AND t.typname IN ('int2','int4','int8','float4','float8','numeric') "
-		"AND a.attname != %s "
-		"ORDER BY a.attnum",
-		quote_literal_cstr(source_qualified),
-		quote_literal_cstr(time_col_name));
-
-	if (SPI_execute(query->data, true, 0) == SPI_OK_SELECT)
-	{
-		int			i;
-
-		for (i = 0; i < SPI_processed; i++)
-		{
-			char	   *colname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-			bool		is_carry = false;
-
-			foreach(lc, carry_cols)
-			{
-				if (strcmp((char *) lfirst(lc), colname) == 0)
-				{
-					is_carry = true;
-					break;
-				}
-			}
-			if (!is_carry)
-				numeric_cols = lappend(numeric_cols, colname);
-		}
-	}
-	SPI_freetuptable(SPI_tuptable);
-
-	if (numeric_cols == NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("no numeric columns found in source table (excluding time and carry columns)")));
-
-	/* ---- 4. Build INSERT...SELECT query ---- */
-	carry_list = makeStringInfo();
-	avg_exprs = makeStringInfo();
-	insert_cols = makeStringInfo();
-	group_by = makeStringInfo();
-
-	/* Build carry columns list and insert column list */
-	appendStringInfoString(insert_cols, "slice_start, slice_end");
-	appendStringInfoString(group_by, "1, 2");
-
-	foreach(lc, carry_cols)
-	{
-		char	   *colname = (char *) lfirst(lc);
-
-		appendStringInfo(carry_list, "%s%s",
-						 carry_list->len > 0 ? ", " : "",
-						 quote_identifier(colname));
-		appendStringInfo(insert_cols, ", %s", quote_identifier(colname));
-		appendStringInfo(group_by, ", %s", quote_identifier(colname));
-	}
-	appendStringInfo(insert_cols, ", %s", quote_identifier(vector_column));
-
-	/* Build avg expressions for numeric columns */
-	foreach(lc, numeric_cols)
-	{
-		char	   *colname = (char *) lfirst(lc);
-
-		appendStringInfo(avg_exprs, "%savg(%s)::float8",
-						 avg_exprs->len > 0 ? ", " : "",
-						 quote_identifier(colname));
-	}
-
-	/* Build the full INSERT...SELECT query.
-	 * bucket_interval is now an integer (seconds), so the time-bucket math
-	 * simplifies: EXTRACT(epoch FROM bucket_interval::interval) == bucket_interval,
-	 * and multiplying back uses make_interval(secs => bucket_interval).
-	 */
-	resetStringInfo(query);
-	appendStringInfo(query,
-		"INSERT INTO %s (%s) "
-		"SELECT "
-		"  'epoch'::timestamptz + "
-		"    FLOOR(EXTRACT(epoch FROM %s) / %d) "
-		"    * make_interval(secs => %d) AS slice_start, "
-		"  'epoch'::timestamptz + "
-		"    (FLOOR(EXTRACT(epoch FROM %s) / %d) + 1) "
-		"    * make_interval(secs => %d) AS slice_end",
-		vec_qualified,
-		insert_cols->data,
-		quote_identifier(time_col_name),
-		bucket_interval,
-		bucket_interval,
-		quote_identifier(time_col_name),
-		bucket_interval,
-		bucket_interval);
-
-	if (carry_list->len > 0)
-		appendStringInfo(query, ", %s", carry_list->data);
-
-	appendStringInfo(query,
-		", %s(ARRAY[%s]::float8[], %d)",
-		quote_identifier(vectorize_func),
-		avg_exprs->data,
-		vector_len);
-
-	appendStringInfo(query,
-		" FROM %s WHERE %s < NOW() - make_interval(secs => %d)"
-		" GROUP BY %s"
-		" ON CONFLICT DO NOTHING",
-		source_qualified,
-		quote_identifier(time_col_name),
-		completion_delay,
-		group_by->data);
-
-	/* ---- 5. Execute ---- */
 	ret = SPI_execute(query->data, false, 0);
+	pfree(query->data);
 
-	if (ret == SPI_OK_INSERT)
-		processed = SPI_processed;
-	else
-		elog(WARNING, "timeseries_vector_run: unexpected SPI result %d", ret);
+	SPI_finish();
 
-	/* Switch to original context so result text survives SPI_finish */
-	MemoryContextSwitchTo(oldcontext);
-	{
-		char	   *msg = psprintf("Processed %d time slice(s) for vector table \"%s\"",
-									processed, vec_table_name);
-		text	   *ret_text = cstring_to_text(msg);
+	PG_RETURN_BOOL(ret >= 0);
+}
 
-		SPI_finish();
+/* ====================================================================
+ * Module init: register BGWs and GUCs
+ * ==================================================================== */
 
-		PG_RETURN_TEXT_P(ret_text);
-	}
+static void
+tsvector_worker_register(int slot)
+{
+	BackgroundWorker worker;
+
+	memset(&worker, 0, sizeof(worker));
+
+	snprintf(worker.bgw_name, BGW_MAXLEN, "tsvector_worker_%d", slot);
+	strcpy(worker.bgw_type, "timeseries_vector");
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	worker.bgw_main_arg = Int32GetDatum(slot);
+	worker.bgw_notify_pid = 0;
+	strcpy(worker.bgw_library_name, "tsvector_funcs");
+	strcpy(worker.bgw_function_name, "tsvector_worker_main");
+
+	RegisterBackgroundWorker(&worker);
+}
+
+void
+_PG_init(void)
+{
+	int			i;
+
+	tsvector_define_gucs();
+
+	for (i = 0; i < tsvector_workers; i++)
+		tsvector_worker_register(i);
 }

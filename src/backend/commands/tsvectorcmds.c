@@ -26,6 +26,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
 #include "commands/tsvectorcmds.h"
 #include "nodes/makefuncs.h"
@@ -286,9 +287,41 @@ make_timeseries_hnsw_index(RangeVar *relation, const char *vector_column)
 	iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
 
 	index->indexParams = list_make1(iparam);
-	index->indexIncludingParams = NIL;
+        index->indexIncludingParams = NIL;
 
-	return index;
+        return index;
+}
+
+/*
+ * Build the CREATE TRIGGER statement that registers tsvector_trigger_func
+ * on the source table.  This is executed automatically after the vector
+ * table is created, so the user never needs to call
+ * timeseries_register_trigger() manually.
+ */
+static CreateTrigStmt *
+make_timeseries_trigger(const char *source_name)
+{
+        CreateTrigStmt *trig = makeNode(CreateTrigStmt);
+        List       *names = stringToQualifiedNameList(source_name, NULL);
+        RangeVar   *source_rv = makeRangeVarFromNameList(names);
+
+        trig->replace = true;           /* DROP IF EXISTS + CREATE */
+        trig->isconstraint = false;
+        trig->trigname = pstrdup("tsvector_trigger");
+        trig->relation = copyObject(source_rv);
+        trig->funcname = list_make1(makeString("tsvector_trigger_func"));
+        trig->args = NIL;
+        trig->row = true;
+        trig->timing = TRIGGER_TYPE_AFTER;
+        trig->events = TRIGGER_TYPE_INSERT;
+        trig->columns = NIL;
+        trig->whenClause = NULL;
+        trig->transitionRels = NIL;
+        trig->deferrable = false;
+        trig->initdeferred = false;
+        trig->constrrel = NULL;
+
+        return trig;
 }
 
 
@@ -469,6 +502,11 @@ InjectTimeseriesColumns(CreateStmt *stmt)
 	extra_stmts = lappend(extra_stmts,
 						  make_timeseries_hnsw_index(stmt->relation,
 													 vector_column));
+
+
+	/* Auto-register the tsvector trigger on the source table. */
+	extra_stmts = lappend(extra_stmts,
+								make_timeseries_trigger(source_name));
 
 	return extra_stmts;
 }

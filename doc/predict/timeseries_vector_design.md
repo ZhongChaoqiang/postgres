@@ -12,9 +12,9 @@
 
 - 基于现有超表自动创建向量表，无需手动维护
 - 支持按固定时间间隔（time bucket）自动切分时序数据
-- 当时间片数据完整后，自动调用向量化函数计算该时间片的向量
+- **数据驱动触发**：新数据 INSERT 时异步触发向量计算任务，不再依赖定时扫描
 - 向量表记录时间片元数据（开始时间、结束时间）和源表属性列
-- 利用 TimescaleDB 的后台任务调度机制实现定时扫描和计算
+- 计算任务与时序数据插入**完全异步解耦**，不影响写入性能
 - 支持向量相似度查询，快速检索相似的时间片段
 
 ### 1.3 典型应用场景
@@ -49,9 +49,8 @@ CREATE TABLE vector_table_name (
     timeseries.vectorize_function = 'fn',     -- 向量化函数（默认 ts2v_moment）
     timeseries.vector_column = 'col',         -- 向量列名（默认 embedding）
     timeseries.carry_columns = 'c1,c2,...',   -- 携带列名（逗号分隔，类型从源表自动推断）
-    timeseries.enabled = true,                -- 后台任务开关
-    timeseries.scan_interval = 300,           -- 扫描间隔（秒）
-    timeseries.completion_delay = 0           -- 完成延迟（秒）
+    timeseries.enabled = true,                -- 是否启用触发器与异步计算
+    timeseries.recompute_on_late_data = true  -- 迟到数据是否触发重算（默认 true）
     /* 其余数据质量参数见 4.3 节 */
 );
 ```
@@ -96,15 +95,10 @@ CREATE TABLE vector_table_name (
 | `timeseries.vectorize_function` | text | — | `ts2v_moment` | 向量化函数名 |
 | `timeseries.vector_column` | text | — | `embedding` | 向量列名 |
 | `timeseries.carry_columns` | text | — | 空 | 携带列名（逗号分隔），类型从源表自动推断 |
-| `timeseries.enabled` | bool | — | `true` | 是否启用后台任务 |
-| `timeseries.scan_interval` | int | — | `300` | 后台任务扫描间隔（秒） |
-| `timeseries.completion_delay` | int | — | `0` | 时间片完成后的延迟等待（秒） |
-| `timeseries.sample_interval` | int | — | NULL | 期望采样间隔（秒），用于推断期望采样点数 |
+| `timeseries.enabled` | bool | — | `true` | 是否启用源表触发器与异步计算 |
+| `timeseries.recompute_on_late_data` | bool | — | `true` | 迟到数据写入已计算的时间片时，是否触发延迟重算（规则③） |
 | `timeseries.min_coverage` | float | — | `0.5` | 覆盖率阈值 |
 | `timeseries.max_gap` | int | — | NULL | 最大数据间隙（秒） |
-| `timeseries.completion_timeout` | int | — | NULL | 补全缺失数据超时（秒） |
-| `timeseries.strict` | bool | — | `false` | 超时后是否跳过不完整时间片 |
-| `timeseries.recompute_on_late_data` | bool | — | `false` | 迟到数据是否触发重算 |
 
 > `timeseries.source` 与 `timeseries.bucket_interval` 为必需项，其余选项均带默认值。结构性与可调参数统一保存在 reloptions 中，均可通过 `ALTER TABLE ... SET/RESET` 维护（见 2.4 节）。
 
@@ -116,14 +110,13 @@ CREATE TABLE sensor_vectors () WITH (
     timeseries.source = 'sensor_data',
     timeseries.bucket_interval = 3600,
     timeseries.carry_columns = 'sensor_id,location',
-    timeseries.vector_len = 384,
-    timeseries.scan_interval = 300,
-    timeseries.completion_delay = 300
+    timeseries.vector_len = 384
 );
 -- 系统自动注入：slice_start, slice_end, sensor_id(TEXT), location(TEXT),
 --               embedding vector(384), _processed, _data_watermark, _coverage,
 --               _row_count, _gap_count, _created_at, PRIMARY KEY(slice_start, sensor_id, location)
 -- 系统自动创建：HNSW 索引 on embedding
+-- 系统自动为源表注册触发器：tsvector_trigger
 
 -- 携带自定义列：用户只声明额外需要的列
 CREATE TABLE sensor_vectors_ext (
@@ -150,9 +143,11 @@ CREATE TABLE sensor_vectors_ext (
 DROP TABLE vector_table_name;
 ```
 
-后台任务通过 reloptions 识别向量表，表被删除后对应的后台任务/扫描逻辑自动失效，无需额外清理。
+删除时系统自动执行以下清理：
+1. 从源表上移除 `tsvector_trigger` 触发器（若无其他向量表关联该源表）
+2. 触发器函数保留（因其他向量表可能仍在使用）
 
-### 2.4 管理后台任务
+### 2.4 管理触发与计算
 
 向量表的所有配置（含可调参数与结构性配置）都保存在表的 reloptions 中，因此直接使用 PostgreSQL 标准的 `ALTER TABLE ... SET/RESET` 语法即可管理，无需额外的管理函数。
 
@@ -160,21 +155,18 @@ DROP TABLE vector_table_name;
 -- 查看所有时序向量表配置
 SELECT * FROM timeseries_vector_info;
 
--- 手动触发一次向量计算
+-- 手动触发一次向量计算（处理所有未计算的时间片）
 SELECT timeseries_vector_run('vector_table_name');
 
--- 修改扫描间隔（后台任务下次扫描时动态读取，立即生效）
-ALTER TABLE vector_table_name SET (timeseries.scan_interval = 600);
-
--- 修改时间片完成延迟
-ALTER TABLE vector_table_name SET (timeseries.completion_delay = 300);
-
--- 恢复为默认值
-ALTER TABLE vector_table_name RESET (timeseries.scan_interval);
-
--- 停用 / 启用后台任务
+-- 停用 / 启用触发器与异步计算
 ALTER TABLE vector_table_name SET (timeseries.enabled = false);
 ALTER TABLE vector_table_name SET (timeseries.enabled = true);
+
+-- 关闭迟到数据重算（规则③）
+ALTER TABLE vector_table_name SET (timeseries.recompute_on_late_data = false);
+
+-- 恢复为默认值
+ALTER TABLE vector_table_name RESET (timeseries.recompute_on_late_data);
 
 -- 关联到新的源表 / 调整时间片间隔（结构性配置同样通过 reloptions 修改）
 ALTER TABLE vector_table_name SET (timeseries.source = 'new_source_table');
@@ -184,7 +176,7 @@ ALTER TABLE vector_table_name SET (timeseries.bucket_interval = 1800);
 说明：
 
 - 表选项（reloptions）是 PostgreSQL 表自带的存储机制，`ALTER TABLE ... SET/RESET` 由内核自动处理，无需自定义语法解析。
-- 后台任务每次扫描时动态读取 reloptions，因此修改后无需重建任务。
+- 触发器函数每次触发时动态读取 reloptions，因此修改后无需重建触发器。
 - 所有配置统一保存在 reloptions 中，不再维护独立的元数据表（见 3.3 节）。
 
 ## 3. 架构设计
@@ -193,28 +185,100 @@ ALTER TABLE vector_table_name SET (timeseries.bucket_interval = 1800);
 
 ```mermaid
 graph TB
-    subgraph "数据写入流程"
+    subgraph "数据写入流程（同步，轻量）"
         A[INSERT 时序数据] --> B[源超表<br/>sensor_data]
         B --> C[TimescaleDB 自动分区]
+        C --> D[触发器<br/>tsvector_trigger]
+        D --> D1{内存缓存查询<br/>done_slices_cache}
+        D1 -->|HIT| E[直接用缓存结果]
+        D1 -->|MISS| F[查询向量表 EXISTS]
+        E --> G{三规则决策}
+        F --> G
+        G -->|规则①: prev PENDING| H[NOTIFY tsvector_task<br/>priority=HIGH, delay=0]
+        G -->|规则③: curr DONE + 迟到| I[NOTIFY tsvector_task<br/>priority=LOW, delay=bucket_interval]
+        G -->|规则②: curr PENDING| J[跳过]
     end
 
-    subgraph "后台任务流程"
-        D[Background Worker<br/>定时扫描] --> E[查询未处理的<br/>完整时间片]
-        E --> F{时间片数据<br/>是否完整?}
-        F -->|是| G[调用向量化函数<br/>ts2v_moment/ft_transformer]
-        G --> H[计算向量结果]
-        H --> I[INSERT 到向量表]
-        F -->|否| J[等待下次扫描]
-        I --> K[记录处理状态]
+    subgraph "异步任务处理（BG Worker 进程）"
+        subgraph "多个 BG Worker 并发"
+            W1[Worker-1]
+            W2[Worker-2]
+            W3[Worker-N]
+        end
+        W1 --> L[LISTEN tsvector_task]
+        W2 --> L
+        W3 --> L
+        L --> M{收到 NOTIFY}
+        M --> N{in_flight 去重<br/>内存哈希集合}
+        N -->|已存在| O[跳过]
+        N -->|新任务| P{优先级队列<br/>HIGH优先}
+        P --> Q[立即执行 / 延迟队列]
+        Q --> R[查询时间片数据]
+        R --> S[数据质量检查]
+        S --> T[调用向量化函数]
+        T --> U[INSERT/UPDATE 向量表]
+        U --> V[NOTIFY tsvector_done<br/>广播完成事件]
+        V -.-> D1
     end
 
     subgraph "查询流程"
-        L[SELECT 向量搜索] --> M[向量表<br/>sensor_vectors]
-        M --> N[pgvector 相似度搜索]
-        N --> O[返回相似时间片]
+        X[SELECT 向量搜索] --> Y[向量表<br/>sensor_vectors]
+        Y --> Z[pgvector 相似度搜索]
+        Z --> AA[返回相似时间片]
     end
 
-    B -.->|定时扫描| D
+    B -.->|源表触发器| D
+    D -.->|NOTIFY tsvector_task| L
+    V -.->|NOTIFY tsvector_done| D
+```
+
+#### 核心状态与去重机制
+
+```
+时间片三态模型：
+┌─────────────────────────────────────────────────────────────┐
+│  PENDING     │  向量表不存在 + Worker in_flight 不存在       │
+│  IN_FLIGHT   │  Worker in_flight 存在（已下发，计算中/等待） │
+│  DONE        │  向量表存在（已计算完成）                     │
+└─────────────────────────────────────────────────────────────┘
+
+去重三层防线：
+  Layer 1: 触发器内存缓存（LRU）→ 避免不必要的 DB 查询
+  Layer 2: Worker in_flight 集合 → 避免重复下发的 NOTIFY 被执行
+  Layer 3: 向量表主键 + ON CONFLICT → 最终兜底
+```
+
+#### 触发时机决策流程
+
+```
+新数据 INSERT (time = T_new)
+    │
+    ├─ 计算时间片
+    │   curr_slice = time_bucket(bucket_interval, T_new)
+    │   prev_slice  = curr_slice - bucket_interval
+    │
+    ├─ ① 判断 prev_slice 状态（规则①）
+    │   ├── cache_hit? → prev_done = cache[prev_slice]
+    │   └── cache_miss → prev_done = EXISTS(向量表查 prev_slice)
+    │                     结果写入 cache
+    │
+    │   IF NOT prev_done THEN
+    │       pg_notify('tsvector_task', {..., priority: HIGH, delay: 0})
+    │       → Worker in_flight 去重：若已在集合则跳过
+    │
+    ├─ ② 判断 curr_slice 状态（规则②③）
+    │   ├── cache_hit? → curr_done = cache[curr_slice]
+    │   └── cache_miss → curr_done = EXISTS(向量表查 curr_slice)
+    │                     结果写入 cache
+    │
+    │   IF curr_done AND recompute_on_late_data THEN
+    │       pg_notify('tsvector_task', {..., priority: LOW, delay: bucket_interval})
+    │       → Worker in_flight 去重：若已在集合则跳过
+    │
+    │   IF NOT curr_done THEN
+    │       跳过（规则②，等后续数据触发 ①）
+    │
+    └─ 返回，不阻塞 INSERT 事务
 ```
 
 ### 3.2 核心组件
@@ -241,18 +305,17 @@ graph TB
 
 > 系统列若与用户声明的列同名则跳过注入（以免重复），用户可在 `CREATE TABLE` 中覆盖系统列定义（如改默认值或加约束）。
 
-#### 3.2.2 时间片完整性判断与数据质量处理
+#### 3.2.2 时间片数据质量处理
 
-时序数据的采集存在两类典型问题：**数据延迟**（数据未及时写入）和**数据缺失**（采集失败导致时间片内出现空洞）。后台任务不能简单地把"时间已过 `slice_end`"等同于"数据完整"，需要分别处理。
+触发机制本身已经保证了时间片的"数据完整性"语义：规则①只在上一时间片之后有新数据到来时才触发计算，这意味着上一时间片的数据已经完整结束。但仍需处理以下数据质量问题：
 
-##### 1. 数据延迟（迟到数据）
+##### 1. 迟到数据与重算
 
-数据延迟指某段数据在其所属时间片结束后才写入源表。处理策略：
+迟到数据指某段数据在其所属时间片结束后才写入源表。处理策略：
 
-1. **延迟缓冲（`completion_delay`）**：时间片结束后额外等待一段时间再计算，缓解正常传输延迟导致的数据不完整。
-2. **水位线追踪（watermark）**：为每个向量表记录已处理到的源数据最高时间 `_data_watermark`，后台任务从水位线之后扫描，避免重复读取。
-3. **迟到数据重算（`recompute_on_late_data`）**：当检测到水位线之前出现新增数据（迟到数据），将受影响的时间片标记为"待重算"，下次扫描时重新计算向量。默认关闭，按需通过表属性开启。
-   - 检测方式：源表新增数据行时（可借助源表触发器记录 `_updated_at`，或通过 INSERT 语义识别），若其 `time` 早于当前水位线，判定为迟到数据。
+1. **重算触发（规则③）**：当新数据写入一个已计算过的时间片时，触发器会下发一个延迟 `bucket_interval` 时间的重算任务，等待更多迟到数据到达后再统一重算。
+2. **重算开关（`recompute_on_late_data`）**：默认开启。关闭后，迟到数据不会触发重算，向量数据以首算时为准。
+3. **原子重算**：重算使用 `INSERT ON CONFLICT UPDATE` 或 `DELETE + INSERT`，保证向量表中的数据与源表一致。
 
 ##### 2. 数据缺失（采集失败）
 
@@ -260,48 +323,19 @@ graph TB
 
 1. **覆盖率阈值（`min_coverage`）**：`实际采样点数 / 期望采样点数`，低于阈值的时间片不计算向量，避免产生误导性向量。
 2. **最大间隙检测（`max_gap`）**：时间片内相邻采样点的时间间隔若超过阈值，判定中间存在缺失段。
-3. **等待补齐超时（`completion_timeout`）**：覆盖率不足的时间片继续等待回补数据，超时后按模式处理：
-   - `strict` 模式：跳过该时间片，不写入向量（等待后续重算）；
-   - 非 `strict` 模式：仍计算向量，但记录低覆盖率标记，供查询时过滤。
-4. **质量元数据**：在向量表中记录质量元数据列，供查询时过滤低质量向量（见 3.2.1）。
+3. **质量元数据**：在向量表中记录质量元数据列，供查询时过滤低质量向量（见 3.2.1）。
 
-期望采样点数由 `sample_interval` 表属性推断（= 时间片长度 / 采样间隔秒数）；未指定时仅依据 `_row_count` 与 `_gap_count` 判断。
+期望采样点数由 `bucket_interval` 和源表的实际采样频率推断（可通过源表同 carry_columns 组合的平均采样间隔估算）。
 
-##### 3. 综合判定流程
+##### 3. 计算时的数据完整性判定
+
+BG Worker 执行计算时，对每个被触发的时间片执行以下检查：
 
 ```
-1. 找出候选时间片（slice_end + completion_delay < NOW()，且在水位线之后）
-2. 对每个候选时间片：
-   a. 统计覆盖率、最大间隙、行数
-   b. 若 coverage >= min_coverage 且 max_gap 在阈值内 → 计算向量，标记 complete
-   c. 若 coverage < min_coverage 或存在超限间隙：
-      - 未到 completion_timeout → 跳过，继续等待回补数据
-      - 已超时 → 按 strict 模式决定「跳过」或「带质量标记计算」
-3. 检测迟到数据（time < watermark 的新增行）→ 标记受影响时间片为待重算
-4. 重算受影响的时间片
-```
-
-```sql
--- 候选时间片 + 数据质量统计（示意）
-WITH candidates AS (
-    SELECT
-        time_bucket('1 hour', time) AS slice_start,
-        time_bucket('1 hour', time) + interval '1 hour' AS slice_end,
-        sensor_id, location,
-        count(*) AS row_count,
-        count(*)::float / (3600.0 / 60.0) AS coverage,  -- 期望采样点 = 片长 / 采样间隔(60s)
-        MAX(time) AS max_time_in_slice
-    FROM sensor_data
-    WHERE time < NOW() - make_interval(secs => ${completion_delay})  -- completion_delay（秒）
-      AND time > ${watermark}                            -- 水位线之后
-    GROUP BY 1, 2, 3, 4
-)
-SELECT c.*
-FROM candidates c
-LEFT JOIN sensor_vectors sv
-    ON sv.slice_start = c.slice_start AND sv.sensor_id = c.sensor_id
-WHERE sv.slice_start IS NULL
-  AND c.coverage >= 0.5;                                 -- min_coverage
+1. 统计该时间片内的行数、覆盖率、间隙数
+2. 若 coverage < min_coverage 或存在超限间隙 → 跳过计算，记录日志
+   （下一条新数据到来时会再次触发规则①，重新尝试计算）
+3. 若数据质量合格 → 调用向量化函数，写入向量表
 ```
 
 #### 3.2.3 向量化函数接口
@@ -318,31 +352,282 @@ CREATE FUNCTION ts2v_moment(
 
 实际实现中，向量化函数在后台任务内部通过 SPI 执行，接收时间片内的聚合数据作为输入。
 
-#### 3.2.4 后台任务机制
+#### 3.2.4 触发机制与异步任务队列
 
-定时扫描可用 TimescaleDB 的 `add_job` API 注册。由于配置已保存在向量表的 reloptions 中，job 只需一个通用入口，扫描时动态发现并读取各向量表配置，无需在 job config 中重复维护：
+本设计**不再使用定时扫描**，而是采用**数据驱动的触发机制**，在源表 INSERT 时通过触发器下发异步计算任务。
 
-```sql
--- 注册一个通用扫描任务（配置来自各向量表的 reloptions）
-SELECT timescaledb_internal.add_job(
-    proc => 'timeseries_vector_scan'::regproc,
-    schedule_interval => '5 min'::interval,
-    job_name => 'timeseries_vector_scan'
-);
+##### 触发入口：源表触发器（含内存缓存）
+
+在创建时序向量表时，系统自动为源表注册一个 AFTER INSERT 触发器 `tsvector_trigger`。触发器维护一个进程内的 **LRU 缓存** `done_slices_cache`，记录已计算完成的时间片，避免每次 INSERT 都查询向量表。
+
+```c
+/*
+ * tsvector_trigger_func - 源表 AFTER INSERT 触发器函数
+ *
+ * 关键特性：
+ * 1. 内存缓存优先（LRU 512条目），cache miss 才查 DB
+ * 2. LISTEN tsvector_done 通道，Worker 完成任务后广播更新缓存
+ * 3. 三规则决策 + pg_notify 异步下发
+ */
+Datum
+tsvector_trigger_func(PG_FUNCTION_ARGS)
+{
+    /* 初始化：首次调用时 LISTEN tsvector_done + 分配 LRU 缓存 */
+    if (tvec_trigger_cache == NULL)
+    {
+        tvec_trigger_cache = lru_create(512);  /* 每个后端进程 512 条 */
+        SPI_connect();
+        SPI_execute("LISTEN tsvector_done", false, 0);
+        SPI_finish();
+    }
+    
+    /* 处理 Worker 广播的完成事件，更新本地缓存 */
+    PopActiveNotifications();
+    
+    /* ... 获取触发器上下文、计算时间片 ... */
+    
+    /* 规则①：上一时间片状态判断 —— 内存缓存优先 */
+    prev_done = lru_get(tvec_trigger_cache, prev_slice_key);
+    if (prev_done == -1)  /* cache miss */
+    {
+        prev_done = check_slice_done_from_db(...);  /* EXISTS 查询 */
+        lru_put(tvec_trigger_cache, prev_slice_key, prev_done);
+    }
+    if (!prev_done)
+    {
+        pg_notify('tsvector_task', build_task_payload(HIGH, 0, ...));
+        /* 注：不写入 prev_slice → in_flight 状态由 Worker 维护 */
+    }
+    
+    /* 规则②③：当前时间片状态判断 —— 同理 */
+    curr_done = lru_get(tvec_trigger_cache, curr_slice_key);
+    if (curr_done == -1)
+    {
+        curr_done = check_slice_done_from_db(...);
+        lru_put(tvec_trigger_cache, curr_slice_key, curr_done);
+    }
+    if (curr_done && recompute_on_late_data)
+    {
+        pg_notify('tsvector_task', build_task_payload(LOW, bucket_interval, ...));
+    }
+    
+    PG_RETURN_POINTER(NULL);
+}
 ```
 
-后台任务的执行逻辑：
+> **触发器性能分析**：热路径（缓存命中）仅需 LRU 查找（O(1) 哈希），零 DB 查询；冷路径（缓存未命中）执行 1~2 次 EXISTS 查询 + 最多 2 次 pg_notify。Worker 完成广播后，所有触发器的缓存自动更新，后续 INSERT 直接命中缓存。
+
+##### 异步任务执行：多 BG Worker 并发 + 去重 + 优先级
+
+多个 Background Worker 进程（数量由 `timeseries.workers` 配置）独立运行，各自 LISTEN 同一个 `tsvector_task` 通道。
+
+```mermaid
+graph TB
+    subgraph "触发器侧（进程 A/B/C）"
+        TA[Trigger A] -->|LISTEN tsvector_done| CA[LRU Cache A]
+        TB[Trigger B] -->|LISTEN tsvector_done| CB[LRU Cache B]
+        TC[Trigger C] -->|LISTEN tsvector_done| CC[LRU Cache C]
+        TA -->|pg_notify| CHANNEL[tsvector_task]
+        TB -->|pg_notify| CHANNEL
+        TC -->|pg_notify| CHANNEL
+    end
+    
+    subgraph "Worker 侧（进程 W1/W2/W3）"
+        CHANNEL -->|广播| W1
+        CHANNEL -->|广播| W2
+        CHANNEL -->|广播| W3
+        W1 --> IF1{in_flight_1}
+        W2 --> IF2{in_flight_2}
+        W3 --> IF3{in_flight_3}
+        IF1 -->|去重| PQ1[优先级队列 W1]
+        IF2 -->|去重| PQ2[优先级队列 W2]
+        IF3 -->|去重| PQ3[优先级队列 W3]
+        PQ1 --> EXEC[执行计算]
+        PQ2 --> EXEC
+        PQ3 --> EXEC
+        EXEC -->|完成后 NOTIFY| DONE[tsvector_done]
+    end
+    
+    DONE -.->|LISTEN| CA
+    DONE -.->|LISTEN| CB
+    DONE -.->|LISTEN| CC
+```
+
+###### Worker 内部数据结构
+
+```c
+/* 任务唯一标识：用于 in_flight 去重 */
+typedef struct TaskKey {
+    Oid         vector_table_oid;
+    TimestampTz slice_start;
+    uint32      carry_columns_hash;  /* carry_columns 值的哈希 */
+} TaskKey;
+
+/* Worker 内存结构 */
+typedef struct WorkerState {
+    HTAB       *in_flight;           /* 哈希表：TaskKey → 任务信息，用于去重 */
+    List       *priority_queue_high; /* HIGH 优先级立即执行队列 */
+    List       *priority_queue_low;  /* LOW 优先级立即执行队列 */
+    HeapTuple   delay_heap;          /* 延迟执行最小堆（按执行时间排序） */
+    int         max_in_flight;       /* 最大并发 in_flight 数（背压阈值） */
+    bool        backpressure_active; /* 当前是否处于背压状态 */
+} WorkerState;
+```
+
+###### Worker 主循环
+
+```c
+Datum
+tsvector_worker_main(void)
+{
+    WorkerState state = {0};
+    
+    BackgroundWorkerInitializeConnection("postgres", NULL);
+    SPI_connect();
+    SPI_execute("LISTEN tsvector_task", false, 0);
+    SPI_execute("LISTEN tsvector_backpressure", false, 0);
+    SPI_finish();
+    
+    while (true)
+    {
+        /* 等待 NOTIFY 或延迟队列到期 */
+        WaitForLatch(worker_latch, GetNextWakeupTime(&state));
+        
+        /* 处理 tsvector_task 消息 */
+        PopActiveNotifications();
+        foreach (n, Notifications())
+        {
+            if (strcmp(n->channel, "tsvector_task") == 0)
+                handle_task_notify(&state, n->extra);
+            else if (strcmp(n->channel, "tsvector_backpressure") == 0)
+                handle_backpressure_notify(&state, n->extra);
+        }
+        
+        /* 背压：暂停接收新任务 */
+        if (state.backpressure_active)
+            continue;
+        
+        /* 1. 优先级队列：先处理 HIGH，再处理 LOW */
+        while (state.priority_queue_high != NIL)
+        {
+            execute_next(&state, state.priority_queue_high);
+            state.priority_queue_high = list_delete_first(state.priority_queue_high);
+        }
+        while (state.priority_queue_low != NIL)
+        {
+            execute_next(&state, state.priority_queue_low);
+            state.priority_queue_low = list_delete_first(state.priority_queue_low);
+        }
+        
+        /* 2. 延迟队列：到期任务移入优先级队列 */
+        while (delay_heap_top_due(&state.delay_heap))
+        {
+            TaskSpec *task = delay_heap_pop(&state.delay_heap);
+            enqueue_by_priority(&state, task);
+        }
+    }
+}
+```
+
+###### 去重逻辑
+
+```c
+void
+handle_task_notify(WorkerState *state, const char *payload)
+{
+    TaskSpec *task = parse_notify_payload(payload);
+    TaskKey   key  = task_to_key(task);
+    
+    /* Layer 2 去重：检查 in_flight 集合 */
+    if (hash_search(state->in_flight, &key, HASH_FIND, NULL) != NULL)
+    {
+        elog(DEBUG1, "tsvector: task (%s, %s) already in-flight, skipping",
+             task->vector_table, timestamptz_to_string(task->slice_start));
+        pfree(task);
+        return;
+    }
+    
+    /* 背压检查：in_flight 达到上限时暂不接收新任务 */
+    if (hash_get_num_entries(state->in_flight) >= state->max_in_flight)
+    {
+        elog(LOG, "tsvector: worker backpressure active, dropping task");
+        pfree(task);
+        return;
+    }
+    
+    /* 加入 in_flight + 对应队列 */
+    hash_insert(state->in_flight, &key);
+    enqueue_by_priority(state, task);
+}
+
+/* 任务完成后从 in_flight 移除 + 广播完成事件 */
+void
+on_task_done(WorkerState *state, TaskSpec *task, bool success)
+{
+    TaskKey key = task_to_key(task);
+    hash_search(state->in_flight, &key, HASH_REMOVE, NULL);
+    
+    if (success)
+    {
+        /* 广播完成事件：触发器 LISTEN 后更新自己的 LRU 缓存 */
+        SPI_connect();
+        SPI_execute_with_args(
+            "SELECT pg_notify('tsvector_done', $1)",
+            1, (Oid[]){TEXTOID},
+            PointerGetDatum(cstring_to_stringify_done(task)),
+            false, 0);
+        SPI_finish();
+    }
+    
+    pfree(task);
+}
+```
+
+##### 延迟队列实现
+
+Worker 内部维护一个基于执行时间排序的最小堆（min-heap），存储在内存中：
 
 ```
-1. 扫描 pg_class，找出含 timeseries.source reloption 的向量表
-2. 读取每个向量表的 reloptions，获取源表、时间片、向量化等配置
-3. 查询源表，找出未处理且已完整的时间片（依据 completion_delay 等质量参数）
-4. 对每个完整时间片：
-   a. 查询该时间片内的时序数据
-   b. 调用向量化函数计算向量
-   c. INSERT 到向量表（slice_start, slice_end, carry_columns, vector_column）
-5. 记录处理日志
+延迟队列结构（最小堆）：
+┌───────────────────────────────────────────────────────────────┐
+│  执行时间          │  任务类型 │  任务信息                      │
+├───────────────────────────────────────────────────────────────┤
+│  2026-09-11 10:30  │  LOW     │  sensor_vectors + 08:00 + S001  │
+│  2026-09-11 11:00  │  LOW     │  sensor_vectors + 09:00 + S001  │
+│  ...              │  ...     │  ...                          │
+└───────────────────────────────────────────────────────────────┘
+
+堆操作：
+- 插入：O(log n)
+- 查看堆顶：O(1)
+- 弹出到期任务：O(log n)
 ```
+
+##### 优先级与背压
+
+```
+优先级规则：
+┌──────────────────────────────────────────────────┐
+│  HIGH  队列  ← 规则①（立即计算，上一时间片）    │
+│  LOW   队列  ← 规则③（延迟重算，迟到数据）       │
+└──────────────────────────────────────────────────┘
+
+背压机制：
+┌──────────────────────────────────────────────────┐
+│  触发条件：in_flight 数量 >= max_in_flight       │
+│  行为：丢弃新收到的 NOTIFY + 广播 tsvector_backpressure │
+│  解除条件：in_flight 数量降回 < 80% * max_in_flight │
+│  恢复：重新正常接收任务                          │
+└──────────────────────────────────────────────────┘
+```
+
+##### 任务去重三层防线总结
+
+| 防线 | 位置 | 机制 | 覆盖场景 |
+|------|------|------|---------|
+| **Layer 1** | 触发器（每个后端进程） | LRU 缓存 + tsvector_done NOTIFY | 避免重复查 DB；Worker 完成后自动更新缓存 |
+| **Layer 2** | Worker（每个 Worker 进程） | in_flight 哈希集合 | 多个 Worker 收到同一条 NOTIFY 时，只有一个执行 |
+| **Layer 3** | 向量表 | 主键 + ON CONFLICT DO NOTHING | 最终兜底，即使前两层都漏了也不重复写入 |
 
 ### 3.3 元数据管理
 
@@ -352,7 +637,7 @@ SELECT timescaledb_internal.add_job(
 
 - **识别依据**：`pg_class.reloptions` 中存在 `timeseries.source` 选项的普通表即视为时序向量表。
 - **动态读取**：后台任务通过内核函数（`get_reloptions` / 解析 reloptions 数组）读取配置，因此任何 `ALTER TABLE ... SET/RESET` 均立即生效，无需重建任务。
-- **统一存储**：结构性配置（`timeseries.source`、`timeseries.bucket_interval`、`timeseries.vectorize_function`、`timeseries.vector_column`、`timeseries.carry_columns`）与可调参数（`timeseries.scan_interval`、`timeseries.completion_delay`、`timeseries.enabled` 等）不再拆分。
+- **统一存储**：结构性配置（`timeseries.source`、`timeseries.bucket_interval`、`timeseries.vectorize_function`、`timeseries.vector_column`、`timeseries.carry_columns`）与可调参数（`timeseries.enabled`、`timeseries.recompute_on_late_data`、`timeseries.min_coverage` 等）不再拆分。
 
 为使 `CREATE TABLE ... WITH (...)` 与 `ALTER TABLE ... SET/RESET` 能解析这些键，采用 **reloption 命名空间（namespace）** 机制，而非逐个注册 reloption。具体做法：
 
@@ -382,13 +667,13 @@ SELECT
     reloptions_text(c.reloptions, 'timeseries.vector_column') AS vector_column,
     reloptions_text(c.reloptions, 'timeseries.carry_columns') AS carry_columns,
     reloptions_bool(c.reloptions, 'timeseries.enabled') AS enabled,
-    reloptions_int(c.reloptions, 'timeseries.scan_interval') AS scan_interval,
-    reloptions_int(c.reloptions, 'timeseries.completion_delay') AS completion_delay
+    reloptions_bool(c.reloptions, 'timeseries.recompute_on_late_data') AS recompute_on_late_data,
+    reloptions_float(c.reloptions, 'timeseries.min_coverage') AS min_coverage
 FROM pg_class c
 WHERE reloptions_text(c.reloptions, 'timeseries.source') IS NOT NULL;
 ```
 
-> `reloptions_text` / `reloptions_bool` 为示意函数，实际实现中从 `c.reloptions`（`text[]`）解析对应的 `timeseries.*` 键值。若后续接入 TimescaleDB 后台任务，`job_id` 与任务状态通过扩展自身元数据维护，不写入向量表 reloptions。
+> `reloptions_text` / `reloptions_bool` 为示意函数，实际实现中从 `c.reloptions`（`text[]`）解析对应的 `timeseries.*` 键值。
 
 ## 4. 数据模型设计
 
@@ -454,110 +739,348 @@ CREATE TABLE sensor_vectors (
 | `timeseries.vectorize_function` | text | ts2v_moment | 向量化函数名 |
 | `timeseries.vector_column` | text | embedding | 向量列名 |
 | `timeseries.carry_columns` | text | 空 | 携带列名（逗号分隔），类型从源表自动推断 |
-| `timeseries.enabled` | bool | true | 是否启用后台任务 |
-| `timeseries.scan_interval` | int | 300 | 后台任务扫描间隔（秒） |
-| `timeseries.completion_delay` | int | 0 | 时间片完成后的延迟等待（秒，缓解迟到数据） |
-| `timeseries.sample_interval` | int | NULL | 期望采样间隔（秒），用于推断期望采样点数（NULL 则自动推断） |
+| `timeseries.enabled` | bool | true | 是否启用源表触发器与异步计算 |
+| `timeseries.recompute_on_late_data` | bool | true | 迟到数据触发延迟重算（规则③） |
 | `timeseries.min_coverage` | float | 0.5 | 覆盖率阈值，低于此值不计算向量 |
 | `timeseries.max_gap` | int | NULL | 最大数据间隙（秒），超过则判定数据不连续（NULL 表示不检测） |
-| `timeseries.completion_timeout` | int | NULL | 等待补齐缺失数据的超时时间（秒，NULL 表示一直等待） |
-| `timeseries.strict` | bool | false | 超时后是否跳过不完整时间片（true 跳过 / false 带质量标记计算） |
-| `timeseries.recompute_on_late_data` | bool | false | 检测到迟到数据时是否重算受影响的时间片 |
 
-> 向量索引（HNSW）由系统在建表后自动创建，无需用户手动执行。
+> 向量索引（HNSW）由系统在建表后自动创建，无需用户手动执行。与旧版定时扫描方案相关的 `scan_interval`、`completion_delay`、`completion_timeout`、`strict`、`sample_interval` 等选项已移除。
 
-## 5. 后台任务设计
+性能管理选项（全局 postgresql.conf 级别，不是 per-table reloptions）：
 
-### 5.1 任务执行流程
+| 选项 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `timeseries.workers` | int | `1` | BG Worker 进程数量，多进程并行处理任务 |
+| `timeseries.max_in_flight` | int | `64` | 每个 Worker 的最大 in_flight 任务数（背压阈值） |
+| `timeseries.trigger_cache_size` | int | `512` | 触发器 LRU 缓存条目数（每个后端进程） |
+
+> 性能选项通过 `postgresql.conf` 设置，`pg_reload_conf()` 动态生效。`timeseries.workers` 需重启 PostgreSQL 生效。
+
+## 5. 触发机制与异步计算设计
+
+### 5.1 总体架构
+
+数据驱动的触发机制由两个核心组件构成：**源表触发器**（同步，轻量）和 **Background Worker**（异步，执行计算）。
 
 ```
-┌─────────────────────────────────────────────────────┐
-│              timeseries_vector_scan()                │
-├─────────────────────────────────────────────────────┤
-│                                                      │
-│  1. 读取 job config                                   │
-│     ├── source_table, vector_table                   │
-│     ├── bucket_interval, carry_columns               │
-│     └── completion_delay, vectorize_function         │
-│                                                      │
-│  2. 查询未处理的完整时间片                              │
-│     ├── 使用 time_bucket 计算时间片                    │
-│     ├── WHERE slice_end < NOW() - completion_delay   │
-│     └── LEFT JOIN 向量表排除已处理的时间片              │
-│                                                      │
-│  3. 遍历每个时间片                                     │
-│     ├── 查询该时间片内的时序数据                        │
-│     ├── 调用向量化函数                                 │
-│     │   ├── ts2v_moment: 时序特征提取                        │
-│     │   └── ft_transformer_embedding: 多列向量化      │
-│     └── INSERT 结果到向量表                           │
-│                                                      │
-│  4. 异常处理                                          │
-│     ├── 单个时间片失败不影响其他时间片                  │
-│     └── 记录错误日志                                   │
-│                                                      │
-└─────────────────────────────────────────────────────┘
+INSERT source_table
+    │
+    ▼
+[AFTER INSERT TRIGGER]  tsvector_trigger
+    │
+    ├── 解析行数据的时间片
+    ├── 查询向量表判断状态
+    ├── pg_notify('tsvector_task', json_payload)  ← 异步通知
+    └── 返回，不阻塞事务
+    │
+    ▼  (异步通道)
+[BACKGROUND WORKER]  tsvector_worker
+    │
+    ├── LISTEN tsvector_task
+    ├── 收到通知 → 解析 JSON
+    ├── delay > 0 ? → 放入延迟队列 : 立即执行
+    ├── 查询源表该时间片数据
+    ├── 数据质量检查（覆盖率、间隙）
+    ├── 调用向量化函数
+    └── INSERT/UPDATE 向量表
 ```
 
-### 5.2 完整性判断逻辑
+### 5.2 触发决策流程（内存缓存优先）
 
-```sql
--- 找出所有未处理的完整时间片
-WITH complete_slices AS (
-    SELECT
-        time_bucket($1, time) AS slice_start,
-        time_bucket($1, time) + $1 AS slice_end,
-        sensor_id, location,  -- CARRY 列
-        count(*) AS row_count,
-        avg(temperature) AS avg_temp,
-        avg(humidity) AS avg_humidity,
-        avg(pressure) AS avg_pressure,
-        min(temperature) AS min_temp,
-        max(temperature) AS max_temp,
-        stddev(temperature) AS std_temp
-    FROM sensor_data
-    WHERE time < NOW() - make_interval(secs => $2)  -- completion_delay（秒）
-    GROUP BY slice_start, sensor_id, location
-)
-SELECT c.* FROM complete_slices c
-LEFT JOIN sensor_vectors v
-    ON c.slice_start = v.slice_start
-    AND c.sensor_id = v.sensor_id
-    AND c.location = v.location
-WHERE v.slice_start IS NULL;  -- 未处理的时间片
+触发器对每一行新插入数据执行以下决策逻辑。关键优化：**先查内存 LRU 缓存，cache miss 才查向量表**。
+
+```
+INPUT: NEW.time, NEW.carry_columns_values
+       + vector_table 配置 (reloptions)
+       + 触发器本地 LRU 缓存 (done_slices_cache)
+
+① 计算时间片
+   curr_slice := time_bucket(bucket_interval, NEW.time)
+   prev_slice  := curr_slice - bucket_interval
+
+② 检查上一时间片状态（规则①）—— 内存优先
+   prev_done := lru_get(cache, prev_slice_key)
+   IF prev_done == -1 THEN          /* cache miss */
+       prev_done := EXISTS(         /* 查向量表 */
+           SELECT 1 FROM vector_table
+           WHERE slice_start = prev_slice
+             AND carry_columns match NEW
+       )
+       lru_put(cache, prev_slice_key, prev_done)
+   
+   IF NOT prev_done THEN
+       pg_notify('tsvector_task', {
+           vector_table: vector_table_name,
+           slice_start:  prev_slice,
+           carry_columns: {col: NEW.col, ...},
+           delay:        0,
+           priority:     "HIGH"
+       })
+       → Worker in_flight 去重：若已在集合则跳过
+
+③ 检查当前时间片状态（规则②③）—— 内存优先
+   curr_done := lru_get(cache, curr_slice_key)
+   IF curr_done == -1 THEN          /* cache miss */
+       curr_done := EXISTS(
+           SELECT 1 FROM vector_table
+           WHERE slice_start = curr_slice
+             AND carry_columns match NEW
+       )
+       lru_put(cache, curr_slice_key, curr_done)
+   
+   IF curr_done AND recompute_on_late_data THEN
+       pg_notify('tsvector_task', {
+           vector_table: vector_table_name,
+           slice_start:  curr_slice,
+           carry_columns: {col: NEW.col, ...},
+           delay:        bucket_interval,
+           priority:     "LOW"
+       })
+       → Worker in_flight 去重：若已在集合则跳过
+   
+   -- IF NOT curr_done → 跳过（规则②）
 ```
 
-### 5.3 向量化计算
+#### 触发决策示例
 
-向量化函数接收时间片内的数据，返回向量。两种支持模式：
+假设 `bucket_interval = 3600`（1 小时），carry_columns = `(sensor_id)`：
 
-#### 模式一：聚合特征向量化（ts2v_moment）
+| 时间 | 新数据 time | curr_slice | prev_slice | 缓存状态 | prev_done | curr_done | 触发动作 |
+|------|------------|------------|------------|---------|-----------|-----------|----------|
+| 09:15 | 09:15 | 09:00 | 08:00 | 全 MISS | ❌ (DB查) | ❌ (DB查) | 规则①：NOTIFY 08:00 HIGH；规则②：跳过 |
+| 09:30 | 09:30 | 09:00 | 08:00 | 全 HIT | ✅ (缓存) | ❌ (缓存) | 规则①：prev_done 已满足；规则②：跳过 |
+| 10:05 | 10:05 | 10:00 | 09:00 | 09:00 MISS | ❌ (DB查) | ❌ (DB查) | 规则①：NOTIFY 09:00 HIGH |
+| 10:30 | 08:45 | 08:00 | 07:00 | 08:00 HIT | ✅ (缓存) | ✅ (缓存) | 规则③：NOTIFY 08:00 **延迟**3600s LOW |
+| 11:00 | 11:00 | 11:00 | 10:00 | 全 HIT | ✅ (缓存) | ❌ (缓存) | 规则①：prev_done 已满足；规则②：跳过 |
 
-```sql
--- ts2v_moment 函数：将时间片的统计特征转为向量
--- 输入：时间片内的聚合数据（均值、标准差、最小值、最大值等）
--- 输出：固定维度的向量
-SELECT ts2v_moment(
-    avg_temp, avg_humidity, avg_pressure,
-    min_temp, max_temp, std_temp,
-    row_count
-);
+> **缓存命中率**：Worker 完成任务后通过 `tsvector_done` 通道广播，所有触发器进程 LISTEN 后更新缓存。因此正常运行时，后续 INSERT 的缓存命中率接近 100%，触发器几乎零 DB 查询。
+
+### 5.3 异步任务消息格式
+
+`pg_notify` 发送的 JSON 消息结构：
+
+```json
+{
+    "vector_table": "sensor_vectors",
+    "slice_start": "2026-09-11T09:00:00+00:00",
+    "carry_columns": {
+        "sensor_id": "S001",
+        "location": "Room-A"
+    },
+    "delay": 0,
+    "recompute": false,
+    "bucket_interval": 3600,
+    "source_table": "sensor_data",
+    "vectorize_function": "ts2v_moment",
+    "vector_column": "embedding",
+    "min_coverage": 0.5,
+    "max_gap": null
+}
 ```
 
-#### 模式二：多列直接向量化（ft_transformer_embedding）
+> 消息中包含计算所需的全部配置（从 reloptions 读取后内联），Worker 收到后无需再次查询 reloptions。
 
-```sql
--- ft_transformer_embedding 函数：将多列数值转为向量
-SELECT ft_transformer_embedding(
-    avg_temp, avg_humidity, avg_pressure
-);
+### 5.4 Background Worker 执行流程
+
+```c
+/*
+ * tsvector_worker - Background Worker 主函数
+ * PostgreSQL 启动时自动 fork，LISTEN tsvector_task
+ */
+Datum
+tsvector_worker_main(void)
+{
+    /* 1. 建立与数据库的连接 */
+    BackgroundWorkerInitializeConnection("postgres", NULL);
+    
+    /* 2. LISTEN */
+    SPI_connect();
+    SPI_execute("LISTEN tsvector_task", false, 0);
+    
+    while (true)
+    {
+        /* 3. 等待消息（带超时，用于检查延迟队列） */
+        if (WaitForLatch(worker_latch, timeout=NextDelayTaskTime() - Now()))
+        {
+            /* 4. 收到 NOTIFY */
+            PopActiveNotifications();
+            foreach (notification, Notifications())
+            {
+                TaskSpec *task = parse_notify_payload(notification->extra);
+                if (task->delay > 0)
+                {
+                    /* 放入延迟队列 */
+                    delay_queue_push(task);
+                }
+                else
+                {
+                    /* 立即执行 */
+                    execute_task(task);
+                }
+            }
+        }
+        
+        /* 5. 检查延迟队列到期任务 */
+        while (delay_queue_has_due_tasks())
+        {
+            TaskSpec *due = delay_queue_pop_due();
+            execute_task(due);
+        }
+    }
+}
+
+/*
+ * execute_task - 执行单个时间片的向量计算
+ */
+void
+execute_task(TaskSpec *task)
+{
+    /* a. 重新计算 slice_end（保证与触发器逻辑一致） */
+    task->slice_end = task->slice_start + task->bucket_interval;
+    
+    /* b. 查询该时间片内的时序数据 */
+    char *query = build_slice_query(task);
+    SPI_execute(query, true, 0);
+    
+    /* c. 数据质量检查 */
+    if (!check_data_quality(task))
+    {
+        elog(LOG, "tsvector: slice %s skipped (coverage/gap check)", task->slice_start);
+        return;
+    }
+    
+    /* d. 调用向量化函数 */
+    Datum vector_result = call_vectorize_function(task);
+    
+    /* e. 写入向量表 */
+    if (task->recompute)
+    {
+        /* 重算：DELETE + INSERT 或 UPDATE */
+        SPI_execute(build_recompute_insert(task, vector_result), false, 0);
+    }
+    else
+    {
+        /* 首次计算：INSERT ON CONFLICT DO NOTHING（幂等） */
+        SPI_execute(build_insert(task, vector_result), false, 0);
+    }
+}
 ```
 
-### 5.4 并发控制
+### 5.5 并发控制
 
-- 后台任务使用 TimescaleDB 的 job 机制，同一 job 不会并发执行
-- 向量表的 INSERT 使用 `ON CONFLICT DO NOTHING` 防止重复插入
-- 支持多任务并行处理不同的源表
+- **触发器层**：每个后端进程独立维护 LRU 缓存和 LISTEN 状态；多个 INSERT 并发执行时，各自独立判断和下发
+- **Worker 层**：
+  - 多个 Worker 进程并发运行（`timeseries.workers` 配置），各自维护独立的 in_flight 集合
+  - 同一条 NOTIFY 会被所有 Worker 收到，但只有第一个将任务加入 in_flight 的 Worker 会执行，其余 Worker 发现已在 in_flight 集合后跳过
+  - 优先级队列保证 HIGH 任务先于 LOW 任务执行
+- **向量表写入**：`ON CONFLICT DO NOTHING`（首次计算）或 `UPDATE`（重算），主键约束保证数据正确性
+- **背压保护**：in_flight 达到 `max_in_flight` 时 Worker 丢弃新任务并广播背压状态，避免内存耗尽
+
+### 5.6 容错与恢复
+
+| 场景 | 处理方式 |
+|------|---------|
+| Worker 进程崩溃 | PostgreSQL 自动重启；内存中的 in_flight 集合和延迟队列丢失；规则①触发的任务会在下次新数据到来时重新下发；规则③的重算任务丢失后等新迟到数据重新触发 |
+| 向量化函数执行失败 | Worker 从 in_flight 移除任务，记录日志；下一条新数据到来时会再次触发规则①重新下发 |
+| 源表被删除 | 触发器函数在 `find_associated_vector_tables()` 中检测不到关联向量表后直接返回；DROP 向量表时自动移除触发器 |
+| 向量表插入冲突 | 首次计算使用 `ON CONFLICT DO NOTHING`（幂等）；重算使用 `UPDATE` 覆盖 |
+| LISTEN 消息丢失（Worker 未连接） | Worker 重连后 LISTEN 不会补收之前的消息；但规则①每次 INSERT 都会重新检查并下发，保证最终一致性 |
+| 触发器缓存不一致 | 每个后端进程有独立 LRU 缓存；Worker 完成后广播 `tsvector_done`，所有触发器 LISTEN 后更新缓存；极端不一致时 cache miss 会 fallback 到 DB 查询 |
+| 背压状态 | Worker in_flight 达到上限 → 丢弃新任务 + 广播 `tsvector_backpressure` → in_flight 降至 80% 以下时自动恢复 |
+| 数据库重启 | BG Worker 随 PostgreSQL 自动启动并 LISTEN；所有内存状态（LRU 缓存、in_flight、延迟队列）丢失，需等新数据触发重新建立 |
+
+### 5.6 可视化概览
+
+> 以下时序图和架构图用于快速理解整体交互流程，与上方 5.1~5.5 详细设计一致。
+
+**触发流程（简化版）**
+
+```mermaid
+sequenceDiagram
+    participant Client as 客户端
+    participant Backend as Backend<br/>(含触发器)
+    participant PGNotify as pg_notify<br/>'tsvector_task'
+    participant BGW as Background Worker
+    participant VectorTable as 向量表
+
+    Client->>Backend: INSERT INTO source_table VALUES (...)
+    Backend->>Backend: tsvector_trigger_func() 执行
+    Note over Backend: 轻量：只发 NOTIFY
+    Backend->>PGNotify: pg_notify('tsvector_task', payload)
+    Backend-->>Client: INSERT 完成 ✅
+    PGNotify->>BGW: 收到 NOTIFY
+    BGW->>BGW: 检查 in_flight 去重
+    BGW->>VectorTable: 发现缺失的时间片
+    BGW->>VectorTable: INSERT...SELECT + ON CONFLICT DO UPDATE
+```
+
+**三规则决策逻辑**
+
+| 规则 | 条件 | 动作 |
+|------|------|------|
+| ① 立即触发 | 上一时间片未完成 | HIGH 优先级 |
+| ② 跳过 | 当前时间片未完成 | 什么都不做（等稳定） |
+| ③ 延迟重算 | 当前时间片已完成 + 迟到数据 | bucket_interval 后 LOW 优先级 |
+
+**异步执行架构**
+
+```mermaid
+flowchart LR
+    subgraph 触发层
+        A[tsvector_trigger_func] -->|pg_notify| B[tsvector_task 通道]
+    end
+    subgraph Worker 层
+        B --> C[Worker 0<br/>in_flight hash]
+        B --> D[Worker 1<br/>in_flight hash]
+        C --> E[轮询发现<br/>缺失时间片]
+        E --> F[execute_task]
+    end
+    subgraph 计算层
+        F --> G[INSERT...SELECT]
+        G --> H[ts2v_moment]
+        H --> I[写入向量表]
+    end
+```
+
+**任务去重三层防护**
+
+| 层级 | 位置 | 机制 |
+|------|------|------|
+| 第 1 层 | Trigger 后端 | LRU 缓存 |
+| 第 2 层 | Worker 内存 | `in_flight` 哈希表 |
+| 第 3 层 | 向量表主键 | `ON CONFLICT DO UPDATE` |
+
+**完整时序图（含 backpressure）**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Backend
+    participant T as tsvector_trigger_func
+    participant N as NOTIFY
+    participant W as BGW tsvector_worker
+    participant V as vector_table
+
+    C->>B: INSERT INTO source_table
+    B->>T: AFTER INSERT trigger fires
+    T->>T: 组装 JSON payload
+    T->>N: pg_notify('tsvector_task', payload)
+    T-->>B: return newtuple
+    B-->>C: COMMIT OK
+
+    Note over W: 500ms 轮询周期
+
+    W->>W: 检查 in_flight
+    W->>W: backpressure 检查
+    W->>V: SELECT 1 WHERE slice_start = ?
+    alt 时间片不存在
+        W->>V: INSERT INTO ... SELECT ts2v_moment(...)
+    else 已存在
+        W->>V: ON CONFLICT DO UPDATE
+    end
+    W->>W: 从 in_flight 移除
+```
+
 
 ## 6. 使用示例
 
@@ -590,15 +1113,14 @@ CREATE TABLE sensor_vectors (
     timeseries.source = 'sensor_data',
     timeseries.bucket_interval = 3600,
     timeseries.carry_columns = 'sensor_id,location',
-    timeseries.vector_len = 384,
-    timeseries.scan_interval = 60,
-    timeseries.completion_delay = 300
+    timeseries.vector_len = 384
 );
 -- 系统自动注入 slice_start, slice_end, sensor_id, location, embedding,
 -- _processed, _data_watermark, _coverage, _row_count, _gap_count, _created_at
 -- 系统自动创建 PRIMARY KEY 和 HNSW 索引
+-- 系统自动为源表注册 tsvector_trigger 触发器
 
--- 4. 手动触发一次计算（不等后台任务）
+-- 4. 手动触发一次计算（可选，数据驱动会自动触发）
 SELECT timeseries_vector_run('sensor_vectors');
 
 -- 5. 查看结果
@@ -633,16 +1155,19 @@ DROP TABLE sensor_vectors;
 src/include/access/reloptions.h        # HEAP_RELOPT_NAMESPACES 增加 "timeseries"
 src/backend/parser/parse_utilcmd.c     # transformCreateStmt() 开头调用 InjectTimeseriesColumns()
 src/backend/commands/tablecmds.c       # DefineRelation()/ATExecSetRelOptions() 旁路存储 timeseries.* reloptions
-src/backend/commands/tsvectorcmds.c    # 列注入核心实现（InjectTimeseriesColumns）
+src/backend/commands/tsvectorcmds.c    # 列注入核心实现（InjectTimeseriesColumns）、触发器自动注册/移除
 src/include/commands/tsvectorcmds.h    # 头文件声明
-contrib/tsvector_funcs/                # 向量化函数与手动触发（ts2v_moment、timeseries_vector_run）
+contrib/tsvector_funcs/                # 向量化函数、触发器函数、Worker 入口
+    ├── tsvector_funcs.c              # ts2v_moment、timeseries_vector_run、tsvector_trigger_func、tsvector_worker_main
+    └── tsvector_funcs--1.0.sql       # CREATE FUNCTION 定义
 ```
 
 > 由于不再引入自定义 DDL 语法，无需修改语法解析器（`gram.y` / `kwlist.h` / `parsenodes.h`），也无需新增命令标签。实现收敛为：
 > 1) 在 `reloptions.h` 注册 `timeseries` 命名空间；
 > 2) 在 `transformCreateStmt()` 中拦截 `CREATE TABLE`，检测 `timeseries.source`，自动注入系统列与主键（必须在 `transformCreateStmt` 而非 `DefineRelation` 中注入，因为主键约束需经约束转换逻辑处理）；
 > 3) 在 `DefineRelation()` / `ATExecSetRelOptions()` 中旁路存储 `timeseries.*` reloptions；
-> 4) `timeseries_vector_run` 从 reloptions 读取配置。
+> 4) 建表成功后自动在源表上注册 `tsvector_trigger`（AFTER INSERT）；
+> 5) 实现 PostgreSQL Background Worker `tsvector_worker`，LISTEN `tsvector_task` 通道并执行异步计算。
 
 ### 7.2 列自动注入与建表流程
 
@@ -651,7 +1176,7 @@ contrib/tsvector_funcs/                # 向量化函数与手动触发（ts2v_m
     │
     ├── 1. Parser 解析为 CreateStmt（tableElts + options）
     │
-    ├── 2. DefineRelation() 前拦截：检测 options 中的 timeseries.source
+    ├── 2. transformCreateStmt() 拦截：检测 options 中的 timeseries.source
     │      ├── 解析 timeseries.* reloptions（source, bucket_interval, carry_columns, vector_len, ...）
     │      ├── 打开源表 relation，读取 carry 列的 attnum 和 atttypid
     │      ├── 构造 ColumnDef 节点：
@@ -666,11 +1191,104 @@ contrib/tsvector_funcs/                # 向量化函数与手动触发（ts2v_m
     │
     ├── 3. 正常执行 DefineRelation()（建表 + 持久化 reloptions 到 pg_class）
     │
-    └── 4. 建表后：自动创建 HNSW 向量索引
-           └── CREATE INDEX ... ON {vec_table} USING hnsw ({vector_col} vector_cosine_ops)
+    ├── 4. 建表后：自动创建 HNSW 向量索引
+    │      └── CREATE INDEX ... ON {vec_table} USING hnsw ({vector_col} vector_cosine_ops)
+    │
+    └── 5. 自动注册源表触发器（与 HNSW 索引同属 extra_stmts，由 ProcessUtility 链式执行）
+           ├── InjectTimeseriesColumns() 在解析 reloptions 时同步构造 CreateTrigStmt
+           │   └── make_timeseries_trigger(source_name) → CreateTrigStmt:
+           │       trigname = "tsvector_trigger"
+           │       relation = source_table (非向量表)
+           │       funcname = tsvector_trigger_func()
+           │       timing/events = TRIGGER_TYPE_AFTER | TRIGGER_TYPE_INSERT
+           │       replace = true  (幂等，重复 CREATE 覆盖)
+           ├── transformCreateStmt() 将 IndexStmt + CreateTrigStmt 追加到返回列表
+           ├── utility.c 的 while 循环:
+           │   └── DefineRelation → CommandCounterIncrement → ProcessUtility(CreateTrigStmt)
+           └── CREATE TRIGGER tsvector_trigger AFTER INSERT ON {source_table}
+                   FOR EACH ROW EXECUTE FUNCTION tsvector_trigger_func()
 ```
 
-列注入核心代码示意：
+列注入核心代码示意（`src/backend/commands/tsvectorcmds.c`）：
+
+```c
+List *
+InjectTimeseriesColumns(CreateStmt *stmt)
+{
+    /* 检测 timeseries.source reloption，若非 timeseries 向量表直接返回 NIL */
+    source_name = tsrelopt_get_string(stmt->options, "source");
+    if (source_name == NULL)
+        return NIL;
+
+    /* ... 解析 bucket_interval / carry_columns / vector_len 等 ... */
+
+    /* 打开源表，校验 carry 列 */
+    source_relid = RangeVarGetRelid(...);
+    source_rel = relation_open(source_relid, AccessShareLock);
+    tupdesc = RelationGetDescr(source_rel);
+
+    /* 构造系统列 + 主键约束，注入到 stmt->tableElts */
+    injected = lappend(injected, make_column_def("slice_start", TIMESTAMPTZOID, ...));
+    injected = lappend(injected, make_column_def("slice_end",   TIMESTAMPTZOID, ...));
+    foreach(lc, carry_names)
+        injected = lappend(injected, make_carry_column_def(...));
+    injected = lappend(injected, make_vector_column_def(...));
+    stmt->tableElts = list_concat(injected, stmt->tableElts);
+
+    /* 构造 extra_stmts：HNSW 索引 + 源表触发器 */
+    extra_stmts = lappend(extra_stmts,
+                          make_timeseries_hnsw_index(stmt->relation, vector_column));
+    extra_stmts = lappend(extra_stmts,
+                          make_timeseries_trigger(source_name));
+    return extra_stmts;
+}
+
+/* 触发器自动注册的核心实现 */
+static CreateTrigStmt *
+make_timeseries_trigger(const char *source_name)
+{
+    CreateTrigStmt *trig = makeNode(CreateTrigStmt);
+    RangeVar   *source_rv = makeRangeVarFromNameList(
+                                  stringToQualifiedNameList(source_name, NULL));
+
+    trig->replace = true;          /* 幂等：CREATE TRIGGER OR REPLACE */
+    trig->isconstraint = false;
+    trig->trigname = pstrdup("tsvector_trigger");
+    trig->relation = copyObject(source_rv);   /* 目标是源表，不是向量表 */
+    trig->funcname = list_make1(makeString("tsvector_trigger_func"));
+    trig->args = NIL;
+    trig->row = true;
+    trig->timing = TRIGGER_TYPE_AFTER;
+    trig->events = TRIGGER_TYPE_INSERT;
+    trig->whenClause = NULL;
+    trig->deferrable = false;
+    trig->initdeferred = false;
+    return trig;
+}
+```
+
+执行链路（`transformCreateStmt()` → `ProcessUtility`）：
+
+```
+transformCreateStmt()
+  ├─ InjectTimeseriesColumns() → list of IndexStmt + CreateTrigStmt
+  │   （此时向量表还没创建，触发器节点也只是内存数据结构）
+  └─ 返回 result list: [CreateStmt, ..., IndexStmt, CreateTrigStmt]
+
+utility.c T_CreateStmt case:
+  while (stmts != NIL):
+    ├─ IsA(CreateStmt)    → DefineRelation() 建表 + CommandCounterIncrement()
+    ├─ IsA(IndexStmt)    → ProcessUtility → index_create() 建 HNSW 索引
+    └─ else              → ProcessUtility(CreateTrigStmt)
+                              → CreateTrigger() 在源表上注册 tsvector_trigger
+```
+
+> **关键设计**：`CreateTrigStmt.funcname` 必须用 `list_make1(makeString("tsvector_trigger_func"))`
+> 而非 `SystemFuncName()`。后者会把函数名放到 `pg_catalog` schema，导致
+> `function pg_catalog.tsvector_trigger_func() does not exist` 报错。触发器需要调用
+> 当前 schema 中的扩展函数。
+
+注入到 stmt->tableElts 后的建表示意（简化版）：
 
 ```c
 /* 在 DefineRelation() 中，解析完 reloptions 后调用 */
@@ -711,63 +1329,141 @@ if (tsv_source != NULL)
 }
 ```
 
-### 7.3 后台任务实现
+### 7.3 触发器函数实现
 
 ```c
 /*
- * timeseries_vector_scan - 后台任务主函数
- * 由 TimescaleDB job scheduler 调用
+ * tsvector_trigger_func - 源表 AFTER INSERT 触发器函数
+ * 对每一行新插入数据，判断所属时间片状态，异步下发计算任务
  */
 Datum
-timeseries_vector_scan(PG_FUNCTION_ARGS)
+tsvector_trigger_func(PG_FUNCTION_ARGS)
 {
-    Jsonb       *config;
-    Oid          source_table;
-    Oid          vector_table;
-    int          bucket_interval;  /* 秒 */
-    char       **carry_columns;
-    int          num_carry;
-    char        *vector_column;
-    Oid          vectorize_func;
-    int          completion_delay;   /* 秒 */
+    EState      *estate;
+    ResultRelInfo *relinfo;
+    Relation     source_rel;
+    Oid          source_oid;
+    List        *vector_tables;      /* 关联的所有向量表 */
+    ListCell    *lc;
+    HeapTuple    newtuple;
+    TimestampTz  row_time;
+    TupleDesc    tupdesc;
+    char        *time_colname;
+    int          bucket_interval;
 
-    /* 1. 从 job config 读取参数 */
-    config = PG_GETARG_JSONB_P(0);
-    parse_vector_scan_config(config, &source_table, &vector_table,
-                             &bucket_interval, &carry_columns, &num_carry,
-                             &vector_column, &vectorize_func,
-                             &completion_delay);
+    /* 1. 获取触发器上下文 */
+    estate = GetTriggerRelinfo();
+    relinfo = trigger_get_resultrelinfo(estate);
+    source_rel = relinfo->ri_RelationDesc;
+    source_oid = RelationGetRelid(source_rel);
+    tupdesc = RelationGetDescr(source_rel);
 
-    /* 2. 查询未处理的完整时间片 */
-    find_complete_unprocessed_slices(source_table, vector_table,
-                                     bucket_interval, carry_columns, num_carry,
-                                     completion_delay);
+    /* 2. 从 pg_class.reloptions 查找所有 timeseries.source = source_oid 的向量表 */
+    vector_tables = find_associated_vector_tables(source_oid);
+    if (list_length(vector_tables) == 0)
+        return PointerGetDatum(NULL);  /* 无关联向量表，直接返回 */
 
-    /* 3. 对每个时间片计算向量并插入 */
-    while (has_next_slice())
+    /* 3. 提取新插入行的时间列值 */
+    time_colname = find_timestamp_column(tupdesc);
+    newtuple = ExecGetTriggerOldTuples(estate);  /* AFTER INSERT, 用 new tuple */
+    row_time = heap_getattr(newtuple,
+                            get_attnum(source_oid, time_colname),
+                            tupdesc);
+
+    /* 4. 对每个关联的向量表执行触发决策 */
+    foreach(lc, vector_tables)
     {
-        SliceInfo  *slice = get_next_slice();
+        VectorTableConfig *cfg = lfirst(lc);
+        TimestampTz curr_slice;
+        TimestampTz prev_slice;
+        bool        prev_done;
+        bool        curr_done;
+        StringInfoData payload;
 
-        /* 查询时间片内的数据 */
-        char *query = build_slice_query(source_table, bucket_interval,
-                                        carry_columns, num_carry, slice);
+        /* a. 计算时间片 */
+        bucket_interval = cfg->bucket_interval;  /* 秒 */
+        curr_slice = time_bucket_simple(row_time, bucket_interval);
+        prev_slice = curr_slice - bucket_interval * USEC_PER_SEC;
 
-        /* 执行查询获取聚合数据 */
-        SPI_execute(query, true, 0);
+        /* b. 规则①：检查上一时间片是否已计算 */
+        prev_done = check_slice_done(cfg->vector_table_oid, prev_slice,
+                                     cfg->carry_columns, newtuple, tupdesc);
+        if (!prev_done)
+        {
+            initStringInfo(&payload);
+            appendStringInfo(&payload,
+                "{\"vector_table\":\"%s\","
+                "\"slice_start\":\"%s\","
+                "\"carry_columns\":%s,"
+                "\"delay\":0,"
+                "\"recompute\":false,"
+                "\"bucket_interval\":%d,"
+                "\"source_table\":\"%s\","
+                "\"vectorize_function\":\"%s\","
+                "\"vector_column\":\"%s\","
+                "\"min_coverage\":%f,"
+                "\"max_gap\":null}",
+                cfg->vector_table_name,
+                timestamptz_to_string(prev_slice),
+                build_carry_columns_json(cfg, newtuple, tupdesc),
+                bucket_interval,
+                cfg->source_table_name,
+                cfg->vectorize_function,
+                cfg->vector_column,
+                cfg->min_coverage);
 
-        /* 调用向量化函数 */
-        Datum vector_result = call_vectorize_function(vectorize_func,
-                                                       SPI_tuptable);
+            /* pg_notify 异步通知，不阻塞事务 */
+            SPI_connect();
+            SPI_execute_with_args(
+                "SELECT pg_notify('tsvector_task', $1)",
+                1, (Oid[]){TEXTOID}, PointerGetDatum(cstring_to_text(payload.data)),
+                false, 0);
+            SPI_finish();
+        }
 
-        /* INSERT 到向量表 */
-        insert_vector_row(vector_table, slice, carry_columns,
-                          num_carry, vector_column, vector_result);
+        /* c. 规则②③：检查当前时间片状态 */
+        curr_done = check_slice_done(cfg->vector_table_oid, curr_slice,
+                                     cfg->carry_columns, newtuple, tupdesc);
+        if (curr_done && cfg->recompute_on_late_data)
+        {
+            initStringInfo(&payload);
+            appendStringInfo(&payload,
+                "{\"vector_table\":\"%s\","
+                "\"slice_start\":\"%s\","
+                "\"carry_columns\":%s,"
+                "\"delay\":%d,"
+                "\"recompute\":true,"
+                "\"bucket_interval\":%d,"
+                "\"source_table\":\"%s\","
+                "\"vectorize_function\":\"%s\","
+                "\"vector_column\":\"%s\","
+                "\"min_coverage\":%f,"
+                "\"max_gap\":null}",
+                cfg->vector_table_name,
+                timestamptz_to_string(curr_slice),
+                build_carry_columns_json(cfg, newtuple, tupdesc),
+                bucket_interval,
+                bucket_interval,
+                cfg->source_table_name,
+                cfg->vectorize_function,
+                cfg->vector_column,
+                cfg->min_coverage);
+
+            SPI_connect();
+            SPI_execute_with_args(
+                "SELECT pg_notify('tsvector_task', $1)",
+                1, (Oid[]){TEXTOID}, PointerGetDatum(cstring_to_text(payload.data)),
+                false, 0);
+            SPI_finish();
+        }
+        /* ELSE: curr_not_done → 跳过（规则②） */
     }
 
-    SPI_finish();
-    PG_RETURN_VOID();
+    PG_RETURN_POINTER(NULL);  /* AFTER INSERT 触发器返回 NULL 表示不修改行 */
 }
 ```
+
+> **性能要点**：触发器仅执行轻量的 EXISTS 查询和 `pg_notify`，不进行实际计算。所有查询通过 SPI 执行，使用参数化查询避免重复解析。对每个关联的向量表最多执行 2 次 EXISTS + 最多 2 次 pg_notify。
 
 ### 7.4 向量化函数 ts2v_moment 设计
 
@@ -823,16 +1519,19 @@ ts2v_moment(PG_FUNCTION_ARGS)
 
 | 场景 | 处理方式 |
 |------|---------|
-| 向量化函数执行失败 | 跳过该时间片，记录日志，下次扫描重试 |
-| 源表被删除 | 后台任务自动停止，发送通知 |
-| 向量表插入冲突 | `ON CONFLICT DO NOTHING`，视为已处理 |
-| 后台任务超时 | TimescaleDB job 机制自动重试 |
-| 数据库重启 | job 机制自动恢复任务 |
+| 向量化函数执行失败 | BG Worker 跳过该时间片，记录日志；下一条新数据到来时会再次触发规则① |
+| 源表被删除 | 触发器函数在 `find_associated_vector_tables()` 中检测不到关联向量表后直接返回；DROP 向量表时自动移除触发器 |
+| 向量表插入冲突 | 首次计算使用 `ON CONFLICT DO NOTHING`（幂等）；重算使用 `UPDATE` 覆盖 |
+| BG Worker 崩溃 | PostgreSQL 自动重启 Worker；延迟队列中的重算任务丢失，但规则①触发的任务会在下次新数据到来时重新下发 |
+| 数据库重启 | BG Worker 随 PostgreSQL 自动启动并 LISTEN；内存中的延迟队列丢失，需等新数据触发 |
+| LISTEN 消息丢失 | Worker 未连接时 pg_notify 发送的消息不会被接收；但规则①每次 INSERT 都会重新检查并下发，保证最终一致性 |
+| 触发器函数执行失败 | 触发器异常会导致 INSERT 事务回滚；触发器内部应最小化异常风险（只做 EXISTS + pg_notify） |
 
 ### 8.2 数据一致性
 
-- 使用事务确保每个时间片的处理是原子的
-- 通过主键 `(slice_start, carry_columns)` 保证幂等性
+- 向量化计算在独立事务中执行，不影响 INSERT 事务
+- 通过主键 `(slice_start, carry_columns)` + `ON CONFLICT DO NOTHING` 保证幂等性
+- 重算使用明确的 UPDATE 语义，保证向量表数据与源表一致
 - 支持手动重新计算指定时间片：
   ```sql
   SELECT timeseries_vector_recompute('sensor_vectors',
@@ -843,20 +1542,58 @@ ts2v_moment(PG_FUNCTION_ARGS)
 
 ### 9.1 索引策略
 
-- 向量表主键：`(slice_start, carry_columns)` — 用于快速查找已处理时间片
+- 向量表主键：`(slice_start, carry_columns)` — 触发器 EXISTS 查询和 Worker 重算的核心索引
 - 向量索引：HNSW 或 IVFFlat — 用于向量相似度搜索
 - 源表时间索引：TimescaleDB 自动分区索引
 
-### 9.2 批处理优化
+### 9.2 触发器性能（热路径分析）
 
-- 每次扫描批量处理多个时间片，减少查询次数
-- 支持配置单次扫描的最大时间片数量
-- 向量化计算使用批量数据获取，减少 SPI 调用开销
+触发器是 INSERT 热路径上的关键组件，设计目标是**绝大多数情况下零 DB 查询**。
 
-### 9.3 内存控制
+| 场景 | 操作 | 预估耗时 |
+|------|------|---------|
+| LRU cache HIT + prev 未完成 | lru_get + pg_notify | ~5μs |
+| LRU cache HIT + prev 已完成 | lru_get（×2） | ~3μs |
+| LRU cache MISS | EXISTS 查询（主键索引） | ~50μs |
 
+> LRU cache MISS 仅出现在后端进程首次使用或 Worker 尚未广播完成事件时。正常运行后命中率 > 99%，触发器对 INSERT 性能的影响可忽略。
+
+### 9.3 性能管理
+
+#### Worker 并发
+
+```sql
+-- postgresql.conf
+timeseries.workers = 4              -- 启动 4 个 Worker 进程
+timeseries.max_in_flight = 64       -- 每个 Worker 最多 64 个 in_flight 任务
+timeseries.trigger_cache_size = 512 -- 每个后端进程 LRU 缓存 512 条
+```
+
+多 Worker 场景下的任务分发：
+- 同一条 NOTIFY 被所有 Worker 收到（pg_notify 广播语义）
+- 每个 Worker 独立检查自己的 in_flight 集合
+- 第一个将任务加入 in_flight 的 Worker 执行，其余 Worker 跳过
+- **注意**：多 Worker 带来的重复检查开销很小（内存哈希查找），换来的是真正的并行执行能力
+
+#### 优先级与背压
+
+- HIGH 任务（规则①，上一时间片立即计算）始终优先于 LOW 任务（规则③，延迟重算）
+- in_flight 达到 `max_in_flight` 时触发背压：丢弃新任务 + 广播 `tsvector_backpressure`
+- in_flight 降至 80% 以下自动恢复
+- 背压是瞬时的，下一条新数据到来时会重新下发被丢弃的任务（规则①重试）
+
+#### 计算资源限制
+
+- 利用 PostgreSQL 的 `work_mem` 限制向量化函数使用的内存
+- 可通过 `max_parallel_workers_per_gather` 限制并行度
+- PG16+ 可使用 Resource Groups 限制 CPU/内存使用
+
+### 9.4 内存控制
+
+- 触发器 LRU 缓存：`trigger_cache_size` × 每条约 100B → 每个后端 ~50KB
+- Worker in_flight 集合：`max_in_flight` × 每条约 200B → 每个 Worker ~12KB
+- Worker 延迟队列：内存最小堆，容量由 bucket_interval 和数据速率决定
 - 向量化函数在内存中处理数据，限制单个时间片的最大数据量
-- 对于大数据量时间片，支持采样或分批处理
 
 ## 10. 兼容性设计
 
@@ -864,9 +1601,10 @@ ts2v_moment(PG_FUNCTION_ARGS)
 
 | 依赖 | 说明 |
 |------|------|
-| TimescaleDB | 提供超表、time_bucket、后台任务调度 |
 | pgvector | 提供向量类型和相似度搜索 |
 | jolix_embedding | 提供 st_embedding、ft_transformer_embedding 函数 |
+
+> **不再强依赖 TimescaleDB**：触发机制使用 PostgreSQL 原生的触发器 + LISTEN/NOTIFY + Background Worker，不需要 TimescaleDB 的 job 调度器。超表（hypertable）作为可选的源表优化，向量表本身也可以是普通表。
 
 ### 10.2 版本兼容
 
@@ -892,23 +1630,45 @@ ts2v_moment(PG_FUNCTION_ARGS)
 | 关联源表校验 | 验证 `timeseries.source` 指向的源表存在且可访问 |
 | 自定义列 | 验证除必需列外，用户可自由新增自定义列且不参与向量计算 |
 | 手动触发计算 | 验证 `timeseries_vector_run` 正确读取 reloptions 并计算向量 |
-| 自动后台计算 | 验证后台任务动态发现向量表并处理完整时间片 |
+| 触发器自动注册 | 验证建表后源表自动创建 `tsvector_trigger` 触发器 |
+| 规则①触发 | 验证新数据到来时上一时间片未计算 → 立即下发 NOTIFY |
+| 规则②跳过 | 验证新数据到来时当前时间片未计算 → 跳过 |
+| 规则③延迟重算 | 验证迟到数据写入已计算的时间片 → 延迟 bucket_interval 下发重算 |
 | 向量相似度搜索 | 验证向量索引和相似度查询正常工作 |
-| 删除向量表 | 验证标准 `DROP TABLE` 删除后后台任务不再扫描该表 |
+| 删除向量表 | 验证 `DROP TABLE` 后源表触发器自动移除 |
 | carry 列处理 | 验证多列 GROUP BY 和主键正确 |
-| 时间片完整性判断 | 验证 completion_delay 机制 |
+| 多向量表关联同一源表 | 验证同一源表上多个向量表的触发器正确处理 |
 
 ### 12.2 边界测试
 
 | 测试项 | 说明 |
 |--------|------|
-| 空时间片 | 源表无数据时，后台任务不报错 |
+| 空时间片 | 源表无数据时，触发器不报错（不关联向量表） |
 | 单行时间片 | 时间片内只有一行数据时正确计算 |
-| 源表删除 | 源表删除后后台任务优雅停止 |
+| 源表删除 | 源表删除后触发器优雅处理（无关联向量表时直接返回） |
 | 大数据量 | 单时间片大量数据时内存控制 |
-| 并发写入 | 源表并发写入时后台任务正常执行 |
+| 并发写入 | 源表并发写入时触发器和 BG Worker 正常工作 |
+| 迟到数据重算 | bucket_interval 之后写入老时间片数据 → 触发延迟重算 |
+| Worker 重启 | 数据库重启后 Worker 自动恢复 LISTEN |
+| 禁用触发器 | `timeseries.enabled = false` 后触发器不触发计算 |
+| 关闭重算 | `timeseries.recompute_on_late_data = false` 后迟到数据不触发重算 |
 
 ## 13. 实现状态
+
+### 13.1 设计变更说明（2026-09-11）
+
+**触发机制重构（2026-09-11）**：原设计采用定时扫描（TimescaleDB add_job），现改为**数据驱动触发**机制：
+
+| 变更项 | 旧设计 | 新设计 |
+|--------|--------|--------|
+| 触发方式 | TimescaleDB add_job 定时扫描 | 源表 AFTER INSERT 触发器 + LISTEN/NOTIFY |
+| 计算执行 | Job 内同步执行 | 独立 Background Worker 异步执行 |
+| 延迟计算 | 无 | 规则③支持 bucket_interval 延迟重算 |
+| 定时扫描 | `timeseries.scan_interval` 选项 | **已移除** |
+| completion_delay | 表选项，定时扫描时等待 | **已移除**（触发机制自动保证数据完整性） |
+| 强依赖 TimescaleDB | 是 | **否**（仅依赖 pgvector） |
+
+保留了 reloptions 配置、列自动注入、HNSW 索引自动创建等核心设计。新增触发器自动注册、BG Worker 异步任务队列等组件。
 
 ### 13.1 设计变更说明（2026-09-10）
 
@@ -927,18 +1687,25 @@ ts2v_moment(PG_FUNCTION_ARGS)
 | 列自动注入 | ✅ 已完成 | `transformCreateStmt()` 中检测 `timeseries.source`，调用 `InjectTimeseriesColumns()` 注入系统列、carry 列、向量列、主键 |
 | HNSW 索引自动创建 | ✅ 已完成 | 建表后在向量列上自动创建 `USING hnsw (... vector_cosine_ops)` 索引 |
 | timeseries_vector_run 改造 | ✅ 已完成 | 已从 `pg_class.reloptions` 读取源表、bucket、vectorize、carry 等配置 |
-| 后台扫描任务 | 🔲 待实现 | 定时扫描并计算向量 |
-| 时间片完整性判断 | 🔲 待实现 | 基于 completion_delay 等质量参数判断时间片完整性 |
-| TimescaleDB 后台任务集成 | 🔲 待实现 | TimescaleDB 可用时通过 add_job 注册定时任务 |
+| **源表触发器自动注册** | ✅ 已完成 | `InjectTimeseriesColumns()` 返回 `CreateTrigStmt`，由 `ProcessUtility` 链式执行（与 HNSW 索引同属 extra_stmts） |
+| **触发器函数** | 🔲 待实现 | `tsvector_trigger_func`：三规则决策 + pg_notify |
+| **Background Worker** | 🔲 待实现 | `tsvector_worker_main`：LISTEN + 延迟队列 + 执行计算 |
+| **延迟队列** | 🔲 待实现 | Worker 内最小堆，按执行时间排序 |
+| DROP 触发器清理 | 🔲 待实现 | `DROP TABLE` 时移除源表上的 tsvector_trigger |
 
 ### 13.3 涉及源码文件（新方案）
 
 | 文件 | 修改内容 |
 |------|----------|
-| `src/backend/commands/tablecmds.c` | 修改 `DefineRelation()`：检测 `timeseries.source` 后调用列注入逻辑 |
-| `src/backend/commands/tsvectorcmds.c` | 注册 `timeseries.*` reloption、列注入逻辑、HNSW 索引自动创建 |
+| `src/include/access/reloptions.h` | HEAP_RELOPT_NAMESPACES 增加 `"timeseries"` |
+| `src/backend/parser/parse_utilcmd.c` | `transformCreateStmt()` 调用 `InjectTimeseriesColumns()` |
+| `src/backend/commands/tablecmds.c` | `DefineRelation()`/`ATExecSetRelOptions()` 旁路存储 timeseries.* reloptions |
+| `src/backend/commands/tsvectorcmds.c` | 列注入、HNSW 索引自动创建、触发器自动注册/移除 |
 | `src/include/commands/tsvectorcmds.h` | 头文件声明 |
-| `contrib/tsvector_funcs/tsvector_funcs.c` | ts2v_moment + timeseries_vector_run（改为从 reloptions 读取配置） |
+| `contrib/tsvector_funcs/tsvector_funcs.c` | ts2v_moment、timeseries_vector_run、tsvector_trigger_func、tsvector_worker_main |
+| `contrib/tsvector_funcs/tsvector_funcs--1.0.sql` | CREATE FUNCTION 定义（新增 trigger 函数和 worker 入口） |
+| `contrib/tsvector_funcs/Makefile` | 新增 `PG_CPPFLAGS -I$(PG_SRC)/src/backend/access/transam` 等 Worker 编译依赖 |
+| `src/backend/utils/activity/pgstat_activity.c` 或 postmaster | 注册 Background Worker（`bgworker.c` 中的 `RegisterBackgroundWorker`） |
 
 > 新方案不再修改 parser / nodes / cmdtag 等语法相关文件；原方案对 `kwlist.h`、`gram.y`、`parsenodes.h`、`cmdtaglist.h`、`utility.c`、`gen_node_support.pl` 的改动一并移除。
 
