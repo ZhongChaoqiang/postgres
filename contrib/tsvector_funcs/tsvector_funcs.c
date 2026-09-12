@@ -838,6 +838,146 @@ ts2v_moment(PG_FUNCTION_ARGS)
 }
 
 /* ====================================================================
+ * parse_comma_list — split a comma-separated string into a List of strings.
+ * Empty entries are skipped. Caller is responsible for pfree'ing each
+ * element and the list itself.
+ * ==================================================================== */
+static List *
+parse_comma_list(const char *s)
+{
+	List	   *result = NIL;
+	const char *p;
+	const char *start;
+
+	if (s == NULL || *s == '\0')
+		return result;
+
+	p = s;
+	while (*p)
+	{
+		/* skip leading whitespace */
+		while (*p == ' ' || *p == '\t')
+			p++;
+		start = p;
+		/* read until comma or end */
+		while (*p && *p != ',')
+			p++;
+		if (p > start)
+			result = lappend(result, pnstrdup(start, p - start));
+		if (*p == ',')
+			p++;
+	}
+	return result;
+}
+
+/* ====================================================================
+ * build_vector_run_query — assemble the INSERT...SELECT query that
+ * populates a timeseries vector table from its source table.
+ *
+ * Column layout matches what InjectTimeseriesColumns() injects:
+ *   slice_start, slice_end, [carry columns...], embedding, _row_count
+ * Primary key: (slice_start, [carry columns...])
+ *
+ * All memory used by this function lives in the SPI context because
+ * appendStringInfo grows the StringInfo's own palloc'd buffer and we
+ * never free intermediate pieces — the returned StringInfo is owned by
+ * the caller who is responsible for pfree(query->data)/pfree(query).
+ * ==================================================================== */
+static StringInfo
+build_vector_run_query(Oid vec_oid, int bucket_interval,
+						int vector_len,
+						const char *source_name,
+						const char *vector_column,
+						List *carry_cols,
+						const char *value_column)
+{
+	StringInfo	q = makeStringInfo();
+	ListCell   *lc;
+
+	if (vector_column == NULL || *vector_column == '\0')
+		vector_column = "embedding";
+
+	if (value_column == NULL || *value_column == '\0')
+		elog(ERROR,
+			 "timeseries.value_column reloption not set; please specify "
+			 "which source column contains the numeric values to aggregate");
+
+	/* --- helper strings built via pstrdup / psprintf (both palloc) --- */
+	StringInfo	vec_col_clause = makeStringInfo();	/* ", carry1, carry2" in target list */
+	StringInfo	grp_clause = makeStringInfo();		/* ", carry1, carry2" in GROUP BY   */
+	StringInfo	pk_clause = makeStringInfo();		/* ", carry1, carry2" in ON CONFLICT */
+	StringInfo	inner_sel = makeStringInfo();		/* inner SELECT expression list      */
+	const char *vec_name = get_rel_name(vec_oid);
+
+	/* comma-separated carry lists */
+	foreach(lc, carry_cols)
+	{
+		const char *c = (const char *) lfirst(lc);
+
+		appendStringInfoChar(vec_col_clause, ',');
+		appendStringInfoChar(grp_clause, ',');
+		appendStringInfoChar(pk_clause, ',');
+		appendStringInfo(vec_col_clause, " %s", c);
+		appendStringInfo(grp_clause, " %s", c);
+		appendStringInfo(pk_clause, " %s", c);
+	}
+
+	/* inner SELECT: time, bucket_epoch, [carries...], value */
+	appendStringInfo(inner_sel,
+					 "time, (EXTRACT(EPOCH FROM time) / %d)::bigint * %d AS bucket_epoch",
+					 bucket_interval, bucket_interval);
+	foreach(lc, carry_cols)
+	{
+		const char *c = (const char *) lfirst(lc);
+		appendStringInfo(inner_sel, ", %s", c);
+	}
+	appendStringInfo(inner_sel, ", %s", value_column);
+
+	/* --- full INSERT ... SELECT --- */
+	appendStringInfo(q,
+		"INSERT INTO %s (slice_start, slice_end%s, %s, _row_count, _processed) "
+		"SELECT "
+		"  (to_timestamp(bucket_epoch))::timestamptz AS slice_start, "
+		"  (to_timestamp(bucket_epoch + %d))::timestamptz AS slice_end"
+		"%s, "
+		"  ts2v_moment(array_agg(%s ORDER BY time), %d) AS embedding, "
+		"  count(*) AS _row_count, "
+		"  true AS _processed "
+		"FROM (SELECT %s FROM %s) sub "
+		"GROUP BY bucket_epoch%s "
+		"ON CONFLICT (slice_start%s) DO UPDATE SET "
+		"  %s = EXCLUDED.%s, "
+		"  _row_count = EXCLUDED._row_count, "
+		"  _processed = true",
+		vec_name,
+		vec_col_clause->data,
+		vector_column,
+		bucket_interval,
+		vec_col_clause->data,
+		value_column,
+		vector_len,
+		inner_sel->data,
+		source_name,
+		grp_clause->data,
+		pk_clause->data,
+		vector_column, vector_column);
+
+	/*
+	 * Free intermediate StringInfo containers. The caller will free q.
+	 * The StringInfo->data buffers are palloc'd in the top-level SPI
+	 * memory context, so they will also be reclaimed when SPI_finish()
+	 * is called — but freeing them explicitly here avoids leaving a
+	 * bunch of unreferenced palloc chunks.
+	 */
+	pfree(vec_col_clause->data); pfree(vec_col_clause);
+	pfree(grp_clause->data);     pfree(grp_clause);
+	pfree(pk_clause->data);      pfree(pk_clause);
+	pfree(inner_sel->data);     pfree(inner_sel);
+
+	return q;
+}
+
+/* ====================================================================
  * timeseries_vector_run — manual trigger for one vector table
  * ==================================================================== */
 
@@ -850,8 +990,13 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 	int			bucket_interval;
 	char	   *source_name;
 	int			vector_len;
+	char	   *vector_column;
+	char	   *carry_str;
+	char	   *value_column;
+	List	   *carry_cols;
 	StringInfo	query;
 	int			ret;
+	int			nrows;
 
 	/* SPI_connect must come BEFORE read_relopt_* which use SPI */
 	SPI_connect();
@@ -859,6 +1004,9 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 	bucket_interval = read_relopt_int(vec_oid, "timeseries.bucket_interval", 3600);
 	source_name = read_relopt_text(vec_oid, "timeseries.source");
 	vector_len = read_relopt_int(vec_oid, "timeseries.vector_len", 384);
+	vector_column = read_relopt_text(vec_oid, "timeseries.vector_column");
+	carry_str = read_relopt_text(vec_oid, "timeseries.carry_columns");
+	value_column = read_relopt_text(vec_oid, "timeseries.value_column");
 
 	if (source_name == NULL)
 	{
@@ -869,31 +1017,30 @@ timeseries_vector_run(PG_FUNCTION_ARGS)
 						get_rel_name(vec_oid))));
 	}
 
-	query = makeStringInfo();
-	appendStringInfo(query,
-		"INSERT INTO %s (slice_start, carry_hash, vector, count) "
-		"SELECT "
-		"  (to_timestamp(bucket_us / 1000000.0))::timestamptz, "
-		"  0, "
-		"  ts2v_moment(array_agg(val1 ORDER BY time), %d), "
-		"  count(*) "
-		"FROM (SELECT time, val1, "
-		"       (EXTRACT(EPOCH FROM time) / %d)::bigint * %d AS bucket_us "
-		"FROM %s) sub "
-		"GROUP BY bucket_us "
-		"ON CONFLICT (slice_start, carry_hash) DO UPDATE SET "
-		"  vector = EXCLUDED.vector, count = EXCLUDED.count",
-		get_rel_name(vec_oid),
-		vector_len,
-		bucket_interval, bucket_interval,
-		source_name);
+	carry_cols = parse_comma_list(carry_str);
+
+	query = build_vector_run_query(vec_oid, bucket_interval, vector_len,
+								   source_name, vector_column,
+								   carry_cols, value_column);
 
 	ret = SPI_execute(query->data, false, 0);
+
+	if (ret < 0)
+	{
+		elog(WARNING, "timeseries_vector_run: SPI_execute failed with code %d", ret);
+		elog(WARNING, "timeseries_vector_run: query was: %s", query->data);
+	}
+
+	nrows = SPI_processed;
+
+	/* cleanup */
 	pfree(query->data);
+	list_free_deep(carry_cols);
 
 	SPI_finish();
 
-	PG_RETURN_BOOL(ret >= 0);
+	/* return the number of rows processed */
+	PG_RETURN_INT32(nrows);
 }
 
 /* ====================================================================

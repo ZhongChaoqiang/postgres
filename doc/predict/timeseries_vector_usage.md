@@ -10,7 +10,7 @@
 
 - [1. 功能简介](#1-功能简介)
 - [2. 快速上手](#2-快速上手)
-  - [2.1 第一步：创建源表](#21-第一步创建源表)
+  - [2.1 第一步：创建源表（TimescaleDB 超表）](#21-第一步创建源表timescaledb-超表)
   - [2.2 第二步：创建向量表](#22-第二步创建向量表)
   - [2.3 写入数据](#23-写入数据)
   - [2.4 手动触发计算](#24-手动触发计算)
@@ -57,11 +57,36 @@
 
 ## 2. 快速上手
 
-### 2.1 第一步：创建源表
+### 2.1 第一步：创建源表（TimescaleDB 超表）
 
-源表就是你已有的时序数据表，支持任意结构：
+本特性主要针对时序数据场景，源表推荐使用 TimescaleDB 的**超表（hypertable）**，它会按时间自动分区，对大批量时序数据有更好的查询性能。
 
 ```sql
+-- 启用 TimescaleDB 扩展（每个数据库执行一次）
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+-- 创建源表：IoT 传感器数据（时间 + 设备 + 指标）
+CREATE TABLE sensor_data (
+    time timestamptz NOT NULL,
+    device_id text NOT NULL,
+    metric_type text NOT NULL,
+    value double precision,
+    location text,
+    PRIMARY KEY (time, device_id, metric_type)
+);
+
+-- 转为 TimescaleDB 超表，按 time 列自动分区（7 天一个 chunk）
+SELECT create_hypertable('sensor_data', 'time',
+                         chunk_time_interval => INTERVAL '7 days');
+
+-- 可选：按 device_id 做二级维度分区，进一步优化多设备查询
+SELECT add_dimension('sensor_data', 'device_id', number_partitions => 4);
+```
+
+如果你的时序数据量较小，也可以使用普通 PostgreSQL 表，功能完全一致：
+
+```sql
+-- 普通 PostgreSQL 表（小数据量场景）
 CREATE TABLE sensor_data (
     time timestamptz NOT NULL,
     device_id text NOT NULL,
@@ -69,27 +94,22 @@ CREATE TABLE sensor_data (
     humidity double precision,
     PRIMARY KEY (time, device_id)
 );
-
--- 可选：配合 TimescaleDB 超表
-SELECT create_hypertable('sensor_data', 'time');
 ```
 
 ### 2.2 第二步：创建向量表
 
-使用标准 `CREATE TABLE ... WITH (...)` 语法，指定 `timeseries.source` 触发自动列注入。也可以先创建空表，再用 `ALTER TABLE SET` 设置 reloptions：
+使用标准 `CREATE TABLE ... WITH (...)` 语法，指定 `timeseries.source` 触发自动列注入。也可以先创建空表，再用 `ALTER TABLE SET` 设置 reloptions。两种方式等价，**方式 A 更简洁**：
 
 ```sql
--- 方式 A: 创建时直接设置（需在 pg_class.c 注册 timeseries 命名空间）
-CREATE TABLE sensor_vector (
-    -- 用户自定义列（可选，也可以完全不声明列）
-) WITH (
+-- 方式 A（推荐）: 创建时直接设置
+CREATE TABLE sensor_vector () WITH (
     timeseries.source = 'sensor_data',
     timeseries.bucket_interval = 3600,
     timeseries.vector_len = 384,
     timeseries.recompute_on_late_data = true
 );
 
--- 方式 B（推荐）: 先建表，再 ALTER 设置
+-- 方式 B: 先建表，再 ALTER 设置
 CREATE TABLE sensor_vector (
     slice_start timestamptz NOT NULL,
     carry_hash integer NOT NULL DEFAULT 0,
@@ -145,10 +165,8 @@ ORDER BY slice_start;
 ### 3.1 创建向量表
 
 ```sql
--- 方式 A: WITH 子句（需注册 timeseries reloption 命名空间）
-CREATE TABLE <vector_table_name> (
-    <自定义列>...
-) WITH (
+-- 方式 A（推荐）: WITH 子句直接创建
+CREATE TABLE <vector_table_name> () WITH (
     timeseries.source = '<source_table>',
     timeseries.bucket_interval = <seconds>,
     timeseries.vector_len = <N>,
@@ -158,7 +176,7 @@ CREATE TABLE <vector_table_name> (
     timeseries.recompute_on_late_data = <bool>
 );
 
--- 方式 B: 先建表再 ALTER（当前推荐）
+-- 方式 B: 先建表再 ALTER SET
 CREATE TABLE <vector_table_name> (
     slice_start timestamptz NOT NULL,
     carry_hash integer NOT NULL DEFAULT 0,
@@ -364,7 +382,13 @@ SELECT count(*) FROM sensor_vector;
 
 ```sql
 -- ====================================================================
--- 1. 创建源表
+-- 0. 启用扩展（TimescaleDB + pgvector + tsvector_funcs）
+-- ====================================================================
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ====================================================================
+-- 1. 创建源表（TimescaleDB 超表）
 -- ====================================================================
 CREATE TABLE iot_sensors (
     time timestamptz NOT NULL,
@@ -375,7 +399,8 @@ CREATE TABLE iot_sensors (
     PRIMARY KEY (time, device_id, metric_type)
 );
 
-SELECT create_hypertable('iot_sensors', 'time');
+SELECT create_hypertable('iot_sensors', 'time',
+                         chunk_time_interval => INTERVAL '7 days');
 
 -- ====================================================================
 -- 2. 创建向量表

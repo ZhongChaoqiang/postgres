@@ -10,9 +10,9 @@ AS 'MODULE_PATHNAME', 'ts2v_moment'
 LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
 -- timeseries_vector_run: manually trigger vector computation for a vector table.
--- Takes the OID of the vector table.
+-- Takes the OID of the vector table. Returns the number of rows inserted/updated.
 CREATE FUNCTION timeseries_vector_run(oid)
-RETURNS boolean
+RETURNS integer
 AS 'MODULE_PATHNAME', 'timeseries_vector_run'
 LANGUAGE C VOLATILE;
 
