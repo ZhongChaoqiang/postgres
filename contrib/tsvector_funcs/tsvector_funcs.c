@@ -21,6 +21,8 @@
 #include <string.h>
 
 #include "access/htup_details.h"
+#include "access/xact.h"
+#include "utils/snapmgr.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_type.h"
@@ -31,6 +33,7 @@
 #include "nodes/value.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
+#include "utils/builtins.h"
 #include "storage/proc.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -62,9 +65,19 @@ typedef struct Vector
 /* ====================================================================
  * GUC parameters
  * ==================================================================== */
-static int	tsvector_workers = 1;
-static int	tsvector_max_in_flight = 64;
-static int	tsvector_trigger_cache_size = 512;
+static int   tsvector_workers = 1;
+static int   tsvector_max_in_flight = 64;
+static int   tsvector_trigger_cache_size = 512;
+
+/* forward declarations (BGW module section appears before helpers) */
+static int run_vector_table(Oid vec_oid);
+static StringInfo build_vector_run_query(Oid vec_oid, int bucket_interval,
+										 int vector_len, const char *source_name,
+										 const char *vector_column,
+										 const char *vectorize_fn,
+										 List *carry_cols,
+										 const char *value_column,
+										 const char *time_column);
 
 static void
 tsvector_define_gucs(void)
@@ -226,53 +239,65 @@ lru_put(LruCache *cache, Oid vec_oid, TimestampTz slice_start,
 }
 
 /* ====================================================================
- * Helper: read reloptions via SPI (portable, works in BGW too)
+ * Helper: read a single relopt from pg_class via its own SPI context.
+ *
+ * Each call opens and closes its own SPI_connect/SPI_finish, so it's
+ * safe to call from inside or outside any caller's SPI context — no
+ * stack nesting and no "non-empty SPI stack" warnings at commit time.
  * ==================================================================== */
 
 static char *
 read_relopt_raw(Oid relid, const char *name)
 {
-	StringInfo	si = makeStringInfo();
+	StringInfo	si;
 	char	   *result = NULL;
+	char		key_prefix[256];
 	int			ret;
-	char		escaped_name[256];
-	char		qbuf[512];
 
-	/*
-	 * Simple approach: build SQL directly using fixed buffers to avoid
-	 * any memory-allocation issues that cause segfaults in SPI context.
-	 * Pattern: "SELECT opt FROM pg_class, LATERAL unnest(reloptions) AS opt
-	 *           WHERE oid = <relid> AND opt LIKE '<name>=%' LIMIT 1"
-	 * The '%' is SQL LIKE wildcard. Single % in SQL string, escaped as %% in C printf.
-	 */
-	snprintf(escaped_name, sizeof(escaped_name), "%s=", name);
+	snprintf(key_prefix, sizeof(key_prefix), "%s=", name);
 
-	/* Build the SQL LIKE pattern with literal % */
-	snprintf(qbuf, sizeof(qbuf), "'%s%%'", escaped_name);
-
+	si = makeStringInfo();
 	appendStringInfo(si,
 		"SELECT opt FROM pg_class, "
 		"LATERAL unnest(reloptions) AS opt "
-		"WHERE oid = %u AND opt LIKE %s "
+		"WHERE oid = %u AND opt LIKE '%s%%' "
 		"LIMIT 1",
-		relid, qbuf);
+		relid, key_prefix);
 
-	ret = SPI_execute(si->data, true, 1);
-	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	if (SPI_connect() == SPI_OK_CONNECT)
 	{
-		char   *opt = SPI_getvalue(SPI_tuptable->vals[0],
-								   SPI_tuptable->tupdesc, 1);
-
-		if (opt)
+		ret = SPI_execute(si->data, true, 1);
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
 		{
-			const char *eq = strchr(opt, '=');
+			char   *opt = SPI_getvalue(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc, 1);
 
-			if (eq)
-				result = pstrdup(eq + 1);
+			if (opt)
+			{
+				const char *eq = strchr(opt, '=');
+
+				if (eq)
+				{
+					/*
+					 * Copy into TopMemoryContext before SPI_finish frees
+					 * the SPI context that pstrdup would otherwise use.
+					 * Without this, the returned pointer becomes dangling
+					 * and may be overwritten by subsequent relopt reads.
+					 */
+					MemoryContext old_ctx = CurrentMemoryContext;
+					MemoryContextSwitchTo(TopMemoryContext);
+					result = pstrdup(eq + 1);
+					MemoryContextSwitchTo(old_ctx);
+				}
+				pfree(opt);
+			}
+			SPI_freetuptable(SPI_tuptable);
 		}
-		SPI_freetuptable(SPI_tuptable);
+		SPI_finish();
 	}
+
 	pfree(si->data);
+	pfree(si);
 	return result;
 }
 
@@ -408,278 +433,146 @@ tsvector_trigger_func(PG_FUNCTION_ARGS)
 }
 
 /* ====================================================================
- * Background Worker structures
+ * Background Worker discovery & execution
+ *
+ * Design: simple poller that scans pg_class for every vector table
+ * (one with a timeseries.source reloption) and calls run_vector_table()
+ * on it. run_vector_table() uses ON CONFLICT DO UPDATE, so repeated
+ * calls are idempotent — we don't need slice-level tracking.
+ *
+ * The trigger still sends pg_notify('tsvector_task', src_oid) as a
+ * low-latency hint; the BGW does LISTEN on that channel so a fresh
+ * insert wakes it up immediately instead of waiting for the poll
+ * interval.
  * ==================================================================== */
-
-typedef struct TaskKey
-{
-	Oid			vec_oid;
-	TimestampTz slice_start;
-	uint32		carry_hash;
-} TaskKey;
-
-typedef struct TaskSpec
-{
-	TaskKey		key;
-	char	   *vector_table_name;
-	int			delay_seconds;
-	bool		recompute;
-	int			bucket_interval;
-} TaskSpec;
-
-typedef struct WorkerState
-{
-	HTAB	   *in_flight;
-	bool		backpressure_active;
-} WorkerState;
-
-static WorkerState worker_state = {0};
 
 /* ====================================================================
- * execute_task: actually run vector computation for one task
+ * execute_task — thin wrapper, kept as a named entry point for clarity.
+ * The actual work is all in run_vector_table().
  * ==================================================================== */
-
 static void
-execute_task(TaskSpec *task)
+execute_task(Oid vec_oid, const char *vec_name)
 {
-	Oid			vec_oid = task->key.vec_oid;
-	int			bucket_interval;
-	char	   *source_name;
-	int			vector_len;
-	StringInfo	query;
-	int			ret;
+	int			nrows = run_vector_table(vec_oid);
 
-	elog(LOG, "tsvector_worker: executing task vec=%s slice=%lld",
-		 task->vector_table_name, (long long) task->key.slice_start);
-
-	SPI_connect();
-
-	bucket_interval = read_relopt_int(vec_oid, "timeseries.bucket_interval", 3600);
-	source_name = read_relopt_text(vec_oid, "timeseries.source");
-	vector_len = read_relopt_int(vec_oid, "timeseries.vector_len", 384);
-
-	if (source_name == NULL)
-	{
-		SPI_finish();
-		elog(WARNING, "tsvector_worker: no source relopt on %s, skipping",
-			 task->vector_table_name);
-		return;
-	}
-
-	query = makeStringInfo();
-	appendStringInfo(query,
-		"INSERT INTO %s (slice_start, carry_hash, vector, count) "
-		"SELECT %lld::timestamptz, %u, "
-		"ts2v_moment(array_agg(val1 ORDER BY time), %d), count(*) "
-		"FROM %s WHERE time >= %lld::timestamptz "
-		"AND time < (%lld::timestamptz + interval '%d seconds') "
-		"ON CONFLICT (slice_start, carry_hash) DO UPDATE SET "
-		"vector = EXCLUDED.vector, count = EXCLUDED.count",
-		task->vector_table_name,
-		(long long) task->key.slice_start, task->key.carry_hash,
-		vector_len,
-		source_name,
-		(long long) task->key.slice_start,
-		(long long) task->key.slice_start, bucket_interval);
-
-	ret = SPI_execute(query->data, false, 0);
-	if (ret < 0)
-		elog(WARNING, "tsvector_worker: SPI_execute failed: %d", ret);
-
-	pfree(query->data);
-	SPI_finish();
+	elog(LOG, "tsvector_worker: processed %s (oid=%u), rows=%d",
+		 vec_name, vec_oid, nrows);
 }
 
 /* ====================================================================
- * BGW main: poll-based approach using a task queue table
+ * BGW main
+ *
+ * Two-phase poller (1s interval):
+ *   Phase 1 — scan pg_class for vec table OIDs, then SPI_finish
+ *   Phase 2 — for each vec_oid, call run_vector_table() which does its
+ *             own SPI_connect/SPI_finish (no nesting)
+ *
+ * Every vec table gets its own clean SPI context; one failing table
+ * (e.g. vec dropped) doesn't break the scan loop.
+ *
+ * BGW transaction/snapshot model:
+ *   PostgreSQL BGWs have no automatic transaction or active snapshot.
+ *   Before any SPI_execute we MUST:
+ *     StartTransactionCommand() + PushActiveSnapshot(GetTransactionSnapshot())
+ *   and after:
+ *     PopActiveSnapshot() + CommitTransactionCommand()
+ *
+ * Note: PostgreSQL does NOT allow LISTEN/NOTIFY inside background
+ * workers, so we use pure polling. The trigger still sends pg_notify
+ * as a hint for any future frontend-based consumer.
  * ==================================================================== */
 
-static void
+PGDLLEXPORT void
 tsvector_worker_main(Datum main_arg)
 {
-	MemoryContext worker_ctx;
-	MemoryContext old_ctx;
-
 	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
 
-	worker_ctx = AllocSetContextCreate(TopMemoryContext, "tsvector_worker",
-									   ALLOCSET_DEFAULT_SIZES);
-	old_ctx = MemoryContextSwitchTo(worker_ctx);
-
-	/* in_flight hash */
-	{
-		HASHCTL		ctl;
-
-		memset(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(TaskKey);
-		ctl.entrysize = sizeof(TaskSpec);
-		ctl.hcxt = worker_ctx;
-		worker_state.in_flight = hash_create("tsvector_in_flight",
-											 tsvector_max_in_flight,
-											 &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	}
-
-	elog(LOG, "tsvector_worker: started (poll-based)");
-
-	/*
-	 * We use a simple approach: poll for pending tasks by checking
-	 * pg_stat_activity for our own trigger output, or better yet,
-	 * use a dedicated queue table that triggers INSERT into.
-	 *
-	 * For now, we do a simple poll: every 500ms connect via SPI
-	 * and check for tasks that need execution. We discover what to compute
-	 * by scanning vector tables for missing slices near "now".
-	 *
-	 * This is a reasonable hybrid: trigger still sends NOTIFY for low-latency
-	 * hints, but the BGW uses polling as the primary discovery mechanism.
-	 */
+	elog(LOG, "tsvector_worker: started, polling for timeseries vector tables");
 
 	while (true)
 	{
-		/* Sleep 500ms */
-		WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-				  500L, WAIT_EVENT_PG_SLEEP);
-		ResetLatch(MyLatch);
+		/* ============================================================
+		 * Phase 1 — discover vec table OIDs (own transaction + SPI)
+		 * ============================================================ */
+		Oid			vec_oids[64];
+		int			n_vecs = 0;
+		int			i;
 
-		/* Backpressure: skip if too many in-flight */
-		if (hash_get_num_entries(worker_state.in_flight) >= tsvector_max_in_flight)
-		{
-			if (!worker_state.backpressure_active)
-			{
-				worker_state.backpressure_active = true;
-				elog(LOG, "tsvector_worker: backpressure active");
-			}
-			continue;
-		}
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 
-		if (worker_state.backpressure_active &&
-			hash_get_num_entries(worker_state.in_flight) <
-			tsvector_max_in_flight * 80 / 100)
-		{
-			worker_state.backpressure_active = false;
-			elog(LOG, "tsvector_worker: backpressure relieved");
-		}
-
-		/* Try to discover pending tasks */
 		SPI_connect();
 		{
-			TimestampTz now = GetCurrentTimestamp();
-			TimestampTz horizon;
 			StringInfo	q = makeStringInfo();
 			int			ret;
 
-			horizon = now - (10 * 60 * 1000000LL);	/* 10 minutes ago */
-
-			/*
-			 * Find source tables that have recent inserts but their vector
-			 * tables don't have the corresponding slice yet.
-			 */
 			appendStringInfo(q,
-				"SELECT vec.relname AS vec_table, "
-				"       src.relname AS src_table, "
-				"       src_stats.last_autovacuum, "
-				"       vec_opts.bucket_interval "
-				"FROM pg_class src "
-				"JOIN pg_stat_user_tables src_stats ON src.oid = src_stats.relid "
-				"JOIN pg_class vec ON vec.reloptions IS NOT NULL "
-				"JOIN LATERAL unnest(vec.reloptions) AS opt "
-				"  ON opt LIKE 'timeseries.source=%%' "
-				"WHERE src_stats.last_autovacuum > %lld "
-				"LIMIT 32",
-				(long long) horizon);
+				"SELECT c.oid FROM pg_class c, LATERAL unnest(c.reloptions) AS opt "
+				"WHERE opt LIKE 'timeseries.source=%%' "
+				"  AND c.relkind = 'r'::char "
+				"LIMIT 64");
 
 			ret = SPI_execute(q->data, true, 0);
+
 			if (ret == SPI_OK_SELECT && SPI_processed > 0)
 			{
-				TupleDesc	spi_tupdesc = SPI_tuptable->tupdesc;
+				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
 				int			t;
 
-				for (t = 0; t < SPI_processed; t++)
+				for (t = 0; t < SPI_processed && n_vecs < 64; t++)
 				{
 					HeapTuple	htup = SPI_tuptable->vals[t];
-					char	   *vec_table;
 					bool		isnull;
-					Oid			vec_oid;
-					int			bucket_interval;
-					TimestampTz curr_slice;
-					TimestampTz prev_slice;
-					uint32		carry_hash = 0;
-					TaskKey		key;
+					Oid			oid;
 
-					vec_table = SPI_getvalue(htup, spi_tupdesc, 1);
-					vec_oid = vec_table ? get_relname_relid(vec_table, InvalidOid) : InvalidOid;
-
-					if (!OidIsValid(vec_oid))
-						continue;
-
-					/* Read bucket_interval from relopts if not in result */
-					bucket_interval = read_relopt_int(vec_oid, "timeseries.bucket_interval", 3600);
-
-					{
-						int64		bucket_us = (int64) bucket_interval * 1000000LL;
-						TimestampTz row_time = now - bucket_us;
-
-						curr_slice = (row_time / bucket_us) * bucket_us;
-						prev_slice = curr_slice - bucket_us;
-					}
-
-					/* Try prev slice */
-					memset(&key, 0, sizeof(key));
-					key.vec_oid = vec_oid;
-					key.slice_start = prev_slice;
-					key.carry_hash = carry_hash;
-
-					if (hash_search(worker_state.in_flight, &key, HASH_FIND, NULL) != NULL)
-						continue;
-
-					{
-						StringInfo	si = makeStringInfo();
-						int			sret;
-
-						appendStringInfo(si,
-							"SELECT 1 FROM %s WHERE slice_start = %lld LIMIT 1",
-							vec_table, (long long) prev_slice);
-
-						sret = SPI_execute(si->data, true, 1);
-						if (sret == SPI_OK_SELECT && SPI_processed == 0)
-						{
-							TaskSpec	task;
-
-							memset(&task, 0, sizeof(task));
-							task.key = key;
-							task.vector_table_name = pstrdup(vec_table);
-							task.bucket_interval = bucket_interval;
-
-							hash_search(worker_state.in_flight,
-										&key, HASH_ENTER, NULL);
-
-							SPI_finish();
-							execute_task(&task);
-							SPI_connect();
-
-							hash_search(worker_state.in_flight,
-										&key, HASH_REMOVE, NULL);
-
-							pfree(task.vector_table_name);
-						}
-						pfree(si->data);
-					}
+					oid = DatumGetObjectId(SPI_getbinval(htup, tupdesc, 1, &isnull));
+					if (!isnull && OidIsValid(oid))
+						vec_oids[n_vecs++] = oid;
 				}
 				SPI_freetuptable(SPI_tuptable);
 			}
-			else if (ret == SPI_OK_SELECT)
-			{
-				/* No results */
-				SPI_freetuptable(SPI_tuptable);
-			}
 			pfree(q->data);
+			pfree(q);
 		}
 		SPI_finish();
-	}
 
-	elog(LOG, "tsvector_worker: shutting down");
-	MemoryContextSwitchTo(old_ctx);
-	MemoryContextDelete(worker_ctx);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		/* --- Phase 1 transaction cleanly closed --- */
+
+		elog(LOG, "tsvector_worker: discovered %d vec tables", n_vecs);
+
+		/* ============================================================
+		 * Phase 2 — run each vec table in its OWN transaction + SPI
+		 * ============================================================ */
+		for (i = 0; i < n_vecs; i++)
+		{
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
+			PG_TRY();
+			{
+				int			nrows = run_vector_table(vec_oids[i]);
+
+				elog(LOG, "tsvector_worker: vec_oid=%u -> %d rows",
+					 vec_oids[i], nrows);
+			}
+			PG_CATCH();
+			{
+				FlushErrorState();
+			}
+			PG_END_TRY();
+
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			/* --- per-table transaction cleanly closed --- */
+		}
+
+		/* ---- sleep 1s, wake early on postmaster death ---- */
+		WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+				  1000L, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+	}
 }
 
 /* ====================================================================
@@ -888,8 +781,10 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 						int vector_len,
 						const char *source_name,
 						const char *vector_column,
+						const char *vectorize_fn,
 						List *carry_cols,
-						const char *value_column)
+						const char *value_column,
+						const char *time_column)
 {
 	StringInfo	q = makeStringInfo();
 	ListCell   *lc;
@@ -897,10 +792,21 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 	if (vector_column == NULL || *vector_column == '\0')
 		vector_column = "embedding";
 
+	if (vectorize_fn == NULL || *vectorize_fn == '\0')
+		vectorize_fn = "ts2v_moment";
+
 	if (value_column == NULL || *value_column == '\0')
 		elog(ERROR,
 			 "timeseries.value_column reloption not set; please specify "
 			 "which source column contains the numeric values to aggregate");
+
+	/* time_column defaults to 'time' if not set — preserves backward compat. */
+	if (time_column == NULL || *time_column == '\0')
+		time_column = "time";
+
+	/* quote_ident for SQL-safety — fn names come from user reloptions */
+	StringInfo	fn_quoted = makeStringInfo();
+	appendStringInfoString(fn_quoted, quote_identifier(vectorize_fn));
 
 	/* --- helper strings built via pstrdup / psprintf (both palloc) --- */
 	StringInfo	vec_col_clause = makeStringInfo();	/* ", carry1, carry2" in target list */
@@ -922,10 +828,17 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 		appendStringInfo(pk_clause, " %s", c);
 	}
 
-	/* inner SELECT: time, bucket_epoch, [carries...], value */
+	/*
+	 * inner SELECT: time, bucket_epoch, [carries...], value
+	 *
+	 * Use FLOOR() to avoid PostgreSQL's double-to-bigint cast rounding
+	 * 496994.5 -> 496995 (ties-away-from-zero rounding). FLOOR gives the
+	 * correct "bucket floor" semantics: every event at or after
+	 * bucket_epoch belongs to that bucket.
+	 */
 	appendStringInfo(inner_sel,
-					 "time, (EXTRACT(EPOCH FROM time) / %d)::bigint * %d AS bucket_epoch",
-					 bucket_interval, bucket_interval);
+					 "%s, FLOOR(EXTRACT(EPOCH FROM %s) / %d)::bigint * %d AS bucket_epoch",
+					 time_column, time_column, bucket_interval, bucket_interval);
 	foreach(lc, carry_cols)
 	{
 		const char *c = (const char *) lfirst(lc);
@@ -940,7 +853,7 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 		"  (to_timestamp(bucket_epoch))::timestamptz AS slice_start, "
 		"  (to_timestamp(bucket_epoch + %d))::timestamptz AS slice_end"
 		"%s, "
-		"  ts2v_moment(array_agg(%s ORDER BY time), %d) AS embedding, "
+		"  %s(array_agg(%s ORDER BY %s), %d) AS embedding, "
 		"  count(*) AS _row_count, "
 		"  true AS _processed "
 		"FROM (SELECT %s FROM %s) sub "
@@ -954,7 +867,9 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 		vector_column,
 		bucket_interval,
 		vec_col_clause->data,
+		fn_quoted->data,
 		value_column,
+			time_column,
 		vector_len,
 		inner_sel->data,
 		source_name,
@@ -973,6 +888,7 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 	pfree(grp_clause->data);     pfree(grp_clause);
 	pfree(pk_clause->data);      pfree(pk_clause);
 	pfree(inner_sel->data);     pfree(inner_sel);
+	pfree(fn_quoted->data);     pfree(fn_quoted);
 
 	return q;
 }
@@ -981,65 +897,125 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
  * timeseries_vector_run — manual trigger for one vector table
  * ==================================================================== */
 
-PG_FUNCTION_INFO_V1(timeseries_vector_run);
-
-Datum
-timeseries_vector_run(PG_FUNCTION_ARGS)
+/* ====================================================================
+ * run_vector_table — shared entry point used by both the SQL function
+ * timeseries_vector_run() and the background worker execute_task().
+ * Reads all reloptions, builds the dynamic INSERT ... SELECT via
+ * build_vector_run_query(), executes it through SPI, and returns the
+ * number of rows affected.
+ *
+ * Caller is responsible for SPI_connect() / SPI_finish() if running
+ * outside a SQL function context; this helper always does its own.
+ * ==================================================================== */
+static int
+run_vector_table(Oid vec_oid)
 {
-	Oid			vec_oid = PG_GETARG_OID(0);
 	int			bucket_interval;
 	char	   *source_name;
 	int			vector_len;
 	char	   *vector_column;
 	char	   *carry_str;
 	char	   *value_column;
+	const char *vectorize_fn;
+	char	   *time_column;
 	List	   *carry_cols;
 	StringInfo	query;
 	int			ret;
-	int			nrows;
+	int			nrows = 0;
+	bool		spi_connected = false;
 
-	/* SPI_connect must come BEFORE read_relopt_* which use SPI */
-	SPI_connect();
-
+	/*
+	 * Read relopts FIRST (each read_relopt_raw call manages its own
+	 * SPI_connect/SPI_finish independently). We must NOT hold an outer
+	 * SPI connection here, because PostgreSQL SPI does not allow nested
+	 * SPI_connect() calls — they return SPI_ERROR_ATTACHED silently.
+	 */
 	bucket_interval = read_relopt_int(vec_oid, "timeseries.bucket_interval", 3600);
 	source_name = read_relopt_text(vec_oid, "timeseries.source");
 	vector_len = read_relopt_int(vec_oid, "timeseries.vector_len", 384);
 	vector_column = read_relopt_text(vec_oid, "timeseries.vector_column");
 	carry_str = read_relopt_text(vec_oid, "timeseries.carry_columns");
 	value_column = read_relopt_text(vec_oid, "timeseries.value_column");
+	vectorize_fn = read_relopt_text(vec_oid, "timeseries.vectorize_function");
+	time_column = read_relopt_text(vec_oid, "timeseries.time_column");
 
-	if (source_name == NULL)
-	{
-		SPI_finish();
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("vector table %s missing 'source' relopt",
-						get_rel_name(vec_oid))));
-	}
+	if (vectorize_fn == NULL || *vectorize_fn == '\0')
+		vectorize_fn = "ts2v_moment";
+
+	if (time_column == NULL || *time_column == '\0')
+		time_column = "time";
+
+	if (source_name == NULL || *source_name == '\0')
+		return 0;
 
 	carry_cols = parse_comma_list(carry_str);
 
 	query = build_vector_run_query(vec_oid, bucket_interval, vector_len,
 								   source_name, vector_column,
-								   carry_cols, value_column);
+								   vectorize_fn,
+								   carry_cols, value_column, time_column);
 
-	ret = SPI_execute(query->data, false, 0);
+	/* Now connect SPI for the INSERT ... SELECT execution */
+	SPI_connect();
+	spi_connected = true;
 
-	if (ret < 0)
+	PG_TRY();
 	{
-		elog(WARNING, "timeseries_vector_run: SPI_execute failed with code %d", ret);
-		elog(WARNING, "timeseries_vector_run: query was: %s", query->data);
+		ret = SPI_execute(query->data, false, 0);
+		nrows = (ret >= 0) ? SPI_processed : 0;
 	}
-
-	nrows = SPI_processed;
-
-	/* cleanup */
-	pfree(query->data);
-	list_free_deep(carry_cols);
+	PG_CATCH();
+	{
+		FlushErrorState();
+		if (spi_connected)
+			SPI_finish();
+		pfree(query->data);
+		pfree(query);
+		list_free_deep(carry_cols);
+		return 0;
+	}
+	PG_END_TRY();
 
 	SPI_finish();
 
-	/* return the number of rows processed */
+	pfree(query->data);
+	pfree(query);
+	list_free_deep(carry_cols);
+
+	return nrows;
+}
+
+/* ====================================================================
+ * timeseries_vector_run — SQL-callable manual trigger
+ * ==================================================================== */
+
+PG_FUNCTION_INFO_V1(timeseries_vector_run);
+
+Datum
+timeseries_vector_run(PG_FUNCTION_ARGS)
+{
+	Oid			vec_oid = PG_GETARG_OID(0);
+	int			nrows;
+
+	/* Validate the table exists and has a timeseries.source relopt */
+	{
+		char	   *source_name;
+		bool		has_source;
+
+		SPI_connect();
+		source_name = read_relopt_text(vec_oid, "timeseries.source");
+		has_source = (source_name != NULL && *source_name != '\0');
+		SPI_finish();
+
+		if (!has_source)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("vector table %s missing 'source' relopt",
+							get_rel_name(vec_oid))));
+	}
+
+	nrows = run_vector_table(vec_oid);
+
 	PG_RETURN_INT32(nrows);
 }
 

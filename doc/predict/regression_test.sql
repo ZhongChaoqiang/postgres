@@ -740,136 +740,211 @@ SELECT label FROM ldm_test_default WHERE name='grape';
 SELECT reloptions FROM pg_class WHERE relname='ldm_test_reg';
 
 -- ================================================================
--- 第11部分: 创建时序向量表 (CREATE TABLE ... WITH timeseries.*) 测试
+-- 第11部分: 时序向量表 (reloptions 方案) + BGW 异步测试
 -- ================================================================
 \echo '============================================================'
-\echo '第11部分: 创建时序向量表测试'
+\echo '第11部分: 时序向量表 + BGW 异步触发'
 \echo '============================================================'
 
-\echo '--- 11.1 创建源时序表 ---'
-DROP TABLE IF EXISTS tsvec_source CASCADE;
-DROP TABLE IF EXISTS tsvec_result CASCADE;
+\echo '--- 11.1 确认 BGW 已加载 (需 shared_preload_libraries=tsvector_funcs) ---'
+SELECT name, setting, unit FROM pg_settings
+WHERE name = 'shared_preload_libraries';
 
-CREATE TABLE tsvec_source (
-    time TIMESTAMPTZ NOT NULL,
-    device_id TEXT NOT NULL,
-    temperature DOUBLE PRECISION,
-    humidity DOUBLE PRECISION
+\echo '--- 11.2 确认 BGW 进程在运行 ---'
+SELECT pid, state, query
+FROM pg_stat_activity
+WHERE backend_type LIKE '%worker%'
+  AND query LIKE '%tsvector_worker%';
+
+\echo '--- 11.3 创建源表（hypertable 可选）---'
+DROP TABLE IF EXISTS tsvec_src CASCADE;
+CREATE TABLE tsvec_src (
+    time  TIMESTAMPTZ NOT NULL,
+    k     TEXT,
+    v     DOUBLE PRECISION
 );
-INSERT INTO tsvec_source VALUES
-('2025-01-01 00:00:00', 'dev1', 20.5, 45.0),
-('2025-01-01 00:30:00', 'dev1', 21.0, 44.5),
-('2025-01-01 01:00:00', 'dev1', 21.5, 44.0),
-('2025-01-01 01:30:00', 'dev1', 22.0, 43.5);
+-- 如果已装 TimescaleDB: SELECT create_hypertable('tsvec_src', 'time');
 
-\echo '--- 11.2 创建时序向量表（系统列自动注入）---'
-CREATE TABLE tsvec_result () WITH (
-    timeseries.source = 'tsvec_source',
-    timeseries.bucket_interval = 3600,
-    timeseries.carry_columns = 'device_id',
-    timeseries.vectorize_function = 'ts2v_moment',
-    timeseries.vector_column = 'embedding',
-    timeseries.vector_len = 384
-);
-
-\echo '--- 11.3 验证向量表结构 ---'
-SELECT a.attname, format_type(a.atttypid, a.atttypmod) as type, a.attnotnull
-FROM pg_catalog.pg_attribute a
-WHERE a.attrelid = 'tsvec_result'::regclass AND a.attnum > 0 AND NOT a.attisdropped
-ORDER BY a.attnum;
-
-\echo '--- 11.4 验证索引 ---'
-SELECT c.relname as index_name, pg_get_indexdef(c.oid) as index_def
-FROM pg_catalog.pg_index i
-JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
-WHERE i.indrelid = 'tsvec_result'::regclass;
-
-\echo '--- 11.5 验证触发器自动注册 ---'
-SELECT tgname, tgrelid::regclass as relname, tgenabled,
-       pg_get_triggerdef(oid) as trigger_def
-FROM pg_trigger
-WHERE tgrelid = 'tsvec_source'::regclass
-  AND tgname = 'tsvector_trigger';
-
-\echo '--- 11.6 验证 reloptions 元数据 ---'
-SELECT relname, reloptions
-FROM pg_class
-WHERE relname = 'tsvec_result';
-
-\echo '--- 11.7 测试 IF NOT EXISTS ---'
-CREATE TABLE IF NOT EXISTS tsvec_result () WITH (
-    timeseries.source = 'tsvec_source',
-    timeseries.bucket_interval = 3600,
-    timeseries.carry_columns = 'device_id',
-    timeseries.vectorize_function = 'ts2v_moment',
-    timeseries.vector_column = 'embedding',
-    timeseries.vector_len = 384
+\echo '--- 11.4 创建向量表（手动定义列 + reloptions）---'
+DROP TABLE IF EXISTS tsvec_vec CASCADE;
+CREATE TABLE tsvec_vec (
+    slice_start  TIMESTAMPTZ,
+    slice_end    TIMESTAMPTZ,
+    k            TEXT,
+    embedding    vector(3),
+    _row_count   BIGINT,
+    _processed   BOOL DEFAULT FALSE,
+    PRIMARY KEY (slice_start, k)
 );
 
-\echo '--- 11.8 测试重复创建（应报错）---'
-CREATE TABLE tsvec_result () WITH (
-    timeseries.source = 'tsvec_source',
-    timeseries.bucket_interval = 3600,
-    timeseries.carry_columns = 'device_id',
-    timeseries.vectorize_function = 'ts2v_moment',
-    timeseries.vector_column = 'embedding',
-    timeseries.vector_len = 384
-);
+-- 注入 reloptions (UPDATE pg_class 是最稳妥的方式)
+UPDATE pg_class
+   SET reloptions = ARRAY[
+        'timeseries.source=tsvec_src',
+        'timeseries.bucket_interval=3600',
+        'timeseries.vector_len=3',
+        'timeseries.vector_column=embedding',
+        'timeseries.carry_columns=k',
+        'timeseries.value_column=v'
+     ]
+ WHERE relname = 'tsvec_vec'
+   AND relnamespace = 'public'::regnamespace;
 
-\echo '--- 11.9 测试多个carry列 ---'
-DROP TABLE IF EXISTS tsvec_result2 CASCADE;
-CREATE TABLE tsvec_result2 () WITH (
-    timeseries.source = 'tsvec_source',
-    timeseries.bucket_interval = 1800,
-    timeseries.carry_columns = 'device_id,temperature,humidity',
-    timeseries.vectorize_function = 'ts2v_moment',
-    timeseries.vector_column = 'vec',
-    timeseries.vector_len = 256
-);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'tsvec_vec';
 
-SELECT a.attname, format_type(a.atttypid, a.atttypmod) as type
-FROM pg_catalog.pg_attribute a
-WHERE a.attrelid = 'tsvec_result2'::regclass AND a.attnum > 0 AND NOT a.attisdropped
-ORDER BY a.attnum;
+\echo '--- 11.5 验证 BGW 能发现 vec 表 ---'
+SELECT c.oid, c.relname
+FROM pg_class c, LATERAL unnest(c.reloptions) AS opt
+WHERE opt LIKE 'timeseries.source=%';
 
-\echo '--- 11.10 ts2v_moment 函数 - 基本向量化（moment 算法）---'
-SELECT ts2v_moment(ARRAY[1.0, 2.0, 3.0]::float8[], 4) AS basic_vec;
--- 预期: [0.6666667, 0.44948974, 0, 0.6]
--- (4 维: 均值/标准差/偏度=0(对称)/峰度=1.5 的 soft-sign 归一化)
+\echo '--- 11.6 基线：手动跑一次 timeseries_vector_run ---'
+-- 10:00, 10:15, 10:30 的 A 数据 + 10:45 的 B
+-- FLOOR 语义: 10:00,10:15,10:30,10:45 全属于 10:00 bucket
+INSERT INTO tsvec_src (time, k, v) VALUES
+    ('2026-09-12 10:00:00+08', 'A', 1.0),
+    ('2026-09-12 10:15:00+08', 'A', 2.0),
+    ('2026-09-12 10:30:00+08', 'A', 3.0),
+    ('2026-09-12 10:45:00+08', 'B', 4.0);
 
-\echo '--- 11.11 ts2v_moment 函数 - 相同值（range=0）---'
-SELECT ts2v_moment(ARRAY[5.0, 5.0, 5.0]::float8[], 3) AS same_val_vec;
--- 预期: [0.8333333, 0, 0] (常量序列: 均值特征 + 高阶矩为 0)
+SELECT timeseries_vector_run('tsvec_vec'::regclass) AS run_rows;
 
-\echo '--- 11.12 ts2v_moment 函数 - 默认维度384 ---'
+-- Bug #1 回归: 10:30 必须在 10:00 bucket (不是 ROUND 到 11:00)
+-- 所以 A 的 _row_count 应该是 3 (10:00, 10:15, 10:30)
+SELECT slice_start, k, vector_dims(embedding) AS dims, _row_count
+FROM tsvec_vec ORDER BY slice_start, k;
+
+\echo '--- 11.6a Bug#1 FLOOR 验证: 10:30 必须在 10:00 bucket ---'
+SELECT 
+  'bucket FLOOR check' AS test,
+  COUNT(*) FILTER (WHERE k = 'A' AND slice_start = '2026-09-12 10:00:00+08' AND _row_count = 3) AS pass,
+  COUNT(*) FILTER (WHERE k = 'A' AND slice_start = '2026-09-12 11:00:00+08') AS wrong_bucket;
+-- 预期 pass=1, wrong_bucket=0
+
+SELECT
+  'FLOOR vs ROUND' AS method,
+  FLOOR(EXTRACT(EPOCH FROM TIMESTAMP '2026-09-12 10:30:00+08')/3600)::bigint*3600 AS floor_epoch,
+  (EXTRACT(EPOCH FROM TIMESTAMP '2026-09-12 10:30:00+08')/3600)::bigint*3600 AS round_epoch;
+-- 预期 floor_epoch = round_epoch-3600 (FLOOR 正确, ROUND 会多跳 1 小时)
+
+\echo '--- 11.7 BGW 异步触发：插入新行，等 BGW 自动处理 ---'
+INSERT INTO tsvec_src (time, k, v) VALUES
+    ('2026-09-12 10:50:00+08', 'C', 5.0),
+    ('2026-09-12 11:00:00+08', 'D', 6.0),
+    ('2026-09-12 11:15:00+08', 'A', 7.0);
+
+-- BGW poll 间隔 1s，等 5s 足够多轮
+SELECT pg_sleep(5);
+
+SELECT slice_start, k, vector_dims(embedding) AS dims, _row_count
+FROM tsvec_vec ORDER BY slice_start, k;
+
+\echo '--- 11.8 验证 BGW 日志（应有 "vec_oid=... -> N rows"）---'
+-- 需在服务器上查看: tail -f /var/log/postgresql/postgresql-18-main.log | grep tsvector_worker
+\echo '--- 11.9 幂等性：再次手动跑，ON CONFLICT DO UPDATE ---'
+SELECT timeseries_vector_run('tsvec_vec'::regclass) AS run_again;
+SELECT _row_count FROM tsvec_vec ORDER BY slice_start, k;
+
+\echo '--- 11.10 ts2v_moment 函数测试 ---'
+SELECT ts2v_moment(ARRAY[1.0, 2.0, 3.0]::float8[], 3) AS basic_vec;
+SELECT vector_dims(ts2v_moment(ARRAY[1.0, 2.0, 3.0]::float8[], 4)) AS dims_4;
 SELECT vector_dims(ts2v_moment(ARRAY[1.0, 2.0]::float8[])) AS default_dims;
--- 预期: 384
 
-\echo '--- 11.13 ts2v_moment 函数 - 空数组报错 ---'
-SELECT ts2v_moment(ARRAY[]::float8[], 4);
+\echo '--- 11.11 timeseries_vector_search 相似度搜索测试 ---'
+-- 先确保目标向量表有数据
+SELECT count(*) AS tsvec_count FROM tsvec_vec;
 
-\echo '--- 11.14 ts2v_moment 函数 - NULL输入报错 ---'
-SELECT ts2v_moment(NULL::float8[], 4);
+-- 测试1: 基本相似度搜索（指定 carry_filter）
+\echo '--- 11.11.1 指定 carry_filter 搜索 ---'
+SELECT slice_start_out, slice_end_out, round(cosine_distance::numeric, 6) AS cos_dist
+FROM timeseries_vector_search('tsvec_vec', '2026-09-16 00:00:00+00', 'k = ''1''', 3);
 
-\echo '--- 11.15 timeseries_vector_run 手动触发 ---'
--- 使用11.1创建的tsvec_source和tsvec_result表
-DELETE FROM tsvec_result;
-SELECT timeseries_vector_run('tsvec_result') AS run1;
--- 预期: Processed 2 time slice(s) (2个1小时时间片)
+-- 测试2: 不指定 carry_filter（跨 carry 值搜索）
+\echo '--- 11.11.2 无 carry_filter 跨值搜索 ---'
+SELECT slice_start_out, slice_end_out, round(cosine_distance::numeric, 6) AS cos_dist
+FROM timeseries_vector_search('tsvec_vec', '2026-09-16 00:00:00+00', NULL, 5);
 
-\echo '--- 11.16 验证向量表数据 ---'
-SELECT slice_start, slice_end, device_id,
-       vector_dims(embedding) AS dims,
-       (embedding IS NOT NULL) AS has_vec
-FROM tsvec_result
-ORDER BY slice_start, device_id;
+-- 测试3: 非对齐时间戳自动对齐（如 10:30:45 -> 10:00:00）
+\echo '--- 11.11.3 非对齐时间戳自动对齐 ---'
+SELECT slice_start_out, slice_end_out, round(cosine_distance::numeric, 6) AS cos_dist
+FROM timeseries_vector_search('tsvec_vec', '2026-09-16 00:30:45+00', 'k = ''1''', 3);
 
-\echo '--- 11.17 timeseries_vector_run 幂等性 ---'
-SELECT timeseries_vector_run('tsvec_result') AS run2;
--- 预期: Processed 0 time slice(s) (ON CONFLICT DO NOTHING)
+-- 测试4: 搜索未计算向量的时间片（期望返回空集）
+\echo '--- 11.11.4 未计算向量的时间片返回空 ---'
+SELECT count(*) AS empty_result_count
+FROM timeseries_vector_search('tsvec_vec', '2099-01-01 00:00:00+00', 'k = ''1''', 5);
 
-\echo '--- 11.18 timeseries_vector_run 不存在的表 ---'
-SELECT timeseries_vector_run('nonexistent_tsvec_table');
+-- 测试5: 验证返回的 slice 是自排除的（目标 slice 不应出现在结果中）
+\echo '--- 11.11.5 目标 slice 自排除验证 ---'
+SELECT count(*) AS self_excluded_count FROM (
+    SELECT slice_start_out FROM timeseries_vector_search(
+        'tsvec_vec', '2026-09-16 00:00:00+00', 'k = ''1''', 100
+    )
+) sub WHERE slice_start_out = '2026-09-16 00:00:00+00'::timestamptz;
+
+-- 测试6: 不存在的表应报错
+\echo '--- 11.11.6 不存在的表报错验证 ---'
+DO $$
+BEGIN
+    PERFORM * FROM timeseries_vector_search('nonexistent_table', now(), NULL, 5);
+    RAISE NOTICE 'FAIL: should have raised exception';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'OK: got expected error: %', SQLERRM;
+END $$;
+
+\echo '--- 11.12 向量嵌套表 + ts2v_pool 测试 ---'
+-- 先用 tsvec_vec 做一层 source，建 tsvec_vec2
+\echo '--- 11.12.1 建二级向量表 tsvec_vec2（tsvec_vec → tsvec_vec2） ---'
+DROP TABLE IF EXISTS tsvec_vec2 CASCADE;
+CREATE TABLE tsvec_vec2 () WITH (
+    timeseries.source              = 'tsvec_vec',
+    timeseries.time_column         = 'slice_start',
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',
+    timeseries.vectorize_function = 'ts2v_pool',
+    timeseries.vector_len          = 3
+);
+
+\echo '--- 11.12.2 跑二级向量化 ---'
+SELECT timeseries_vector_run('tsvec_vec2'::regclass) AS vec2_rows;
+
+\echo '--- 11.12.3 验证 ts2v_pool avg 聚合与手动 avg 一致 ---'
+SELECT
+    count(*) AS vec2_count,
+    (SELECT round((embedding <=> (SELECT avg(embedding) FROM tsvec_vec WHERE k='1'))::numeric, 6)
+       FROM tsvec_vec2 WHERE k='1' ORDER BY slice_start LIMIT 1) AS match_err;
+-- match_err 应为 0，验证 ts2v_pool 结果 = 手动 avg
+
+\echo '--- 11.12.4 在二级向量表上跑相似度搜索 ---'
+SELECT slice_start_out, round(cosine_distance::numeric, 6) AS dist
+FROM timeseries_vector_search('tsvec_vec2', '2026-09-16 00:00:00+00', 'k = ''1''', 3);
+
+\echo '--- 11.12.5 错误路径：未配 vectorize_function（应返回 0 行，不崩溃） ---'
+DROP TABLE IF EXISTS tsvec_vec_bad CASCADE;
+CREATE TABLE tsvec_vec_bad () WITH (
+    timeseries.source          = 'tsvec_vec',
+    timeseries.time_column     = 'slice_start',
+    timeseries.bucket_interval = 7200,
+    timeseries.value_column    = 'embedding',
+    timeseries.vector_len      = 3
+    -- 忘了配 vectorize_function
+);
+SELECT timeseries_vector_run('tsvec_vec_bad'::regclass) AS vec_bad_rows;
+-- 期望 0 行，不崩溃
+
+\echo '--- 11.12.6 错误路径：未配 time_column（默认 time，应返回 0 行） ---'
+DROP TABLE IF EXISTS tsvec_vec_bad2 CASCADE;
+CREATE TABLE tsvec_vec_bad2 () WITH (
+    timeseries.source              = 'tsvec_vec',
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',
+    timeseries.vectorize_function = 'ts2v_pool',
+    timeseries.vector_len          = 3
+    -- 忘了配 time_column
+);
+SELECT timeseries_vector_run('tsvec_vec_bad2'::regclass) AS vec_bad2_rows;
+-- 期望 0 行，因为 tsvec_vec 没有 'time' 列
 
 -- ================================================================
 -- 第12部分: 清理
@@ -897,9 +972,11 @@ DROP TABLE IF EXISTS ldm_test_anom CASCADE;
 DROP TABLE IF EXISTS ldm_test_ext CASCADE;
 DROP TABLE IF EXISTS ldm_test_empty CASCADE;
 DROP TABLE IF EXISTS ldm_test_default CASCADE;
-DROP TABLE IF EXISTS tsvec_result CASCADE;
-DROP TABLE IF EXISTS tsvec_result2 CASCADE;
-DROP TABLE IF EXISTS tsvec_source CASCADE;
+DROP TABLE IF EXISTS tsvec_vec CASCADE;
+DROP TABLE IF EXISTS tsvec_src CASCADE;
+DROP TABLE IF EXISTS tsvec_vec2 CASCADE;
+DROP TABLE IF EXISTS tsvec_vec_bad CASCADE;
+DROP TABLE IF EXISTS tsvec_vec_bad2 CASCADE;
 DROP SCHEMA IF EXISTS test_schema CASCADE;
 
 SELECT clear_predict_history();

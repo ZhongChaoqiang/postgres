@@ -15,7 +15,7 @@
 - **数据驱动触发**：新数据 INSERT 时异步触发向量计算任务，不再依赖定时扫描
 - 向量表记录时间片元数据（开始时间、结束时间）和源表属性列
 - 计算任务与时序数据插入**完全异步解耦**，不影响写入性能
-- 支持向量相似度查询，快速检索相似的时间片段
+- 提供 `timeseries_vector_search` 封装函数：按 bucket 对齐 + 自动判定目标向量存在性 + 向量相似度排序 + 可选 carry_filter 过滤，用户只需传入目标时间片起始点即可
 
 ### 1.3 典型应用场景
 
@@ -90,7 +90,9 @@ CREATE TABLE vector_table_name (
 | 选项 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `timeseries.source` | text | ✅ | — | 关联的原始时序表（源表）名称。存在即触发系统列自动注入 |
+| `timeseries.time_column` | text | — | `time` | 源表中表示时间的列名。默认 `time`，把向量表当下一级源表时需设为 `slice_start` |
 | `timeseries.bucket_interval` | int | ✅ | — | 时间片间隔（秒），如 `3600`（1 小时） |
+| `timeseries.value_column` | text | ✅ | — | 源表中用于向量化聚合的数值列名（如 `value`、`_row_count`） |
 | `timeseries.vector_len` | int | — | `384` | 向量维度，决定向量列 `vector(N)` 的 N |
 | `timeseries.vectorize_function` | text | — | `ts2v_moment` | 向量化函数名 |
 | `timeseries.vector_column` | text | — | `embedding` | 向量列名 |
@@ -178,6 +180,61 @@ ALTER TABLE vector_table_name SET (timeseries.bucket_interval = 1800);
 - 表选项（reloptions）是 PostgreSQL 表自带的存储机制，`ALTER TABLE ... SET/RESET` 由内核自动处理，无需自定义语法解析。
 - 触发器函数每次触发时动态读取 reloptions，因此修改后无需重建触发器。
 - 所有配置统一保存在 reloptions 中，不再维护独立的元数据表（见 3.3 节）。
+
+### 2.5 向量相似度搜索
+
+为避免用户手写 bucket 对齐逻辑和向量查询 SQL，系统提供 `timeseries_vector_search` 封装函数，一键完成"给定一个目标时间片，返回 Top-N 相似时间片"的搜索。
+
+**函数签名**：
+
+```sql
+timeseries_vector_search(
+    vec_table          text,           -- 向量表名，如 'sensor_vectors'
+    target_slice_start timestamptz,    -- 目标时间片起点，自动对齐到 bucket 边界
+    carry_filter       text DEFAULT NULL,   -- 可选 carry 列过滤条件，如 'device_id = 123'
+    top_n              int  DEFAULT 10     -- 返回 Top-N 相似时间片
+) RETURNS TABLE (
+    slice_start_out   timestamptz,
+    slice_end_out     timestamptz,
+    cosine_distance   float8
+)
+```
+
+**核心行为**：
+
+1. **自动 bucket 对齐**：从 reloptions 读取 `timeseries.bucket_interval`，用 `FLOOR(epoch / bucket) * bucket` 将 `target_slice_start` 对齐到 bucket 边界。即使用户传入 `10:30:45+00`，也会自动对齐到 `10:00:00+00`。
+2. **向量存在性检查**：先按对齐后的 `slice_start` + 可选 `carry_filter` 在向量表中查找 `_processed IS TRUE OR _processed IS NULL` 的 embedding。若不存在，**直接返回空集**（不执行搜索、不报错）。
+3. **相似度排序**：用 pgvector `<=>` 余弦距离算子 + 自动创建的 HNSW 索引，对目标向量做 Top-N 近似最近邻搜索。
+4. **自排除**：结果集中自动排除目标时间片本身（`slice_start <> target_bucket_start`）。
+5. **carry_filter 可选**：不传时跨 carry 值搜索；传入时等价于在 WHERE 里加 `AND (<carry_filter>)`。
+
+**使用示例**：
+
+```sql
+-- 跨 carry 值搜索：找 10:00 这个 bucket 下全量最相似的其它时间片
+SELECT * FROM timeseries_vector_search('sensor_vectors', '2026-01-01 10:00:00+00', NULL, 5);
+
+-- 限定同一个 device_id
+SELECT * FROM timeseries_vector_search('sensor_vectors', '2026-01-01 10:30:45+00', 'device_id = 123', 10);
+-- 注意：10:30:45 会自动对齐到 10:00:00 bucket
+
+-- 查询尚未计算向量的时间片（期望返回空集，而不是报错）
+SELECT * FROM timeseries_vector_search('sensor_vectors', '2099-01-01 00:00:00+00', NULL, 5);
+```
+
+**实现位置**：`contrib/tsvector_funcs/tsvector_funcs--1.0.sql` 中的 PL/pgSQL 函数，无需 C 扩展逻辑变更。核心 SQL 逻辑：
+
+```sql
+-- 搜索查询（动态拼出，参数化避免 SQL 注入）
+SELECT slice_start, slice_end, (%I <=> $1) AS cosine_distance
+FROM %s
+WHERE slice_start <> $2
+  [AND (<carry_filter>)]
+ORDER BY %I <=> $1
+LIMIT <top_n>
+```
+
+其中 `%I` 为从 reloptions 读取的 `timeseries.vector_column`（默认 `embedding`），动态查询中的字面量（`top_n`、`vec_table`）均用 `quote_identifier` 包裹。
 
 ## 3. 架构设计
 
@@ -1129,12 +1186,11 @@ SELECT slice_start, slice_end, sensor_id, location,
 FROM sensor_vectors
 ORDER BY slice_start;
 
--- 6. 向量相似度搜索：找最相似的时间片
-SELECT slice_start, slice_end, sensor_id, location,
-       embedding <=> target_embedding AS distance
-FROM sensor_vectors
-ORDER BY embedding <=> target_embedding
-LIMIT 5;
+-- 6. 向量相似度搜索：找最相似的时间片（用 timeseries_vector_search 封装函数）
+SELECT slice_start_out, slice_end_out, cosine_distance
+FROM timeseries_vector_search('sensor_vectors', '2026-01-01 00:00:00+00', NULL, 5);
+-- 注：不传 carry_filter 时跨 device 搜索；传入时如 'device_id = ''S001''' 则只在该设备内比较
+--    若目标 bucket 未计算向量，函数返回空集（不报错）
 
 -- 7. 查看任务状态
 SELECT * FROM timeseries_vector_info;
@@ -1513,6 +1569,64 @@ ts2v_moment(PG_FUNCTION_ARGS)
 3. **位置编码**：添加时间位置信息
 4. **归一化**：确保向量各维度在合理范围内 — 当前实现使用 soft-sign 有界归一化到 (-1, 1)
 
+### 7.5 向量化函数 ts2v_pool 设计（向量嵌套场景）
+
+当一级向量表（vec）本身作为下一级 source 建向量表时，`value_column` 通常指向 `embedding` 列（`vector` 类型）。此时 `array_agg(value_column)` 得到 `vector[]`，而默认 `ts2v_moment(float8[], int)` 无法直接接受。
+
+`ts2v_pool` 是一个 SQL 层内置函数，签名：
+
+```sql
+ts2v_pool(vecs vector[], dim int DEFAULT NULL) RETURNS vector
+```
+
+实现（仅 6 行 PL/pgSQL）：
+
+```sql
+RETURN (SELECT avg(v) FROM unnest(vecs) AS v);
+```
+
+核心思想：`unnest` 把 `vector[]` 展平成多行 vector，再用 pgvector 内置的 `avg(vector)` aggregate 做均值聚合，得到一组向量的**中心向量**（centroid）。
+
+#### ts2v_moment vs ts2v_pool 对比
+
+| 函数 | 输入类型 | 典型 value_column | 聚合算法 | 适用层级 |
+|------|---------|------------------|---------|---------|
+| `ts2v_moment` | `float8[]` | `v`, `temperature`, `value` | 统计矩特征 + softsign 归一化 | 原始时序 → 一级向量 |
+| `ts2v_pool` | `vector[]` | `embedding`（vector 类型） | 向量均值聚合 (unnest + pgvector.avg) | 一级向量 → 二级/三级向量 |
+
+#### 向量嵌套的 reloptions 配置要点
+
+```sql
+-- 第一层：原始时序 → vec
+CREATE TABLE vec () WITH (
+    timeseries.source            = 'src',
+    timeseries.bucket_interval   = 3600,    -- 1h bucket
+    timeseries.carry_columns     = 'k',
+    timeseries.value_column      = 'v',     -- 数值列
+    timeseries.vector_len        = 3
+    -- vectorize_function 留空，默认 ts2v_moment
+);
+
+-- 第二层：vec → vec_embed（关键配置）
+CREATE TABLE vec_embed () WITH (
+    timeseries.source              = 'vec',
+    timeseries.time_column         = 'slice_start', -- ← 向量表的时间列
+    timeseries.bucket_interval     = 7200,          -- 2h bucket（合并两个 1h bucket）
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',   -- ← vector 类型列
+    timeseries.vectorize_function = 'ts2v_pool',    -- ← pool 不是 moment
+    timeseries.vector_len          = 3
+);
+
+-- 也可在 ALTER TABLE 中补配：
+-- ALTER TABLE vec_embed SET (timeseries.time_column = 'slice_start',
+--                              timeseries.vectorize_function = 'ts2v_pool');
+```
+
+#### 错误路径（已在 C 层自动拦截为 0 行）
+
+如果忘了配 `timeseries.vectorize_function = 'ts2v_pool'`，C 层 `build_vector_run_query` 生成的 SQL 会报 `function ts2v_moment(vector[], integer) does not exist`。由于 `run_vector_table` 用 PG_TRY/PG_CATCH 包裹，错误会被吞掉并返回 0 行（不会影响 BGW 的下一个 vector table），建议用户在建表时就显式配置。
+
 ## 8. 异常处理与可靠性
 
 ### 8.1 错误处理
@@ -1742,26 +1856,69 @@ timeseries.trigger_cache_size = 512 -- 每个后端进程 LRU 缓存 512 条
 
 - **实现位置**: `contrib/tsvector_funcs/tsvector_funcs.c`（共享库，非内置函数）
 - **原因**: `vector` 返回类型来自 pgvector 扩展，bootstrap 时不可用，无法通过 `pg_proc.dat` 注册为 `LANGUAGE internal`
-- **算法**（moment 特征提取）:
-  1. 计算 1 阶原点矩（均值 mean）与 2 阶中心矩（方差 variance，标准差 stddev）
-  2. 计算 3~8 阶标准化矩（偏度 skewness、峰度 kurtosis 及更高阶矩），标准化矩具有平移/尺度不变性
-  3. 对每个特征应用 soft-sign 有界归一化 `f(v) = v / (1 + |v|)`，映射到 (-1, 1)
-  4. 将 8 个有界特征（mean, stddev, 3~8 阶标准化矩）循环填充到目标维度
-  - 常量序列（std=0）时，高阶矩全部置 0，仅保留均值特征
+- **算法**（moment + 分桶直方图特征提取）:
+  1. 第一遍：计算均值、最小值、最大值、平方和
+  2. 第二遍：计算标准差，然后计算 3 阶（偏度 skewness）和 4 阶（峰度 kurtosis）标准化矩
+  3. soft-sign 有界归一化 `f(v) = v / (1 + |v|)`，把任意实数映射到 (-1, 1)
+  4. 前 6 维固定为：[softsign(mean), softsign(stddev), softsign(min), softsign(max), softsign(skew), softsign(kurtosis)]
+  5. 当 `target_dim > 6` 时，对 [min, max] 区间等频分桶，统计每个桶的样本密度后做最大值归一化（quantile-based bucketing）
+  6. 当 `target_dim < 6` 时截断取前 N 维
+  - 常量序列（stddev=0）时，偏度/峰度置 0；分桶直方图部分将所有样本归到同一桶
 - **签名**: `ts2v_moment(float8[], int DEFAULT 384) RETURNS vector`
 - **属性**: IMMUTABLE, PARALLEL SAFE
 
 ### 13.6 timeseries_vector_run 函数技术细节
 
 - **实现位置**: `contrib/tsvector_funcs/tsvector_funcs.c`
-- **签名**: `timeseries_vector_run(text) RETURNS text`（参数为向量表名）
+- **签名**: `timeseries_vector_run(oid) RETURNS integer`（参数为向量表 OID，可传 `'table'::regclass` 隐式转换）
 - **属性**: VOLATILE
 - **执行流程**:
-  1. 读取向量表 `pg_class.reloptions` 中的 `timeseries.*` 配置（源表、bucket、vectorize、carry 等；当前实现暂读元数据表，待重构为 reloptions）
-  2. 构建源表和向量表的限定标识符
-  3. 查找源表的时间列（第一个 TIMESTAMPTZ 列）
-  4. 查找数值列（排除时间列和 carry 列）
-  5. 构建 INSERT...SELECT，使用 epoch 时间分桶和 GROUP BY
-  6. 通过 SPI 执行，ON CONFLICT DO NOTHING 保证幂等
-  7. 返回处理的时间片数量
-- **内存管理**: 在 `SPI_connect()` 前保存 `CurrentMemoryContext`，在 `SPI_finish()` 前切换回原上下文分配结果文本
+  1. 独立读取各 reloption（每次 read_relopt 自行管理 SPI_connect/SPI_finish，避免嵌套 SPI）
+  2. 动态构建 INSERT...SELECT：内层 FLOOR bucket_epoch + GROUP BY (bucket_epoch, carry_columns...)
+  3. vectorize_fn(array_agg(value ORDER BY time), vector_len) AS embedding
+  4. ON CONFLICT (slice_start, carry_columns...) DO UPDATE 幂等写入
+  5. 单次 SPI_execute；SPI_processed 作为返回值
+
+#### 运行时 SQL 生成（timeseries_vector_run / BGW 内部）
+
+`timeseries_vector_run('vec'::regclass)` 及 BGW Worker 内部构建的 INSERT ... SELECT 语句结构如下：
+
+```sql
+INSERT INTO vec (slice_start, slice_end, k, embedding, _row_count, _processed)
+SELECT
+  (to_timestamp(bucket_epoch))::timestamptz           AS slice_start,
+  (to_timestamp(bucket_epoch + <bucket_interval>))::timestamptz AS slice_end,
+  k                                                   AS k,
+  ts2v_moment(array_agg(v ORDER BY time), <vector_len>) AS embedding,
+  count(*)                                            AS _row_count,
+  true                                                AS _processed
+FROM (
+  SELECT
+    time,
+    FLOOR(EXTRACT(EPOCH FROM time) / <bucket_interval>)::bigint * <bucket_interval> AS bucket_epoch,
+    k,
+    v
+  FROM <source_table>
+) sub
+GROUP BY bucket_epoch, k
+ON CONFLICT (slice_start, k) DO UPDATE SET
+  embedding   = EXCLUDED.embedding,
+  _row_count  = EXCLUDED._row_count,
+  _processed  = true;
+```
+
+> **为什么用 FLOOR 不用 `::bigint` 截断？** PostgreSQL `(double)::bigint` 是**四舍五入**（ties-away-from-zero）。当 EPOCH / bucket_interval 恰好是 x.5 时，会跳到下一个 bucket（例如 10:30 / 3600 = 294994.5 → 294995 → 归属 11:00 bucket）。FLOOR 是数学 floor 语义，保证 "bucket_interval 秒为一个片" 的直觉行为。
+
+#### timeseries_vector_run 内部执行流程
+
+```mermaid
+flowchart TD
+    A[调用 timeseries_vector_run] --> B[读取 reloptions]
+    B --> C{source 是否设置?}
+    C -- 否 --> D[return 0]
+    C -- 是 --> E[SPI_connect]
+    E --> F[构建 INSERT...SELECT 查询<br/>FLOOR bucket + GROUP BY]
+    F --> G[调用 ts2v_moment 向量化]
+    G --> H[ON CONFLICT (slice_start, carry) DO UPDATE]
+    H --> I[SPI_finish + 返回 SPI_processed]
+```
