@@ -17,6 +17,7 @@
   - [2.5 向量相似度查询](#25-向量相似度查询)
 - [3. 完整语法参考](#3-完整语法参考)
   - [3.1 创建向量表](#31-创建向量表)
+  - [3.1.1 向量表列定义（自动注入，无需手动声明）](#311-向量表列定义自动注入无需手动声明)
   - [3.2 表选项（reloptions）](#32-表选项reloptions)
   - [3.3 向量函数说明](#33-向量函数说明)
   - [3.4 ts2v_moment 输出语义](#34-ts2v_moment-输出语义)
@@ -195,6 +196,42 @@ CREATE TABLE <vector_table_name> () WITH (
 );
 ```
 
+#### 3.1.1 向量表列定义（自动注入，无需手动声明）
+
+创建向量表后，系统自动注入以下列。所有列都是**系统自动填充**，用户无需（也不应该）手动 INSERT：
+
+| 列名 | 类型 | 语义 | 何时有值 | 填充方式 |
+|---|---|---|---|---|
+| **`slice_start`** | timestamptz | 时间片窗口起点（含） | 每次 INSERT 都有 | C 层 SQL 生成：bucket 模式 = `FLOOR(time/bucket_interval)*bucket_interval`；slide 模式 = source 每行真实时间戳 |
+| **`slice_end`** | timestamptz | 时间片窗口终点（不含），= `slice_start + bucket_interval` | 每次 INSERT 都有 | 同 slice_start 一起计算 |
+| **`[carry_columns...]`** | 与源表同类型 | 用户声明的 carry 列分组值（如 `device_id`、`k`） | 每次 INSERT 都有 | 直接从 source 表 select DISTINCT 带入 |
+| **`embedding`**（或 `vector_column` 指定名） | vector(N) | 本时间片聚合后的向量 | 每次 INSERT 都有 | 由 `vectorize_function` 计算（默认 `ts2v_moment`；二级/三级用 `ts2v_pool`） |
+| **`_row_count`** | int | 本时间片窗口内实际包含的 source 行数 | 每次 INSERT 都有 | C 层 SQL 里的 `count(*)` |
+| **`_processed`** | bool | 是否已完成计算（用于状态标记，默认 `true`） | 每次 INSERT 都有 | 建表 DEFAULT `true` |
+| **`_created_at`** | timestamptz | 本行首次写入时间 | 每次 INSERT 都有 | 建表 DEFAULT `now()` |
+| **`_data_watermark`** | timestamptz | 本窗口已处理到 source 表的哪个时间点（增量水位线） | **v1.2 占位 NULL，v3 增量重算时填充** | 预留 |
+| **`_coverage`** | float8 | 窗口内有效源数据覆盖率（0.0 ~ 1.0），用于检测迟到/缺失 | **v1.2 占位 NULL，v3 质量监控时填充** | 预留 |
+| **`_gap_count`** | int | 窗口内时间轴空缺数（比如 18:30-18:40 无数据） | **v1.2 占位 NULL，v3 质量监控时填充** | 预留 |
+
+> **主键**：自动在 `(slice_start, [carry_columns...])` 上创建 UNIQUE 约束。  
+> **索引**：自动在向量列上创建 HNSW 索引（用于 `timeseries_vector_search`）。  
+> **触发器**：当 `timeseries.enabled = true`（默认）时，在 source 表上注册 AFTER INSERT 触发器，数据写入自动触发重算。
+
+##### 列值示例（verify_l1，bucket=3600s, carry=k）
+
+```
+slice_start            slice_end              k  _row_count  embedding
+2026-09-29 18:00:00+08 2026-09-29 19:00:00+08 0  50           [0.9906, 0.7427, 0.9901]
+2026-09-29 19:00:00+08 2026-09-29 20:00:00+08 0  50           [0.9914, 0.7427, 0.9910]
+...
+2026-09-29 18:00:00+08 2026-09-29 19:00:00+08 1  50           [0.9906, 0.7427, 0.9901]
+...
+```
+
+- 同一 `slice_start` 出现两次是因为 carry 列 `k` 有两个值（0 和 1），**不是重复行**
+- bucket 模式下 `slice_start` 被 FLOOR 对齐到 bucket_interval；slide 模式下取 source 真实时间戳（不对齐）
+- `_row_count = 50` 表示该 bucket 内有 50 条源表记录被聚合进 embedding
+
 ### 3.2 表选项（reloptions）
 
 | 选项 | 类型 | 必需 | 默认值 | 说明 |
@@ -206,7 +243,8 @@ CREATE TABLE <vector_table_name> () WITH (
 | `timeseries.vector_column` | text | — | `embedding` | 向量列名 |
 | `timeseries.carry_columns` | text | — | 空 | 分组列名（逗号分隔） |
 | `timeseries.value_column` | text | ✅ | — | 源表中用于向量化的数值列名（如 `value`、`_row_count`） |
-| `timeseries.vectorize_function` | text | — | `ts2v_moment` | 向量化函数名，签名 `fn(float8[], int) RETURNS vector` |
+| `timeseries.vectorize_function` | text | — | `ts2v_moment` | 向量化函数名，签名 `fn(float8[], int) RETURNS vector`。vector 类型 value_column 用 `ts2v_pool` |
+| `timeseries.window_mode` | text | — | `bucket` | 窗口模式：`bucket`（硬切分，默认）或 `slide`（滑动窗口）。**🚫 slide 禁止在原始时序表上使用，必须配合一级 tumbling 向量表** |
 
 ### 3.3 向量函数说明
 
@@ -326,6 +364,86 @@ SELECT timeseries_vector_run('vec_embed'::regclass); -- → 3 行（合并成 3 
 | 自定义数值向量化 | float8 | 自建 `my_func(float8[], int)` |
 
 如果在建 vec_embed 时**忘了配** `vectorize_function = 'ts2v_pool'`，C 层会报 `function ts2v_moment(vector[], integer) does not exist`，但错误被自动捕获，表现为 `timeseries_vector_run` 返回 0 行而不是崩溃。
+
+### 3.7 滑动窗口（Sliding Window）快速上手
+
+默认硬切分（`window_mode = 'bucket'`）下，时间轴被 `bucket_interval` 整齐切割，每条原始数据只属于一个 bucket。滑动窗口模式（`window_mode = 'slide'`）下，从每条 source 记录各自开一个窗口（大小 = `bucket_interval` 秒），数据可以属于多个窗口（重叠）。
+
+#### 最小示例
+
+```sql
+-- 硬切分 vs 滑动窗口对比（src 有 3 个 1h bucket，bucket_interval=7200）
+-- bucket: 18:00 → 2行, 20:00 → 1行        = 3 行
+-- slide: 18:00 → 2行, 19:00 → 2行, 20:00 → 1行 = 5 行（19:00 窗口重叠！）
+
+CREATE TABLE vec_slide () WITH (
+    timeseries.source          = 'src',
+    timeseries.bucket_interval = 7200,   -- slide 下即窗口大小
+    timeseries.carry_columns   = 'k',
+    timeseries.value_column    = 'v',
+    timeseries.vector_len      = 3,
+    timeseries.window_mode     = 'slide' -- ← 关键参数
+);
+
+SELECT timeseries_vector_run('vec_slide'::regclass);
+-- 结果: 5 行（而 bucket 只有 3 行）
+```
+
+#### 向量表 source + sliding + ts2v_pool
+
+```sql
+CREATE TABLE vec2_slide () WITH (
+    timeseries.source              = 'vec',
+    timeseries.time_column         = 'slice_start',
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',
+    timeseries.vectorize_function = 'ts2v_pool',
+    timeseries.vector_len          = 3,
+    timeseries.window_mode         = 'slide'
+);
+SELECT timeseries_vector_run('vec2_slide'::regclass);
+```
+
+#### ALTER TABLE 动态切换
+
+```sql
+ALTER TABLE vec_slide SET (timeseries.window_mode = 'bucket');  -- 切回硬切分
+ALTER TABLE vec_slide SET (timeseries.window_mode = 'slide');   -- 切回滑动
+ALTER TABLE vec_slide RESET (timeseries.window_mode);           -- 恢复默认 bucket
+```
+
+> 🚫 **严禁在原始时序表上直接使用 sliding 模式**
+>
+> sliding 的 SQL 基于"每行 source 开一个窗口 + 自连接"，复杂度 O(N²/K)。
+> 在 100k 行原始表上跑一次耗时 ~97 秒；而先经过一级 tumbling 聚合
+> （bucket_interval 把高频数据压缩到万行级），再在二级向量表上
+> sliding，耗时降到 ~1.7 秒（快 **56 倍**）。
+>
+> **正确姿势链**：
+>
+> ```
+> 原始时序表 ──[tumbling, bucket_interval=3600s]──▶ 一级向量表 (N 行)
+>                                                      │
+>                                           ┌──────────┴──────────┐
+>                                           ▼                     ▼
+>                                  二级向量表                 三级向量表
+>                                  (sliding, window=7200s)   (sliding, window=86400s)
+> ```
+>
+> ❌ `CREATE TABLE vec () WITH (source = 'raw_timeseries', window_mode = 'slide')` — 禁止
+> ✅ `CREATE TABLE vec_l1 () WITH (source = 'raw_timeseries', window_mode = 'bucket', bucket_interval = 3600)`
+> ✅ `CREATE TABLE vec_l2 () WITH (source = 'vec_l1', window_mode = 'slide', bucket_interval = 7200, time_column = 'slice_start', vectorize_function = 'ts2v_pool')`
+
+#### 注意事项
+
+| # | 提示 |
+|---|------|
+| 1 | sliding 模式下 `bucket_interval` 是**窗口大小**，不是切分间隔 |
+| 2 | sliding 的 slice_start 来自 source 真实时间戳，**不对齐 FLOOR** |
+| 3 | BGW worker 透明支持 sliding，无需额外配置 |
+| 4 | source 应为**向量表**（已聚合），禁止原始表直接滑动 |
+| 5 | 即使在向量表上，bucket_interval 也应远小于窗口大小以保证 N 足够小 |
 
 ---
 

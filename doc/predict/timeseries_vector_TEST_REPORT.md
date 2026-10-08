@@ -42,7 +42,7 @@ GUC: timeseries.workers=1, timeseries.max_in_flight=64
 
 ---
 
-## 1. 用例汇总 (78/78 通过)
+## 1. 用例汇总 (84/84 通过)
 
 ### 0. 前置条件 (8/8)
 
@@ -229,6 +229,52 @@ CREATE TABLE vec_bad () WITH (
 );
 SELECT timeseries_vector_run('vec_bad'::regclass);  -- → 0 行，不崩溃 ✅
 ```
+
+### 12. Sliding Window 滑动窗口模式 (NEW, 6/6)
+
+本模块为 v1.2 新增。核心改动：`timeseries.window_mode` reloption + C 层 `build_vector_run_query` sliding SQL 分支（DISTINCT + LEFT JOIN 自连接）。
+
+| # | 用例 | 结果 |
+|---|------|------|
+| 12-1 | CREATE TABLE 带 `window_mode = 'slide'` reloption | ✅ 正常解析，reloptions 正确存储 |
+| 12-2 | sliding 在 src 原始时序表上跑，bucket_interval=3600 | ✅ 正确聚合 |
+| 12-3 | sliding 在 vec 向量表上跑 + ts2v_pool + bucket_interval=7200 | ✅ 5 行（vs tumbling 3 行），19:00 窗口包含重叠数据 |
+| 12-4 | tumbling 回归（不传 window_mode 或设为 bucket） | ✅ 路径不受影响，3 行 |
+| 12-5 | sliding 自排除：窗口不重复（DISTINCT 保证 slice_start 唯一） | ✅ |
+| 12-6 | ALTER TABLE SET window_mode 动态切换 | ✅ 立即生效 |
+
+**关键对比数据**（vec 有 3 个 1h bucket：18:00, 19:00, 20:00，k=1）：
+
+| slice_start | bucket 模式（7200s） | slide 模式（7200s） |
+|-------------|---------------------|---------------------|
+| 18:00 | 2行 (18+19) | 2行 (18+19) |
+| **19:00** | —（被 FLOOR 合并进 18:00） | **2行 (19+20)** ← 重叠！ |
+| 20:00 | 1行 (20) | 1行 (20) |
+| 共 | **2 行** | **3 行** |
+
+**测试 SQL 片段**：
+
+```sql
+-- 12-3 sliding 在 vec 向量表上
+CREATE TABLE vec_slide_fixed () WITH (
+    timeseries.source              = 'vec',
+    timeseries.time_column         = 'slice_start',
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',
+    timeseries.vectorize_function = 'ts2v_pool',
+    timeseries.vector_len          = 3,
+    timeseries.window_mode         = 'slide'
+);
+SELECT timeseries_vector_run('vec_slide_fixed'::regclass);
+-- 返回 5 行（k=1×3 + k=2×2）
+```
+
+**修复过程中发现并解决的 4 个 C 层 bug**：
+1. carry 列在子查询 SELECT DISTINCT 中误加 `sw.` 前缀 → 改为裸名
+2. carry 列在外层 SELECT 投影中裸名导致歧义 → 加 `sw.` 前缀
+3. carry 列在 GROUP BY 中裸名 → 加 `sw.` 前缀
+4. 无 carry 列时 JOIN 条件变成 ` AND ()` 语法错误 → 空 carry 时跳过整段
 
 ---
 
@@ -431,7 +477,9 @@ wsl -- bash /mnt/d/workspace/postgres/doc/predict/_tsvector_e2e_test.sh
 | 5 | 全量扫描 src，无水位线 | 加 `_last_processed` 列 |
 | 6 | CREATE TABLE WITH reloption namespace 需特殊处理 | 等 PG 18 正式版 |
 | 7 | `timeseries_vector_search` 动态 SQL carry_filter 未加注入防护 | 当前 STABLE + 无 DDL 权限，风险可控；后续加固 |
+| 8 | sliding 模式 window_step 不可配置（默认 = source 粒度，每行开一个窗口） | 后续可加 `timeseries.window_step` reloption |
+| 9 | sliding 模式 O(N×W) 自连接，**🚫 严禁在原始时序表上直接使用**（100k 行原始表耗时 97 秒 vs 聚合后 1.7 秒） | 设计约束：sliding 仅用于二级/三级向量表叠加 |
 
 ---
 
-**结论**: **78/78 通过**。v1.1 完成四项增量交付：① `timeseries.time_column` reloption 解除时间列硬编码；② `ts2v_pool(vector[], int)` 函数支持 vector 类型 value_column 聚合；③ `timeseries_vector_search` 相似度搜索封装函数；④ 完整的一级→二级→三级向量表嵌套能力（vec → vec2 → vec3），avg 聚合结果手动验证一致。可以交付。
+**结论**: **84/84 通过**。v1.2 新增第 12 模块 Sliding Window：`timeseries.window_mode` reloption 切换 `bucket`/`slide`；C 层 `build_vector_run_query` 新增 DISTINCT + LEFT JOIN 自连接 sliding SQL 分支，自动 dispatch，BGW 透明支持。实测对比：vec 有 3 个 1h bucket，bucket_interval=7200s 下 bucket 模式 3 行、slide 模式 5 行，19:00 窗口正确包含重叠数据（19+20 两行）。修复过程中定位并解决了 C 层 4 个 carry 列拼接 bug。可以交付。

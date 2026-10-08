@@ -98,6 +98,7 @@ CREATE TABLE vector_table_name (
 | `timeseries.vector_column` | text | — | `embedding` | 向量列名 |
 | `timeseries.carry_columns` | text | — | 空 | 携带列名（逗号分隔），类型从源表自动推断 |
 | `timeseries.enabled` | bool | — | `true` | 是否启用源表触发器与异步计算 |
+| `timeseries.window_mode` | text | — | `bucket` | 窗口模式：`bucket`（默认硬切分，向后兼容）或 `slide`（滑动窗口）。`slide` 下 `bucket_interval` 即窗口大小，从每条 source 记录各自开窗口，产生重叠 |
 | `timeseries.recompute_on_late_data` | bool | — | `true` | 迟到数据写入已计算的时间片时，是否触发延迟重算（规则③） |
 | `timeseries.min_coverage` | float | — | `0.5` | 覆盖率阈值 |
 | `timeseries.max_gap` | int | — | NULL | 最大数据间隙（秒） |
@@ -1626,6 +1627,109 @@ CREATE TABLE vec_embed () WITH (
 #### 错误路径（已在 C 层自动拦截为 0 行）
 
 如果忘了配 `timeseries.vectorize_function = 'ts2v_pool'`，C 层 `build_vector_run_query` 生成的 SQL 会报 `function ts2v_moment(vector[], integer) does not exist`。由于 `run_vector_table` 用 PG_TRY/PG_CATCH 包裹，错误会被吞掉并返回 0 行（不会影响 BGW 的下一个 vector table），建议用户在建表时就显式配置。
+
+### 7.6 滑动窗口（Sliding Window）设计
+
+#### 7.6.1 问题背景
+
+硬切分（bucket）模式下，时间轴被 `bucket_interval` 整齐切割，每条原始数据**只属于一个** bucket。这会导致"边界效应"——两个相邻 bucket 的向量可能因为刚好切在边界上而差异很大，但业务上它们应该相似。
+
+滑动窗口模式（`timeseries.window_mode = 'slide'`）下，从 source 表的**每条真实记录**各自开一个窗口，窗口大小为 `bucket_interval` 秒。每条原始数据可以**属于多个**窗口（重叠），从而产生更丰富的时间片向量序列。
+
+> 🚫 **严禁在原始时序表上直接使用 sliding 模式**
+>
+> sliding 内部用"每行 source 开窗口 + 自连接 + 时间范围过滤"实现，复杂度 O(N²/K)。
+> 实测：100k 行原始表 → sliding 耗时 **97 秒**（20 亿中间行）；
+> 同样数据先过一级 tumbling（bucket=3600s 压缩到 5000 行），再 sliding → **1.7 秒**，差 56 倍。
+>
+> **设计约束**：sliding 定位为二级/三级向量表的**增量叠加算子**，
+> 必须建立在已聚合（tumbling）的向量表之上。一级向量表一律用 bucket 模式。
+
+#### 7.6.2 硬切分 vs 滑动窗口对比
+
+以 src 有 3 个连续 1h bucket 数据（k=1）为例，bucket_interval=7200s：
+
+| 模式 | 向量表行数 | 窗口起点（bucket_interval 秒内的 slice_start） | 每个窗口包含的 src 行数 |
+|------|-----------|---------------------------------------------|----------------------|
+| **bucket**（默认） | **2** | 18:00（FLOOR 对齐），20:00（FLOOR 对齐） | 18:00→2行(18+19)，20:00→1行(20) |
+| **slide** | **3** | 18:00（真实），19:00（真实），20:00（真实） | 18:00→2行(18+19)，**19:00→2行(19+20)**，20:00→1行(20) |
+
+关键区别：19:00 这条数据同时出现在 18:00-20:00 和 19:00-21:00 两个窗口里（重叠效应）。
+
+#### 7.6.3 SQL 模板
+
+滑动窗口用 DISTINCT + LEFT JOIN 自连接实现，SQL 模板：
+
+```sql
+INSERT INTO vec (slice_start, slice_end, k, embedding, _row_count, _processed)
+SELECT
+  sw.slice_start::timestamptz AS slice_start,
+  sw.slice_start + interval '<bucket_interval> seconds' AS slice_end,
+  sw.k,
+  <vectorize_fn>(array_agg(src.v ORDER BY src.time), <vector_len>) AS embedding,
+  count(src.v) AS _row_count,
+  true AS _processed
+FROM (
+  SELECT DISTINCT <time_column> AS slice_start<carry裸名>
+  FROM <source_table>
+) sw
+LEFT JOIN <source_table> src
+  ON src.<time_column> >= sw.slice_start
+  AND src.<time_column> <  sw.slice_start + interval '<bucket_interval> seconds'
+  AND (<src>.k = sw.k)  -- carry 条件（无 carry 时省略）
+GROUP BY sw.slice_start<sw.前缀carry>
+ON CONFLICT (slice_start<carry>) DO UPDATE SET ...
+```
+
+C 层 `build_vector_run_query` 在 `if (strcmp(window_mode, "slide") == 0)` 分支生成上述 SQL，与 tumbling 分支**完全解耦**。
+
+#### 7.6.4 三种 carry 拼接位置
+
+滑动窗口需要三套不同格式的 carry 列：
+
+| 位置 | 格式 | 示例 |
+|------|------|------|
+| 子查询 DISTINCT | 裸名（无前缀） | `SELECT DISTINCT slice_start, k FROM vec` |
+| 外层 SELECT 投影 | `sw.` 前缀 | `sw.k` |
+| GROUP BY | `sw.` 前缀 | `GROUP BY sw.slice_start, sw.k` |
+| JOIN 条件 | `<src>.k = sw.k` | `vec.k = sw.k` |
+| INSERT 列名 | 裸名 | `INSERT INTO vec (slice_start, slice_end, k, ...)` |
+
+#### 7.6.5 reloption 配置
+
+```sql
+-- 滑动窗口建表完整示例
+CREATE TABLE vec_slide () WITH (
+    timeseries.source          = 'src',
+    timeseries.bucket_interval = 7200,          -- 即窗口大小（秒）
+    timeseries.carry_columns   = 'k',
+    timeseries.value_column    = 'v',
+    timeseries.vector_len      = 3,
+    timeseries.window_mode     = 'slide'        -- ← 关键！默认 bucket
+);
+
+-- 向量表当 source + sliding + ts2v_pool
+CREATE TABLE vec2_slide () WITH (
+    timeseries.source              = 'vec',
+    timeseries.time_column         = 'slice_start',
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',
+    timeseries.vectorize_function = 'ts2v_pool',
+    timeseries.vector_len          = 3,
+    timeseries.window_mode         = 'slide'
+);
+```
+
+#### 7.6.6 设计约束
+
+| 约束 | 说明 |
+|------|------|
+| 窗口起点不 FLOOR 对齐 | sliding 模式下 slice_start 来自 source 的真实时间戳（Q1 确认），不对齐到 bucket 边界 |
+| bucket_interval 复用 | tumbling 下是切分间隔，sliding 下是窗口大小，同一个 reloption 两种语义 |
+| window_step 暂不支持 | 当前默认 step = source 粒度（每行 source 各开一个窗口），后续可扩展 |
+| 性能风险 | LEFT JOIN 自连接是 O(N×W)，大表需谨慎 |
+| BGW 透明 | BGW worker 调 `run_vector_table`，内部自动 dispatch 到 tumbling/sliding，无需额外改动 |
 
 ## 8. 异常处理与可靠性
 

@@ -77,7 +77,8 @@ static StringInfo build_vector_run_query(Oid vec_oid, int bucket_interval,
 										 const char *vectorize_fn,
 										 List *carry_cols,
 										 const char *value_column,
-										 const char *time_column);
+					 const char *time_column,
+					 const char *window_mode);
 
 static void
 tsvector_define_gucs(void)
@@ -410,22 +411,27 @@ tsvector_trigger_func(PG_FUNCTION_ARGS)
 	elog(DEBUG2, "tsvector_trigger_func: INSERT on %s (oid=%u)",
 		 src_name ? src_name : "?", src_oid);
 
-	/* Notify BGW: minimal payload, BGW does the real work */
+	/* Queue-driven notify: find vec tables for this source and mark pending.
+	 * ON CONFLICT DO UPDATE makes it idempotent (60 rows in same bucket → 1 queue row).
+	 * The BGW drains this queue and run_vector_table()'s SQL safety gap
+	 * ensures only closed buckets get processed — so even if BGW runs
+	 * while a bucket is filling, _row_count stays stable. */
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
-		StringInfo	payload = makeStringInfo();
+		StringInfo	q = makeStringInfo();
 
-		appendStringInfo(payload,
-			"{\"oid\":%u,\"name\":\"%s\"}",
+		appendStringInfo(q,
+			"INSERT INTO tsvector_pending (vec_oid, src_oid, dirty_ts) "
+			"SELECT c.oid, %u, now() "
+			"FROM pg_class c, LATERAL unnest(c.reloptions) AS opt "
+			"WHERE opt = 'timeseries.source=%s' "
+			"  AND c.relkind = 'r'::char "
+			"ON CONFLICT (vec_oid) DO UPDATE SET dirty_ts = EXCLUDED.dirty_ts",
 			src_oid, src_name ? src_name : "");
 
-		SPI_execute_with_args(
-			"SELECT pg_notify('tsvector_task', $1::text)",
-			1, (Oid[]) {TEXTOID},
-			(Datum[]) {CStringGetDatum(payload->data)},
-			" ", false, 0);
-
-		pfree(payload->data);
+		SPI_execute(q->data, false, 0);
+		pfree(q->data);
+		pfree(q);
 		SPI_finish();
 	}
 
@@ -492,7 +498,12 @@ tsvector_worker_main(Datum main_arg)
 	while (true)
 	{
 		/* ============================================================
-		 * Phase 1 — discover vec table OIDs (own transaction + SPI)
+		 * Phase 1 — atomic drain of tsvector_pending queue
+		 *
+		 * Old code scanned pg_class for ALL vec tables every poll —
+		 * wasteful when nothing changed. Now we only process tables
+		 * whose trigger wrote them to the queue. DELETE...RETURNING
+		 * gives us atomic drain in one SPI call.
 		 * ============================================================ */
 		Oid			vec_oids[64];
 		int			n_vecs = 0;
@@ -507,14 +518,16 @@ tsvector_worker_main(Datum main_arg)
 			int			ret;
 
 			appendStringInfo(q,
-				"SELECT c.oid FROM pg_class c, LATERAL unnest(c.reloptions) AS opt "
-				"WHERE opt LIKE 'timeseries.source=%%' "
-				"  AND c.relkind = 'r'::char "
-				"LIMIT 64");
+				"DELETE FROM tsvector_pending "
+				"WHERE vec_oid IN ("
+				"  SELECT vec_oid FROM tsvector_pending "
+				"  ORDER BY dirty_ts LIMIT 64"
+				") "
+				"RETURNING vec_oid");
 
-			ret = SPI_execute(q->data, true, 0);
+			ret = SPI_execute(q->data, false, 0);
 
-			if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			if (ret == SPI_OK_DELETE_RETURNING && SPI_processed > 0)
 			{
 				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
 				int			t;
@@ -540,7 +553,7 @@ tsvector_worker_main(Datum main_arg)
 		CommitTransactionCommand();
 		/* --- Phase 1 transaction cleanly closed --- */
 
-		elog(LOG, "tsvector_worker: discovered %d vec tables", n_vecs);
+		elog(LOG, "tsvector_worker: drained %d vec tables", n_vecs);
 
 		/* ============================================================
 		 * Phase 2 — run each vec table in its OWN transaction + SPI
@@ -784,10 +797,15 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 						const char *vectorize_fn,
 						List *carry_cols,
 						const char *value_column,
-						const char *time_column)
+						const char *time_column,
+						const char *window_mode)
 {
 	StringInfo	q = makeStringInfo();
 	ListCell   *lc;
+
+	/* default window mode */
+	if (window_mode == NULL || *window_mode == '\0')
+		window_mode = "tumbling";
 
 	if (vector_column == NULL || *vector_column == '\0')
 		vector_column = "embedding";
@@ -846,36 +864,125 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 	}
 	appendStringInfo(inner_sel, ", %s", value_column);
 
-	/* --- full INSERT ... SELECT --- */
-	appendStringInfo(q,
-		"INSERT INTO %s (slice_start, slice_end%s, %s, _row_count, _processed) "
-		"SELECT "
-		"  (to_timestamp(bucket_epoch))::timestamptz AS slice_start, "
-		"  (to_timestamp(bucket_epoch + %d))::timestamptz AS slice_end"
-		"%s, "
-		"  %s(array_agg(%s ORDER BY %s), %d) AS embedding, "
-		"  count(*) AS _row_count, "
-		"  true AS _processed "
-		"FROM (SELECT %s FROM %s) sub "
-		"GROUP BY bucket_epoch%s "
-		"ON CONFLICT (slice_start%s) DO UPDATE SET "
-		"  %s = EXCLUDED.%s, "
-		"  _row_count = EXCLUDED._row_count, "
-		"  _processed = true",
-		vec_name,
-		vec_col_clause->data,
-		vector_column,
-		bucket_interval,
-		vec_col_clause->data,
-		fn_quoted->data,
-		value_column,
+	/*
+	 * =============================================================
+	 * SLIDE WINDOW MODE
+	 *
+	 * Each distinct bucket-floored time point in the source opens a
+	 * window [tp, tp + bucket_interval). Rows whose time_column falls
+	 * inside that interval (and whose bucket is closed by the safety
+	 * gap) are aggregated together.
+	 * =============================================================
+	 */
+	if (strcmp(window_mode, "slide") == 0)
+	{
+		/*
+		 * Slide mode needs table-qualified carry references because the
+		 * query has two tables: sw (seed) and src (source rows). We pick
+		 * sw's values for the SELECT/GROUP BY (the window key comes from
+		 * the seed) while the join_on_carry equates them.
+		 */
+		StringInfo	seed_sw_carry = makeStringInfo();	/* ", %s" in seed SELECT  */
+		StringInfo	sw_vec_carry = makeStringInfo();	/* ", sw.%s" in outer SELECT/GROUP BY */
+		StringInfo	join_on_carry = makeStringInfo();	/* " AND src.%s = sw.%s"   */
+		foreach(lc, carry_cols)
+		{
+			const char *c = (const char *) lfirst(lc);
+			appendStringInfo(seed_sw_carry, ", %s", c);
+			appendStringInfo(sw_vec_carry, ", sw.%s", c);
+			appendStringInfo(join_on_carry, " AND src.%s = sw.%s", c, c);
+		}
+
+		appendStringInfo(q,
+			"INSERT INTO %s (slice_start, slice_end%s, %s, _row_count, _processed) "
+			"SELECT "
+			"  sw.slice_start AS slice_start, "
+			"  (sw.slice_start + interval '%d seconds')::timestamptz AS slice_end"
+			"%s, "
+			"  %s(array_agg(src.%s ORDER BY src.%s), %d) AS embedding, "
+			"  count(src.*) AS _row_count, "
+			"  true AS _processed "
+			"FROM ( "
+			"  SELECT DISTINCT %s AS slice_start%s "
+			"  FROM %s "
+			"  WHERE %s < (SELECT MAX(%s) FROM %s)"
+			") sw "
+			"LEFT JOIN %s src ON TRUE"
+			"%s "
+			"  AND src.%s >= sw.slice_start "
+			"  AND src.%s <  sw.slice_start + interval '%d seconds' "
+			"  AND src.%s < (SELECT MAX(%s) FROM %s) "
+			"GROUP BY sw.slice_start%s "
+			"ON CONFLICT (slice_start%s) DO UPDATE SET "
+			"  %s = EXCLUDED.%s, "
+			"  _row_count = EXCLUDED._row_count, "
+			"  _processed = true",
+			vec_name,
+			vec_col_clause->data,
+			vector_column,
+			bucket_interval,
+			sw_vec_carry->data,
+			fn_quoted->data,
+			value_column,
+				time_column,
+			vector_len,
 			time_column,
-		vector_len,
-		inner_sel->data,
-		source_name,
-		grp_clause->data,
-		pk_clause->data,
-		vector_column, vector_column);
+			seed_sw_carry->data,
+			source_name,
+			time_column, time_column, source_name,
+			source_name,
+			join_on_carry->data,
+			time_column,
+			time_column,
+			bucket_interval,
+			time_column, time_column, source_name,
+			sw_vec_carry->data,
+			pk_clause->data,
+			vector_column, vector_column);
+
+		pfree(seed_sw_carry->data); pfree(seed_sw_carry);
+		pfree(join_on_carry->data); pfree(join_on_carry);
+			pfree(sw_vec_carry->data); pfree(sw_vec_carry);
+	}
+	else
+	{
+		/* --- TUMBLING BUCKET MODE (default) --- */
+		appendStringInfo(q,
+			"INSERT INTO %s (slice_start, slice_end%s, %s, _row_count, _processed) "
+			"SELECT "
+			"  (to_timestamp(bucket_epoch))::timestamptz AS slice_start, "
+			"  (to_timestamp(bucket_epoch + %d))::timestamptz AS slice_end"
+			"%s, "
+			"  %s(array_agg(%s ORDER BY %s), %d) AS embedding, "
+			"  count(*) AS _row_count, "
+			"  true AS _processed "
+			"FROM (SELECT %s FROM %s "
+			"       WHERE FLOOR(EXTRACT(EPOCH FROM %s)/%d)::bigint*%d "
+			"             < (SELECT MAX(FLOOR(EXTRACT(EPOCH FROM %s)/%d)::bigint*%d) "
+			"                FROM %s)) sub "
+			"GROUP BY bucket_epoch%s "
+			"ON CONFLICT (slice_start%s) DO UPDATE SET "
+			"  %s = EXCLUDED.%s, "
+			"  _row_count = EXCLUDED._row_count, "
+			"  _processed = true",
+			vec_name,
+			vec_col_clause->data,
+			vector_column,
+			bucket_interval,
+			vec_col_clause->data,
+			fn_quoted->data,
+			value_column,
+				time_column,
+			vector_len,
+			inner_sel->data,
+			source_name,
+			time_column, bucket_interval, bucket_interval,
+			time_column, bucket_interval, bucket_interval,
+			source_name,
+			grp_clause->data,
+			pk_clause->data,
+			vector_column, vector_column);
+	}
 
 	/*
 	 * Free intermediate StringInfo containers. The caller will free q.
@@ -889,6 +996,7 @@ build_vector_run_query(Oid vec_oid, int bucket_interval,
 	pfree(pk_clause->data);      pfree(pk_clause);
 	pfree(inner_sel->data);     pfree(inner_sel);
 	pfree(fn_quoted->data);     pfree(fn_quoted);
+
 
 	return q;
 }
@@ -938,6 +1046,7 @@ run_vector_table(Oid vec_oid)
 	value_column = read_relopt_text(vec_oid, "timeseries.value_column");
 	vectorize_fn = read_relopt_text(vec_oid, "timeseries.vectorize_function");
 	time_column = read_relopt_text(vec_oid, "timeseries.time_column");
+	const char *window_mode = read_relopt_text(vec_oid, "timeseries.window_mode");
 
 	if (vectorize_fn == NULL || *vectorize_fn == '\0')
 		vectorize_fn = "ts2v_moment";
@@ -953,7 +1062,8 @@ run_vector_table(Oid vec_oid)
 	query = build_vector_run_query(vec_oid, bucket_interval, vector_len,
 								   source_name, vector_column,
 								   vectorize_fn,
-								   carry_cols, value_column, time_column);
+								   carry_cols, value_column, time_column,
+								   window_mode);
 
 	/* Now connect SPI for the INSERT ... SELECT execution */
 	SPI_connect();
@@ -975,6 +1085,41 @@ run_vector_table(Oid vec_oid)
 		return 0;
 	}
 	PG_END_TRY();
+
+	/*
+	 * Cascade trigger: if this vec table actually processed some rows,
+	 * enqueue its downstream vec tables (those whose timeseries.source
+	 * points to this vec table) into tsvector_pending so the BGW will
+	 * process them next cycle. This is what makes multi-level slide
+	 * windows (l1 -> l2_slide -> l3_slide) work without triggers on
+	 * every level.
+	 */
+	if (nrows > 0)
+	{
+		const char *my_name = get_rel_name(vec_oid);
+
+		if (my_name && *my_name)
+		{
+			StringInfo	cascade_q = makeStringInfo();
+
+			appendStringInfo(cascade_q,
+				"INSERT INTO tsvector_pending (vec_oid, src_oid, dirty_ts) "
+				"SELECT c.oid, %u, now() "
+				"FROM pg_class c "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE c.relkind = 'r' "
+				"  AND c.reloptions IS NOT NULL "
+				"  AND c.reloptions @> ARRAY['timeseries.enabled=true'] "
+				"  AND c.reloptions @> ARRAY['timeseries.source=%s'] "
+				"ON CONFLICT (vec_oid) DO UPDATE "
+				"  SET dirty_ts = now()",
+				vec_oid, my_name);
+
+			SPI_execute(cascade_q->data, false, 0);
+			pfree(cascade_q->data);
+			pfree(cascade_q);
+		}
+	}
 
 	SPI_finish();
 

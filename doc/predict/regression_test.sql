@@ -946,6 +946,49 @@ CREATE TABLE tsvec_vec_bad2 () WITH (
 SELECT timeseries_vector_run('tsvec_vec_bad2'::regclass) AS vec_bad2_rows;
 -- 期望 0 行，因为 tsvec_vec 没有 'time' 列
 
+\echo '--- 11.13 Sliding Window 滑动窗口模式 ---'
+-- 11.13.1 滑动窗口在原始 src 上
+DROP TABLE IF EXISTS tsvec_slide_src CASCADE;
+CREATE TABLE tsvec_slide_src () WITH (
+    timeseries.source          = 'tsvec_src',
+    timeseries.bucket_interval = 3600,
+    timeseries.carry_columns   = 'k',
+    timeseries.value_column    = 'v',
+    timeseries.vector_len      = 3,
+    timeseries.window_mode     = 'slide'
+);
+SELECT timeseries_vector_run('tsvec_slide_src'::regclass) AS slide_src_rows;
+-- 期望 5 行（3 个 slice_start × 2 carry 值... 取决于 src 粒度）
+
+-- 11.13.2 滑动窗口在向量表上（ts2v_pool）+ tumbling 对比
+DROP TABLE IF EXISTS tsvec_slide_vec CASCADE;
+CREATE TABLE tsvec_slide_vec () WITH (
+    timeseries.source              = 'tsvec_vec',
+    timeseries.time_column         = 'slice_start',
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',
+    timeseries.vectorize_function = 'ts2v_pool',
+    timeseries.vector_len          = 3,
+    timeseries.window_mode         = 'slide'
+);
+SELECT timeseries_vector_run('tsvec_slide_vec'::regclass) AS slide_vec_rows;
+
+-- 11.13.3 tumbling 对比（同样 7200s）
+DROP TABLE IF EXISTS tsvec_tumble_vec CASCADE;
+CREATE TABLE tsvec_tumble_vec () WITH (
+    timeseries.source              = 'tsvec_vec',
+    timeseries.time_column         = 'slice_start',
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',
+    timeseries.vectorize_function = 'ts2v_pool',
+    timeseries.vector_len          = 3
+    -- 没有 window_mode，默认 bucket
+);
+SELECT timeseries_vector_run('tsvec_tumble_vec'::regclass) AS tumble_vec_rows;
+-- sliding 行数 >= tumbling 行数（因为重叠）
+
 -- ================================================================
 -- 第12部分: 清理
 -- ================================================================
@@ -977,6 +1020,9 @@ DROP TABLE IF EXISTS tsvec_src CASCADE;
 DROP TABLE IF EXISTS tsvec_vec2 CASCADE;
 DROP TABLE IF EXISTS tsvec_vec_bad CASCADE;
 DROP TABLE IF EXISTS tsvec_vec_bad2 CASCADE;
+DROP TABLE IF EXISTS tsvec_slide_src CASCADE;
+DROP TABLE IF EXISTS tsvec_slide_vec CASCADE;
+DROP TABLE IF EXISTS tsvec_tumble_vec CASCADE;
 DROP SCHEMA IF EXISTS test_schema CASCADE;
 
 SELECT clear_predict_history();
