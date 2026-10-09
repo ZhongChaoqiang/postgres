@@ -15,6 +15,7 @@
   - [2.3 写入数据](#23-写入数据)
   - [2.4 手动触发计算](#24-手动触发计算)
   - [2.5 向量相似度查询](#25-向量相似度查询)
+  - [2.6 进阶：滑动窗口模式](#26-进阶滑动窗口模式)
 - [3. 完整语法参考](#3-完整语法参考)
   - [3.1 创建向量表](#31-创建向量表)
   - [3.1.1 向量表列定义（自动注入，无需手动声明）](#311-向量表列定义自动注入无需手动声明)
@@ -22,6 +23,8 @@
   - [3.3 向量函数说明](#33-向量函数说明)
   - [3.4 ts2v_moment 输出语义](#34-ts2v_moment-输出语义)
   - [3.5 自定义向量化函数示例](#35-自定义向量化函数示例)
+  - [3.6 内置向量化函数 ts2v_pool（向量嵌套）](#36-内置向量化函数-ts2v_pool向量嵌套)
+  - [3.7 滑动窗口（Sliding Window）快速上手](#37-滑动窗口sliding-window快速上手)
 - [4. 函数接口详解](#4-函数接口详解)
   - [4.1 ts2v_moment](#41-ts2v_moment)
   - [4.2 timeseries_vector_run](#42-timeseries_vector_run)
@@ -177,6 +180,86 @@ SELECT * FROM timeseries_vector_search(
 
 > 若目标时间片还没有计算过向量，函数直接返回空集（不报错、不阻塞）。
 
+### 2.6 进阶：滑动窗口模式
+
+上面所有示例默认用的是**硬切分**（`window_mode = 'bucket'`）：时间轴被整齐切割，每条数据只属于一个 bucket。
+
+滑动窗口（`window_mode = 'slide'`）模式下，**每个 source 的时间点各自开一个窗口**（窗口大小 = `bucket_interval` 秒），数据可以属于多个窗口（重叠）。适合需要"最近 N 分钟/小时"类的聚合场景。
+
+#### 硬切分 vs 滑动窗口 对比
+
+假设源表有 3 个 bucket 的数据（18:00、19:00、20:00 各一行），`bucket_interval = 7200`（2 小时）：
+
+```
+硬切分 (bucket) — 整齐切割, 每行只属于 1 个 bucket:
+  bucket 18:00 → [18:00, 20:00)  → 2 行 (18:00, 19:00)
+  bucket 20:00 → [20:00, 22:00)  → 1 行 (20:00)
+  合计: 3 行
+
+滑动窗口 (slide) — 每行开一个窗口, 数据可重叠:
+  18:00 窗口 → [18:00, 20:00) → 2 行 (18:00, 19:00)
+  19:00 窗口 → [19:00, 21:00) → 2 行 (19:00, 20:00)  ← 19:00 同时属于两个窗口!
+  20:00 窗口 → [20:00, 22:00) → 1 行 (20:00)
+  合计: 5 行
+```
+
+#### 最小滑动窗口示例
+
+```sql
+CREATE TABLE vec_slide () WITH (
+    timeseries.source          = 'src',
+    timeseries.bucket_interval = 7200,   -- slide 下即窗口大小（秒）
+    timeseries.carry_columns   = 'k',
+    timeseries.value_column    = 'v',
+    timeseries.vector_len      = 3,
+    timeseries.window_mode     = 'slide' -- ← 关键参数
+);
+
+SELECT timeseries_vector_run('vec_slide'::regclass);
+```
+
+#### 向量表 source + sliding（高频数据推荐姿势）
+
+高频原始表（如每秒一条）直接用 slide 复杂度 O(N²/K)，建议先 tumbling 聚合再 slide：
+
+```sql
+-- 先一级 tumbling 把高频数据压缩
+CREATE TABLE vec_l1 () WITH (
+    timeseries.source          = 'src',
+    timeseries.bucket_interval = 3600,
+    timeseries.carry_columns   = 'k',
+    timeseries.value_column    = 'v',
+    timeseries.vector_len      = 3,
+    timeseries.window_mode     = 'bucket'  -- 默认 bucket
+);
+
+-- 再二级 slide（此时 source 已是聚合后的向量表，N 很小）
+CREATE TABLE vec_l2_slide () WITH (
+    timeseries.source              = 'vec_l1',
+    timeseries.time_column         = 'slice_start',   -- 向量表 source 必须设
+    timeseries.bucket_interval     = 7200,
+    timeseries.carry_columns       = 'k',
+    timeseries.value_column        = 'embedding',     -- 上一级的向量列
+    timeseries.vectorize_function = 'ts2v_pool',     -- 向量嵌套用 ts2v_pool
+    timeseries.vector_len          = 3,
+    timeseries.window_mode         = 'slide'
+);
+
+SELECT timeseries_vector_run('vec_l1'::regclass);
+SELECT timeseries_vector_run('vec_l2_slide'::regclass);
+```
+
+#### ALTER TABLE 动态切换
+
+```sql
+ALTER TABLE vec SET (timeseries.window_mode = 'bucket');  -- 切回硬切分
+ALTER TABLE vec SET (timeseries.window_mode = 'slide');   -- 切到滑动
+ALTER TABLE vec RESET (timeseries.window_mode);           -- 恢复默认 bucket
+```
+
+> ⚠️ **性能提示**：高频原始表直接 slide 复杂度 O(N²/K)，在 100k 行上慢 56 倍。
+> 低频数据（IoT 分钟级上报等）原始表 slide 没问题。详见 §3.7 完整分析。
+
 ---
 
 ## 3. 完整语法参考
@@ -244,7 +327,7 @@ slice_start            slice_end              k  _row_count  embedding
 | `timeseries.carry_columns` | text | — | 空 | 分组列名（逗号分隔） |
 | `timeseries.value_column` | text | ✅ | — | 源表中用于向量化的数值列名（如 `value`、`_row_count`） |
 | `timeseries.vectorize_function` | text | — | `ts2v_moment` | 向量化函数名，签名 `fn(float8[], int) RETURNS vector`。vector 类型 value_column 用 `ts2v_pool` |
-| `timeseries.window_mode` | text | — | `bucket` | 窗口模式：`bucket`（硬切分，默认）或 `slide`（滑动窗口）。**🚫 slide 禁止在原始时序表上使用，必须配合一级 tumbling 向量表** |
+| `timeseries.window_mode` | text | — | `bucket` | 窗口模式：`bucket`（硬切分，默认）或 `slide`（滑动窗口）。**⚠️ slide 不建议在高频原始时序表上直接使用（低频数据如 IoT 分钟级上报可酌情使用）** |
 
 ### 3.3 向量函数说明
 
@@ -413,14 +496,17 @@ ALTER TABLE vec_slide SET (timeseries.window_mode = 'slide');   -- 切回滑动
 ALTER TABLE vec_slide RESET (timeseries.window_mode);           -- 恢复默认 bucket
 ```
 
-> 🚫 **严禁在原始时序表上直接使用 sliding 模式**
+> ⚠️ **Slide 模式不建议在高频原始时序表上直接使用**
 >
 > sliding 的 SQL 基于"每行 source 开一个窗口 + 自连接"，复杂度 O(N²/K)。
 > 在 100k 行原始表上跑一次耗时 ~97 秒；而先经过一级 tumbling 聚合
 > （bucket_interval 把高频数据压缩到万行级），再在二级向量表上
 > sliding，耗时降到 ~1.7 秒（快 **56 倍**）。
 >
-> **正确姿势链**：
+> 但如果原始数据本身就是**低频写入**（如 IoT 分钟级上报、每小时一条等），
+> 原始表直接用 slide 模式也是完全可以的——此时 N 足够小，O(N²/K) 代价可接受。
+>
+> **推荐姿势链（高频场景）**：
 >
 > ```
 > 原始时序表 ──[tumbling, bucket_interval=3600s]──▶ 一级向量表 (N 行)
@@ -431,9 +517,10 @@ ALTER TABLE vec_slide RESET (timeseries.window_mode);           -- 恢复默认 
 >                                  (sliding, window=7200s)   (sliding, window=86400s)
 > ```
 >
-> ❌ `CREATE TABLE vec () WITH (source = 'raw_timeseries', window_mode = 'slide')` — 禁止
-> ✅ `CREATE TABLE vec_l1 () WITH (source = 'raw_timeseries', window_mode = 'bucket', bucket_interval = 3600)`
-> ✅ `CREATE TABLE vec_l2 () WITH (source = 'vec_l1', window_mode = 'slide', bucket_interval = 7200, time_column = 'slice_start', vectorize_function = 'ts2v_pool')`
+> ⚠️ 高频场景建议避免：`CREATE TABLE vec () WITH (source = 'raw_timeseries', window_mode = 'slide')`
+> ✅ 低频场景可接受：`CREATE TABLE vec () WITH (source = 'raw_timeseries', window_mode = 'slide', bucket_interval = 3600)`
+> ✅ 高频场景推荐：`CREATE TABLE vec_l1 () WITH (source = 'raw_timeseries', window_mode = 'bucket', bucket_interval = 3600)`
+> ✅ 高频场景推荐：`CREATE TABLE vec_l2 () WITH (source = 'vec_l1', window_mode = 'slide', bucket_interval = 7200, time_column = 'slice_start', vectorize_function = 'ts2v_pool')`
 
 #### 注意事项
 
@@ -442,7 +529,7 @@ ALTER TABLE vec_slide RESET (timeseries.window_mode);           -- 恢复默认 
 | 1 | sliding 模式下 `bucket_interval` 是**窗口大小**，不是切分间隔 |
 | 2 | sliding 的 slice_start 来自 source 真实时间戳，**不对齐 FLOOR** |
 | 3 | BGW worker 透明支持 sliding，无需额外配置 |
-| 4 | source 应为**向量表**（已聚合），禁止原始表直接滑动 |
+| 4 | source 建议为**向量表**（已聚合），高频场景避免原始表直接滑动 |
 | 5 | 即使在向量表上，bucket_interval 也应远小于窗口大小以保证 N 足够小 |
 
 ---
